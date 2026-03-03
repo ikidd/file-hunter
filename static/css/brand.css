@@ -1,0 +1,113 @@
+:root {
+    /* ── Typography ── */
+    --font-family: -apple-system, BlinkMacSystemFont, 'Segoe UI', Roboto, sans-serif;
+    --font-size-base: 0.8125rem;
+    --font-size-xs: 0.625rem;
+    --font-size-sm: 0.6875rem;
+    --font-size-md: 0.75rem;
+    --font-size-lg: 0.9375rem;
+    --font-size-xl: 1rem;
+    --font-size-stat: 1.25rem;
+    --font-weight-normal: 400;
+    --font-weight-semibold: 600;
+    --font-weight-bold: 700;
+
+    /* ── Surfaces ── */
+    --color-bg: #1e1e2e;
+    --color-surface: #252536;
+    --color-surface-raised: #2a2a3c;
+    --color-surface-hover: #32324a;
+    --color-surface-active: #2e2e42;
+
+    /* ── Borders ── */
+    --color-border: #3a3a4e;
+    --color-border-subtle: #2e2e42;
+    --color-border-hover: #5b8def;
+    --color-border-card: #3a3a4e;
+
+    /* ── Text ── */
+    --color-text: #d4d4d8;
+    --color-text-muted: #8888a0;
+    --color-text-secondary: #a0a0b8;
+    --color-text-dim: #b0b0c8;
+    --color-text-bright: #ffffff;
+    --color-text-placeholder: #5a5a70;
+
+    /* ── Selection / focus ── */
+    --color-selected: #2a3a5e;
+
+    /* ── Primary action ── */
+    --color-primary: #5b8def;
+    --color-primary-hover: #7aa5ff;
+    --color-btn-active: #4a7ad8;
+
+    /* ── Status: offline ── */
+    --color-offline-bg: #3a2020;
+    --color-offline-text: #ff6b6b;
+    --opacity-offline: 0.45;
+
+    /* ── Status: stale ── */
+    --color-stale-bg: #2a2030;
+    --color-stale-text: #b080c0;
+    --opacity-stale: 0.55;
+
+    /* ── Status: duplicate ── */
+    --color-dup-bg: #3a3a20;
+    --color-dup-text: #e8c840;
+
+    /* ── Status: agent ── */
+    --color-agent-bg: #1a2a3a;
+    --color-agent-text: #5b8def;
+
+    /* ── Status: tags ── */
+    --color-tag-bg: #1a2a3a;
+    --color-tag-text: #60c0d0;
+
+    /* ── Status: backfill ── */
+    --color-backfill-bg: #1a1a2e;
+    --color-backfill-text: #a78bfa;
+
+    /* ── Status: scan / progress ── */
+    --color-scan-bg: #1a2a1a;
+    --color-scan-border: #2a4a2a;
+    --color-scan-text: #60c060;
+    --color-progress-track: #2a2a3c;
+    --color-progress-fill: #5b8def;
+
+    /* ── Overlay ── */
+    --color-overlay: rgba(0, 0, 0, 0.7);
+
+    /* ── Status bar ── */
+    --color-statusbar-bg: #1a1a28;
+    --color-status-ok: #60c060;
+    --color-status-warn: #e8c840;
+    --color-status-error: #ff6b6b;
+    --color-danger-hover: #ff5252;
+
+    /* ── Treemap palette (8 cycling colours, theme-overridable) ── */
+    --treemap-color-1: #4a7aba;
+    --treemap-color-2: #2a9d8f;
+    --treemap-color-3: #8a5cf5;
+    --treemap-color-4: #e07040;
+    --treemap-color-5: #5ba84a;
+    --treemap-color-6: #d4564a;
+    --treemap-color-7: #c89030;
+    --treemap-color-8: #b060a0;
+
+    /* ── Effects (inert defaults — activated by themes) ── */
+    --text-glow: none;
+    --scanline-opacity: 0;
+    --title-letter-spacing: normal;
+    --title-text-transform: none;
+    --title-glow: none;
+    --glow-primary: none;
+    --glow-primary-hover: none;
+    --glow-focus: none;
+    --glow-modal: none;
+    --glow-stat: none;
+    --glow-status-dot: none;
+    --glow-dup: none;
+    --btn-primary-bg: var(--color-primary);
+    --btn-primary-bg-hover: var(--color-primary-hover);
+    --btn-primary-text: #fff;
+}

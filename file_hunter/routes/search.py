@@ -1,0 +1,60 @@
+from starlette.requests import Request
+from file_hunter.db import get_db
+from file_hunter.core import json_ok
+from file_hunter.services.search import (
+    search_files,
+    search_files_advanced,
+    parse_conditions_from_params,
+)
+
+
+async def search(request: Request):
+    db = await get_db()
+    page = int(request.query_params.get("page", 0))
+    sort = request.query_params.get("sort", "name")
+    sort_dir = request.query_params.get("sortDir", "asc")
+
+    scope_type = request.query_params.get("scopeType")
+    scope_id_raw = request.query_params.get("scopeId", "")
+    # Node IDs are prefixed (e.g. "fld-123", "loc-42") — strip to numeric
+    scope_id = scope_id_raw.split("-", 1)[-1] if "-" in scope_id_raw else scope_id_raw
+    location_id = int(scope_id) if scope_type == "location" and scope_id else None
+    folder_id = int(scope_id) if scope_type == "folder" and scope_id else None
+
+    if request.query_params.get("mode") == "advanced":
+        conditions = parse_conditions_from_params(request.query_params)
+        results = await search_files_advanced(
+            db,
+            conditions=conditions,
+            include_files=request.query_params.get("files") != "false",
+            include_folders=request.query_params.get("folders") == "true",
+            location_id=location_id,
+            folder_id=folder_id,
+            page=page,
+            sort=sort,
+            sort_dir=sort_dir,
+        )
+    else:
+        results = await search_files(
+            db,
+            name=request.query_params.get("name"),
+            file_type=request.query_params.get("type"),
+            description=request.query_params.get("description"),
+            tags=request.query_params.get("tags"),
+            size_min=request.query_params.get("sizeMin"),
+            size_max=request.query_params.get("sizeMax"),
+            date_from=request.query_params.get("dateFrom"),
+            date_to=request.query_params.get("dateTo"),
+            name_match=request.query_params.get("nameMatch", "anywhere"),
+            include_files=request.query_params.get("files") != "false",
+            dupes_only=bool(request.query_params.get("dupes")),
+            min_dups=request.query_params.get("minDups"),
+            include_folders=request.query_params.get("folders") == "true",
+            hash_strong=request.query_params.get("hash"),
+            location_id=location_id,
+            folder_id=folder_id,
+            page=page,
+            sort=sort,
+            sort_dir=sort_dir,
+        )
+    return json_ok(results)
