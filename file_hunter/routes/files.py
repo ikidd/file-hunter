@@ -1,10 +1,7 @@
 import asyncio
-import io
 import logging
-import zipfile
 
 from starlette.requests import Request
-from starlette.responses import StreamingResponse
 
 from file_hunter.core import json_ok, json_error
 from file_hunter.db import get_db, execute_write
@@ -112,26 +109,20 @@ async def file_bytes(request: Request):
     location_id = row["location_id"]
     file_size = row["file_size"] or 0
 
-    from file_hunter.extensions import get_fetch_bytes
-
-    fetch_bytes = get_fetch_bytes()
-    if not fetch_bytes:
-        return json_error("File not available (agent offline).", 404)
-
-    body = await fetch_bytes(full_path, location_id)
-    if body is None:
-        return json_error("File not available (agent offline).", 404)
-
     offset = int(request.query_params.get("offset", 0))
     limit = min(int(request.query_params.get("limit", 4096)), 65536)
-    actual_size = len(body)
-    data = body[offset : offset + limit]
+
+    from file_hunter.services.content_proxy import fetch_agent_byte_range
+
+    data = await fetch_agent_byte_range(full_path, location_id, offset, limit)
+    if data is None:
+        return json_error("File not available (agent offline).", 404)
 
     return Response(
         content=data,
         media_type="application/octet-stream",
         headers={
-            "X-File-Size": str(actual_size),
+            "X-File-Size": str(file_size),
             "X-Offset": str(offset),
         },
     )
@@ -191,26 +182,16 @@ async def file_delete(request: Request):
     return json_ok(result)
 
 
-async def _fetch_file_data(full_path, location_id):
-    """Read file bytes via agent proxy."""
-    from file_hunter.extensions import get_fetch_bytes
-
-    fetch_bytes = get_fetch_bytes()
-    if fetch_bytes:
-        return await fetch_bytes(full_path, location_id)
-    return None
-
-
 async def folder_download(request: Request):
     """GET /api/folders/{id:int}/download — download folder as ZIP."""
+    from file_hunter.services.batch import build_streaming_zip
+
     db = await get_db()
     folder_id = int(request.path_params["id"])
 
-    # Get folder info and location root
     row = await db.execute_fetchall(
-        """SELECT f.name, f.rel_path, f.location_id, l.root_path
-           FROM folders f JOIN locations l ON l.id = f.location_id
-           WHERE f.id = ?""",
+        """SELECT f.name, f.rel_path, f.location_id
+           FROM folders f WHERE f.id = ?""",
         (folder_id,),
     )
     if not row:
@@ -219,7 +200,6 @@ async def folder_download(request: Request):
     folder_rel = row[0]["rel_path"]
     location_id = row[0]["location_id"]
 
-    # Recursive CTE to get all descendant folder IDs + the folder itself
     desc_rows = await db.execute_fetchall(
         """WITH RECURSIVE desc(id) AS (
                SELECT ? UNION ALL
@@ -230,40 +210,32 @@ async def folder_download(request: Request):
     )
     desc_ids = [r["id"] for r in desc_rows]
 
-    # Get all files in these folders
     placeholders = ",".join("?" * len(desc_ids))
     files = await db.execute_fetchall(
         f"SELECT full_path, rel_path FROM files WHERE folder_id IN ({placeholders})",
         desc_ids,
     )
 
-    buf = io.BytesIO()
-    zf = zipfile.ZipFile(buf, "w", zipfile.ZIP_STORED)
     prefix = folder_rel + "/" if folder_rel else ""
+    zip_files = []
     for f in files:
         arc_name = f["rel_path"]
         if prefix and arc_name.startswith(prefix):
             arc_name = arc_name[len(prefix) :]
-        data = await _fetch_file_data(f["full_path"], location_id)
-        if data:
-            zf.writestr(arc_name, data)
-    zf.close()
-    buf.seek(0)
+        zip_files.append((f["full_path"], arc_name, location_id))
 
-    return StreamingResponse(
-        buf,
-        media_type="application/zip",
-        headers={"Content-Disposition": f'attachment; filename="{folder_name}.zip"'},
-    )
+    return await build_streaming_zip(zip_files, f"{folder_name}.zip")
 
 
 async def location_download(request: Request):
     """GET /api/locations/{id:int}/download — download entire location as ZIP."""
+    from file_hunter.services.batch import build_streaming_zip
+
     db = await get_db()
     loc_id = int(request.path_params["id"])
 
     row = await db.execute_fetchall(
-        "SELECT name, root_path FROM locations WHERE id = ?", (loc_id,)
+        "SELECT name FROM locations WHERE id = ?", (loc_id,)
     )
     if not row:
         return json_error("Location not found.", 404)
@@ -273,20 +245,8 @@ async def location_download(request: Request):
         "SELECT full_path, rel_path FROM files WHERE location_id = ?", (loc_id,)
     )
 
-    buf = io.BytesIO()
-    zf = zipfile.ZipFile(buf, "w", zipfile.ZIP_STORED)
-    for f in files:
-        data = await _fetch_file_data(f["full_path"], loc_id)
-        if data:
-            zf.writestr(f["rel_path"], data)
-    zf.close()
-    buf.seek(0)
-
-    return StreamingResponse(
-        buf,
-        media_type="application/zip",
-        headers={"Content-Disposition": f'attachment; filename="{loc_name}.zip"'},
-    )
+    zip_files = [(f["full_path"], f["rel_path"], loc_id) for f in files]
+    return await build_streaming_zip(zip_files, f"{loc_name}.zip")
 
 
 async def file_move(request: Request):

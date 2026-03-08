@@ -5,6 +5,7 @@ from the agent's HTTP endpoint and streams it back.
 """
 
 import logging
+from contextlib import asynccontextmanager
 
 import httpx
 from starlette.responses import StreamingResponse
@@ -85,6 +86,46 @@ async def fetch_agent_bytes(full_path, location_id):
         return None
 
 
+async def fetch_agent_byte_range(full_path, location_id, offset, length):
+    """Fetch a byte range from an agent using HTTP Range header.
+
+    Returns bytes if successful, None if not an agent location or offline.
+    """
+    db = await get_db()
+    row = await db.execute_fetchall(
+        "SELECT agent_id FROM locations WHERE id = ?", (location_id,)
+    )
+    if not row or not row[0]["agent_id"]:
+        return None
+
+    resolved = _resolve_agent(row[0]["agent_id"])
+    if not resolved:
+        return None
+    host, port, token = resolved
+
+    url = f"http://{host}:{port}/files/content"
+    end = offset + length - 1
+    try:
+        async with httpx.AsyncClient(timeout=60.0) as client:
+            response = await client.get(
+                url,
+                params={"path": full_path},
+                headers={
+                    "Authorization": f"Bearer {token}",
+                    "Range": f"bytes={offset}-{end}",
+                },
+            )
+        if response.status_code in (200, 206):
+            return response.content
+        logger.warning(
+            "Agent fetch_byte_range failed for %s: %d", full_path, response.status_code
+        )
+        return None
+    except httpx.RequestError as e:
+        logger.warning("Agent fetch_byte_range error for %s: %s", full_path, e)
+        return None
+
+
 async def proxy_agent_content(file_id, full_path, filename, request_headers=None):
     """Proxy file content from an agent for preview/download.
 
@@ -162,3 +203,57 @@ async def proxy_agent_content(file_id, full_path, filename, request_headers=None
         await client.aclose()
         logger.warning("Content proxy error for %s: %s", full_path, e)
         return None
+
+
+@asynccontextmanager
+async def stream_agent_file(full_path, location_id):
+    """Async context manager yielding an async byte iterator, or None if offline.
+
+    Streams file content from an agent in 1 MB chunks.
+
+    Usage::
+
+        async with stream_agent_file(path, loc_id) as chunks:
+            if chunks is not None:
+                async for chunk in chunks:
+                    ...
+    """
+    db = await get_db()
+    row = await db.execute_fetchall(
+        "SELECT agent_id FROM locations WHERE id = ?", (location_id,)
+    )
+    if not row or not row[0]["agent_id"]:
+        yield None
+        return
+
+    resolved = _resolve_agent(row[0]["agent_id"])
+    if not resolved:
+        yield None
+        return
+
+    host, port, token = resolved
+    url = f"http://{host}:{port}/files/content"
+    client = httpx.AsyncClient(timeout=httpx.Timeout(300.0, connect=10.0))
+    response = None
+    try:
+        req = client.build_request(
+            "GET",
+            url,
+            params={"path": full_path},
+            headers={"Authorization": f"Bearer {token}"},
+        )
+        response = await client.send(req, stream=True)
+        if response.status_code != 200:
+            logger.warning(
+                "stream_agent_file failed for %s: %d", full_path, response.status_code
+            )
+            yield None
+        else:
+            yield response.aiter_bytes(chunk_size=1048576)
+    except httpx.RequestError as e:
+        logger.warning("stream_agent_file error for %s: %s", full_path, e)
+        yield None
+    finally:
+        if response:
+            await response.aclose()
+        await client.aclose()

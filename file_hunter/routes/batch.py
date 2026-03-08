@@ -1,14 +1,14 @@
 """Batch operation route handlers."""
 
 from starlette.requests import Request
-from starlette.responses import StreamingResponse
 from file_hunter.db import get_db, execute_write
 from file_hunter.core import json_ok, json_error
 from file_hunter.services.batch import (
     batch_delete,
     batch_move,
     batch_tag,
-    batch_download,
+    batch_collect_files,
+    build_streaming_zip,
 )
 from file_hunter.services.stats import invalidate_stats_cache
 from file_hunter.ws.scan import broadcast
@@ -93,10 +93,5 @@ async def batch_download_route(request: Request):
         return json_error("No items to download.")
 
     db = await get_db()
-    buf = await batch_download(db, file_ids, folder_ids)
-
-    return StreamingResponse(
-        buf,
-        media_type="application/zip",
-        headers={"Content-Disposition": 'attachment; filename="selection.zip"'},
-    )
+    files = await batch_collect_files(db, file_ids, folder_ids)
+    return await build_streaming_zip(files, "selection.zip")

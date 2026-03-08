@@ -1,7 +1,5 @@
 """Batch operations — delete, move, tag, and download multiple items."""
 
-import asyncio
-import io
 import os
 import zipfile
 
@@ -108,37 +106,21 @@ async def batch_tag(
     return {"updated": updated}
 
 
-def _read_file_bytes(path):
-    """Read entire file contents. Called via asyncio.to_thread()."""
-    with open(path, "rb") as f:
-        return f.read()
+async def batch_collect_files(
+    db, file_ids: list[int], folder_ids: list[int]
+) -> list[tuple[str, str, int]]:
+    """Collect file paths for a batch download.
 
-
-async def _fetch_file_data(full_path, location_id):
-    """Read file bytes — agent locations always proxy, local reads from disk."""
-    from file_hunter.extensions import is_agent_location, get_fetch_bytes
-
-    if is_agent_location(location_id):
-        fetch_bytes = get_fetch_bytes()
-        if fetch_bytes:
-            return await fetch_bytes(full_path, location_id)
-        return None
-    if await asyncio.to_thread(os.path.isfile, full_path):
-        return await asyncio.to_thread(_read_file_bytes, full_path)
-    return None
-
-
-async def batch_download(db, file_ids: list[int], folder_ids: list[int]) -> io.BytesIO:
-    """Build a ZIP of selected files and folder contents. Returns a BytesIO buffer."""
-    # Collect all file paths: direct files + recursive folder contents
-    all_files = []
+    Returns list of (full_path, arc_name, location_id).
+    """
+    all_files: list[tuple[str, str, int]] = []
 
     # Direct files
     if file_ids:
         placeholders = ",".join("?" * len(file_ids))
         rows = await db.execute_fetchall(
-            f"""SELECT f.full_path, f.filename, f.location_id, l.name as loc_name
-                FROM files f JOIN locations l ON l.id = f.location_id
+            f"""SELECT f.full_path, f.filename, f.location_id
+                FROM files f
                 WHERE f.id IN ({placeholders})""",
             file_ids,
         )
@@ -147,10 +129,9 @@ async def batch_download(db, file_ids: list[int], folder_ids: list[int]) -> io.B
 
     # Folder contents (recursive)
     for fid in folder_ids:
-        # Get folder info
         frow = await db.execute_fetchall(
-            """SELECT fld.name, fld.rel_path, fld.location_id, l.root_path
-               FROM folders fld JOIN locations l ON l.id = fld.location_id
+            """SELECT fld.name, fld.rel_path, fld.location_id
+               FROM folders fld
                WHERE fld.id = ?""",
             (fid,),
         )
@@ -160,7 +141,6 @@ async def batch_download(db, file_ids: list[int], folder_ids: list[int]) -> io.B
         folder_rel = frow[0]["rel_path"]
         folder_loc_id = frow[0]["location_id"]
 
-        # Recursive CTE for all descendant folders
         desc_rows = await db.execute_fetchall(
             """WITH RECURSIVE desc(id) AS (
                    SELECT ? UNION ALL
@@ -182,17 +162,59 @@ async def batch_download(db, file_ids: list[int], folder_ids: list[int]) -> io.B
             arc_name = f["rel_path"]
             if prefix and arc_name.startswith(prefix):
                 arc_name = arc_name[len(prefix) :]
-            # Nest under folder name
             arc_name = folder_name + "/" + arc_name
             all_files.append((f["full_path"], arc_name, folder_loc_id))
 
-    buf = io.BytesIO()
-    zf = zipfile.ZipFile(buf, "w", zipfile.ZIP_STORED)
-    for full_path, arc_name, loc_id in all_files:
-        data = await _fetch_file_data(full_path, loc_id)
-        if data:
-            zf.writestr(arc_name, data)
-    zf.close()
-    buf.seek(0)
+    return all_files
 
-    return buf
+
+async def build_streaming_zip(files, zip_name):
+    """Build a ZIP from [(full_path, arc_name, location_id)] and return a StreamingResponse.
+
+    Each file is streamed from its agent in chunks and written to the ZIP entry
+    incrementally. The ZIP is built in a temp file to avoid accumulating the
+    entire archive in memory.
+    """
+    import tempfile
+
+    from starlette.responses import StreamingResponse
+
+    from file_hunter.services.content_proxy import stream_agent_file
+
+    tmp_fd, tmp_path = tempfile.mkstemp(suffix=".zip")
+    os.close(tmp_fd)
+
+    try:
+        with zipfile.ZipFile(tmp_path, "w", zipfile.ZIP_STORED) as zf:
+            for full_path, arc_name, loc_id in files:
+                async with stream_agent_file(full_path, loc_id) as chunks:
+                    if chunks is None:
+                        continue
+                    with zf.open(arc_name, "w", force_zip64=True) as entry:
+                        async for chunk in chunks:
+                            entry.write(chunk)
+    except Exception:
+        os.unlink(tmp_path)
+        raise
+
+    file_size = os.path.getsize(tmp_path)
+
+    async def _stream_and_cleanup():
+        try:
+            with open(tmp_path, "rb") as f:
+                while True:
+                    chunk = f.read(1048576)
+                    if not chunk:
+                        break
+                    yield chunk
+        finally:
+            os.unlink(tmp_path)
+
+    return StreamingResponse(
+        _stream_and_cleanup(),
+        media_type="application/zip",
+        headers={
+            "Content-Disposition": f'attachment; filename="{zip_name}"',
+            "Content-Length": str(file_size),
+        },
+    )
