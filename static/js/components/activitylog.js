@@ -47,6 +47,7 @@ const ActivityLog = {
     },
 
     _onScroll() {
+        if (this._ignoreScroll) return;
         const el = this.listEl;
         const atBottom = el.scrollHeight - el.scrollTop - el.clientHeight < 8;
         this._autoScroll = atBottom;
@@ -55,8 +56,10 @@ const ActivityLog = {
 
     _scrollToBottom() {
         this._autoScroll = true;
+        this._ignoreScroll = true;
         this.listEl.scrollTop = this.listEl.scrollHeight;
         this.indicatorEl.classList.add('hidden');
+        requestAnimationFrame(() => { this._ignoreScroll = false; });
     },
 
     add(text) {
