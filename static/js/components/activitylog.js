@@ -49,6 +49,10 @@ const ActivityLog = {
     _onScroll() {
         if (this._ignoreScroll) return;
         const el = this.listEl;
+        if (el.scrollHeight <= el.clientHeight) {
+            this._autoScroll = true;
+            return;
+        }
         const atBottom = el.scrollHeight - el.scrollTop - el.clientHeight < 8;
         this._autoScroll = atBottom;
         if (atBottom) this.indicatorEl.classList.add('hidden');
@@ -74,7 +78,7 @@ const ActivityLog = {
             this._ignoreScroll = true;
             this.listEl.scrollTop = this.listEl.scrollHeight;
             requestAnimationFrame(() => { this._ignoreScroll = false; });
-        } else {
+        } else if (this.listEl.scrollHeight > this.listEl.clientHeight) {
             this.indicatorEl.classList.remove('hidden');
         }
     },

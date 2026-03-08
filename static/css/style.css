@@ -630,7 +630,7 @@ body::after {
     color: var(--color-text);
     cursor: pointer;
     user-select: none;
-    margin: 0.25rem;
+    margin: 0.25rem 0.5rem;
 }
 
 .activity-new-indicator:hover {
