@@ -37,6 +37,7 @@ const Detail = {
     _renderGen: 0,
     _ac: null,
     _locationActivityFn: null,
+    _currentLocationNode: null,
     _previewModal: null,
     _slideshowTotal: 0,
     _slideshowOffset: 0,
@@ -617,6 +618,7 @@ const Detail = {
     },
 
     async renderFile(file) {
+        this._currentLocationNode = null;
         const gen = ++this._renderGen;
         const signal = this._abortPrevious();
         await this.showLoading();
@@ -1163,7 +1165,33 @@ const Detail = {
         }
     },
 
+    updateActivity() {
+        const node = this._currentLocationNode;
+        if (!node) return;
+        const el = this.el && this.el.querySelector('.detail-agent-status');
+        const activity = locationActivityLabel(node.id, this._locationActivityFn);
+        if (activity) {
+            if (el) {
+                el.textContent = activity;
+                el.className = `value detail-agent-status ${activity.toLowerCase()}`;
+            } else {
+                // Activity field doesn't exist yet — inject it after Status
+                const statusField = this.el && this.el.querySelector('.detail-field');
+                if (statusField && statusField.parentNode) {
+                    const div = document.createElement('div');
+                    div.className = 'detail-field';
+                    div.innerHTML = `<span class="label">Activity</span>
+                        <span class="value detail-agent-status ${activity.toLowerCase()}">${activity}</span>`;
+                    statusField.after(div);
+                }
+            }
+        } else if (el) {
+            el.parentNode.remove();
+        }
+    },
+
     async renderLocation(node) {
+        this._currentLocationNode = node;
         const gen = ++this._renderGen;
         const signal = this._abortPrevious();
         await this.showLoading();
@@ -1303,6 +1331,7 @@ const Detail = {
     },
 
     async renderFolder(folder) {
+        this._currentLocationNode = null;
         const gen = ++this._renderGen;
         const signal = this._abortPrevious();
         await this.showLoading();

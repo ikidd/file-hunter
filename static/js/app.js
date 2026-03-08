@@ -1060,6 +1060,7 @@ function syncQueuedLocations(queue) {
         }
     }
     Tree.render();
+    Detail.updateActivity();
 }
 
 WS.on('scan_queued', (msg) => {
