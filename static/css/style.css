@@ -621,20 +621,21 @@ body::after {
 .activity-new-indicator {
     position: absolute;
     bottom: 0;
-    left: 0;
     right: 0;
-    text-align: right;
-    padding: 0.2rem 0;
+    padding: 0.15rem 0.4rem;
     font-size: var(--font-size-sm);
-    color: var(--color-primary);
-    background: var(--color-surface-raised);
-    border-top: 1px solid var(--color-border);
+    border: 1px solid var(--color-border);
+    border-radius: 4px;
+    background: var(--color-surface);
+    color: var(--color-text);
     cursor: pointer;
     user-select: none;
+    margin: 0.25rem;
 }
 
 .activity-new-indicator:hover {
-    color: var(--color-text);
+    background: var(--color-surface-hover);
+    border-color: var(--color-border-hover);
 }
 
 /* ── File list ── */

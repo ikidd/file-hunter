@@ -71,7 +71,9 @@ const ActivityLog = {
             this.listEl.removeChild(this.listEl.firstElementChild);
         }
         if (this._autoScroll) {
+            this._ignoreScroll = true;
             this.listEl.scrollTop = this.listEl.scrollHeight;
+            requestAnimationFrame(() => { this._ignoreScroll = false; });
         } else {
             this.indicatorEl.classList.remove('hidden');
         }
