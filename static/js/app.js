@@ -1004,6 +1004,12 @@ WS.on('scan_completed', async (msg) => {
     await refreshDetailPanel();
 });
 
+WS.on('scan_finalizing', (msg) => {
+    StatusBar.renderActivity('scanning', `${msg.location} — finalizing...`, msg.locationId);
+    ActivityLog.add(`Scan finalizing: <b>${msg.location}</b> — marking stale files`);
+    Tree.clearScanningLocation(msg.locationId);
+});
+
 WS.on('scan_cancelled', async (msg) => {
     const queuePending = StatusBar.getQueue().length > 0;
     if (queuePending) {
@@ -1088,8 +1094,14 @@ WS.on('scan_queue_skipped', (msg) => {
 });
 
 WS.on('backfill_started', (msg) => {
-    StatusBar.renderActivity('scanning', `${msg.location} — backfilling hashes (0/${msg.totalFiles.toLocaleString()})`);
-    ActivityLog.add(`Hash backfill started: <b>${msg.location}</b> — ${msg.totalFiles.toLocaleString()} files`);
+    const detail = msg.totalFiles
+        ? `${msg.location} — backfilling hashes (0/${msg.totalFiles.toLocaleString()})`
+        : `${msg.location} — preparing backfill...`;
+    StatusBar.renderActivity('scanning', detail, msg.locationId);
+    const logDetail = msg.totalFiles
+        ? `${msg.totalFiles.toLocaleString()} files`
+        : 'finding candidates...';
+    ActivityLog.add(`Hash backfill started: <b>${msg.location}</b> — ${logDetail}`);
     Tree.setBackfillingLocation(msg.locationId);
 });
 

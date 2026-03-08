@@ -144,6 +144,16 @@ async def run_backfill(agent_id: int, location_id: int, location_name: str):
     db = None
 
     try:
+        # Broadcast immediately so UI shows backfill state before slow query
+        await broadcast(
+            {
+                "type": "backfill_started",
+                "locationId": location_id,
+                "location": location_name,
+                "totalFiles": 0,
+            }
+        )
+
         db = await open_connection()
 
         candidates = await db.execute_fetchall(
@@ -168,6 +178,18 @@ async def run_backfill(agent_id: int, location_id: int, location_name: str):
                 location_name,
                 location_id,
             )
+            await broadcast(
+                {
+                    "type": "backfill_completed",
+                    "locationId": location_id,
+                    "location": location_name,
+                    "agentFilesHashed": 0,
+                    "agentErrors": 0,
+                    "crossAgentFilesHashed": 0,
+                    "duplicatesFound": 0,
+                    "cancelled": False,
+                }
+            )
             return
 
         total = len(candidates)
@@ -178,11 +200,13 @@ async def run_backfill(agent_id: int, location_id: int, location_name: str):
             location_id,
         )
 
+        # Update with actual candidate count
         await broadcast(
             {
-                "type": "backfill_started",
+                "type": "backfill_progress",
                 "locationId": location_id,
                 "location": location_name,
+                "filesHashed": 0,
                 "totalFiles": total,
             }
         )

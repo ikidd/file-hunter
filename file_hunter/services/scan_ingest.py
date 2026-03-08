@@ -4,7 +4,9 @@ Processes scan_files batches from agents and writes file/folder records
 into the database using the core scanner functions.
 """
 
+import json
 import logging
+import posixpath
 from datetime import datetime, timezone
 
 from file_hunter.db import open_connection
@@ -70,6 +72,43 @@ def is_location_scanning(location_id: int) -> bool:
         if s.location_id == location_id:
             return True
     return False
+
+
+async def prepare_finalization(agent_id: int, msg: dict) -> dict | None:
+    """Persist finalization state to DB so it survives a restart.
+
+    Sets the scan status to 'finalizing' and stores the incremental flag,
+    deleted paths list, and scan_prefix. Returns a dict with session info
+    for the broadcast, or None if no session exists.
+    """
+    session = _active_sessions.get(agent_id)
+    if not session:
+        return None
+
+    db = session.db
+    incremental = msg.get("incremental", False)
+    deleted = msg.get("deleted")
+
+    scan_prefix = None
+    if session.scan_path:
+        scan_prefix = posixpath.relpath(session.scan_path, session.root_path)
+
+    deleted_json = json.dumps(deleted) if deleted else None
+
+    await db.execute(
+        """UPDATE scans SET status='finalizing',
+           scan_prefix=?, incremental=?, deleted_json=?
+           WHERE id=?""",
+        (scan_prefix, 1 if incremental else 0, deleted_json, session.scan_id),
+    )
+    await db.commit()
+
+    return {
+        "location_id": session.location_id,
+        "location_name": session.location_name,
+        "scan_id": session.scan_id,
+        "files_ingested": session.files_ingested,
+    }
 
 
 async def start_session(agent_id: int, path: str):
@@ -304,83 +343,23 @@ async def ingest_batch(agent_id: int, files: list[dict]):
             session.potential_matches += new_matches
 
 
-async def complete_session(
-    agent_id: int,
-    path: str,
-    incremental: bool = False,
-    deleted: list[str] | None = None,
-) -> int:
-    """Finalize a completed agent scan. Returns files ingested count."""
+async def complete_session(agent_id: int) -> int:
+    """Finalize a completed agent scan (slow: stale marking, size recalc).
+
+    Reads incremental/deleted/scan_prefix from the scans table (persisted
+    by prepare_finalization) so the data survives server restarts.
+    Returns files ingested count.
+    """
     session = _active_sessions.pop(agent_id, None)
     if not session:
-        logger.warning(
-            "complete_session: no session for agent #%d (path=%s)", agent_id, path
-        )
+        logger.warning("complete_session: no session for agent #%d", agent_id)
         return 0
-
-    logger.info(
-        "complete_session: agent #%d (scan_id=%d, location=#%d '%s', files=%d, incremental=%s)",
-        agent_id,
-        session.scan_id,
-        session.location_id,
-        session.location_name,
-        session.files_ingested,
-        incremental,
-    )
 
     db = session.db
     try:
-        if incremental and deleted is not None:
-            # Incremental: mark specific deleted files as stale
-            stale_count = 0
-            if deleted:
-                for i in range(0, len(deleted), 500):
-                    batch = deleted[i : i + 500]
-                    placeholders = ",".join("?" * len(batch))
-                    cursor = await db.execute(
-                        f"""UPDATE files SET stale=1
-                            WHERE location_id=? AND stale=0
-                            AND rel_path IN ({placeholders})""",
-                        [session.location_id] + batch,
-                    )
-                    stale_count += cursor.rowcount
-                await db.commit()
-            logger.info(
-                "Incremental stale: %d files marked stale from deleted list",
-                stale_count,
-            )
-        else:
-            # Full scan: mark anything not seen in this scan as stale
-            import posixpath
-
-            scan_prefix = None
-            if session.scan_path:
-                scan_prefix = posixpath.relpath(session.scan_path, session.root_path)
-
-            stale_count = await mark_stale_files(
-                db, session.location_id, session.scan_id, scan_prefix
-            )
-
-        completed_iso = datetime.now(timezone.utc).isoformat(timespec="seconds")
-        await db.execute(
-            """UPDATE scans SET status='completed', completed_at=?,
-               files_found=?, files_hashed=?, stale_files=?
-               WHERE id=?""",
-            (
-                completed_iso,
-                session.files_ingested,
-                session.files_ingested,
-                stale_count,
-                session.scan_id,
-            ),
+        stale_count = await _finalize_scan_record(
+            db, session.scan_id, session.location_id, session.files_ingested
         )
-        await db.execute(
-            "UPDATE locations SET date_last_scanned=? WHERE id=?",
-            (completed_iso, session.location_id),
-        )
-        await db.commit()
-
-        invalidate_stats_cache()
 
         logger.info(
             "Agent #%d scan completed: %d files ingested, %d stale",
@@ -402,6 +381,109 @@ async def complete_session(
         return session.files_ingested
     finally:
         await db.close()
+
+
+async def _finalize_scan_record(
+    db, scan_id: int, location_id: int, files_ingested: int
+) -> int:
+    """Mark stale files and update scan to 'completed'. Shared by normal
+    flow and startup recovery. Returns stale count.
+    """
+    # Read persisted finalization params
+    row = await db.execute_fetchall(
+        "SELECT scan_prefix, incremental, deleted_json FROM scans WHERE id=?",
+        (scan_id,),
+    )
+    if not row:
+        return 0
+
+    scan_prefix = row[0]["scan_prefix"]
+    incremental = bool(row[0]["incremental"])
+    deleted_json = row[0]["deleted_json"]
+
+    stale_count = 0
+    if incremental and deleted_json:
+        deleted = json.loads(deleted_json)
+        if deleted:
+            for i in range(0, len(deleted), 500):
+                batch = deleted[i : i + 500]
+                placeholders = ",".join("?" * len(batch))
+                cursor = await db.execute(
+                    f"""UPDATE files SET stale=1
+                        WHERE location_id=? AND stale=0
+                        AND rel_path IN ({placeholders})""",
+                    [location_id] + batch,
+                )
+                stale_count += cursor.rowcount
+            await db.commit()
+        logger.info(
+            "Incremental stale: %d files marked stale from deleted list",
+            stale_count,
+        )
+    else:
+        stale_count = await mark_stale_files(db, location_id, scan_id, scan_prefix)
+
+    completed_iso = datetime.now(timezone.utc).isoformat(timespec="seconds")
+    await db.execute(
+        """UPDATE scans SET status='completed', completed_at=?,
+           files_found=?, files_hashed=?, stale_files=?,
+           deleted_json=NULL
+           WHERE id=?""",
+        (completed_iso, files_ingested, files_ingested, stale_count, scan_id),
+    )
+    await db.execute(
+        "UPDATE locations SET date_last_scanned=? WHERE id=?",
+        (completed_iso, location_id),
+    )
+    await db.commit()
+
+    invalidate_stats_cache()
+    return stale_count
+
+
+async def resume_finalizing_scans():
+    """On startup, complete any scans left in 'finalizing' state."""
+    from file_hunter.db import get_db
+
+    db_check = await get_db()
+    rows = await db_check.execute_fetchall(
+        "SELECT id, location_id FROM scans WHERE status = 'finalizing'"
+    )
+    if not rows:
+        return
+
+    logger.info("Resuming %d finalizing scan(s) from previous session", len(rows))
+
+    for row in rows:
+        scan_id = row["id"]
+        location_id = row["location_id"]
+        db = await open_connection()
+        try:
+            # Count files ingested from this scan
+            count_row = await db.execute_fetchall(
+                "SELECT COUNT(*) as c FROM files WHERE scan_id = ? AND location_id = ?",
+                (scan_id, location_id),
+            )
+            files_ingested = count_row[0]["c"] if count_row else 0
+
+            stale_count = await _finalize_scan_record(
+                db, scan_id, location_id, files_ingested
+            )
+            logger.info(
+                "Resumed finalizing scan #%d: location #%d, %d files, %d stale",
+                scan_id,
+                location_id,
+                files_ingested,
+                stale_count,
+            )
+
+            from file_hunter.services.sizes import schedule_size_recalc
+
+            schedule_size_recalc(location_id)
+        except Exception:
+            logger.error("Failed to resume finalizing scan #%d", scan_id, exc_info=True)
+        finally:
+            await db.close()
 
 
 async def cancel_session(agent_id: int):

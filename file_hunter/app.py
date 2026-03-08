@@ -44,7 +44,13 @@ from file_hunter.routes.scan import start_scan, cancel_scan, get_scan_queue
 from file_hunter.routes.consolidate import consolidate, batch_consolidate
 from file_hunter.routes.merge import merge, cancel_merge
 from file_hunter.routes.upload import upload_files
-from file_hunter.routes.stats import stats, recalculate_stats, repair_catalog, location_stats, folder_stats
+from file_hunter.routes.stats import (
+    stats,
+    recalculate_stats,
+    repair_catalog,
+    location_stats,
+    folder_stats,
+)
 from file_hunter.routes.browse import browse
 from file_hunter.routes.batch import (
     batch_delete_route,
@@ -153,6 +159,11 @@ async def on_startup():
     from file_hunter.services.dup_exclude import restore_pending as restore_dup_exclude
 
     await restore_dup_exclude()
+
+    from file_hunter.services.scan_ingest import resume_finalizing_scans
+
+    await resume_finalizing_scans()
+    _elapsed("finalizing scans resumed")
 
     from file_hunter.services.hash_backfill import restore_backfills
 

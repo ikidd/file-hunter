@@ -164,6 +164,9 @@ _MIGRATIONS = [
     "ALTER TABLE folders ADD COLUMN dup_exclude INTEGER NOT NULL DEFAULT 0",
     "ALTER TABLE locations ADD COLUMN agent_id INTEGER REFERENCES agents(id)",
     "ALTER TABLE locations ADD COLUMN backfill_needed INTEGER NOT NULL DEFAULT 1",
+    "ALTER TABLE scans ADD COLUMN scan_prefix TEXT",
+    "ALTER TABLE scans ADD COLUMN incremental INTEGER NOT NULL DEFAULT 0",
+    "ALTER TABLE scans ADD COLUMN deleted_json TEXT",
 ]
 
 

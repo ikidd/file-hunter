@@ -238,29 +238,51 @@ async def _finalize_scan(
     loc_info: tuple[int, str] | None,
     msg: dict,
 ):
-    """Background task: run complete_session, broadcast, and launch backfill."""
+    """Background task: persist state, broadcast immediately, then do slow DB work."""
     try:
-        incremental = msg.get("incremental", False)
-        deleted = msg.get("deleted", None)
-        files_ingested = await scan_ingest.complete_session(
-            agent_id, scan_path, incremental=incremental, deleted=deleted
+        # Step 1: Persist finalization state (fast — one UPDATE + commit)
+        info = await scan_ingest.prepare_finalization(agent_id, msg)
+        if not info:
+            logger.warning("Agent #%d _finalize_scan: no session to finalize", agent_id)
+            return
+
+        # Step 2: Broadcast scan_finalizing to UI immediately
+        await broadcast(
+            {
+                "type": "scan_finalizing",
+                "agentId": agent_id,
+                "locationId": info["location_id"],
+                "location": info["location_name"],
+                "filesFound": msg.get("filesFound", 0),
+                "filesHashed": msg.get("filesHashed", 0),
+                "filesSkipped": msg.get("filesSkipped", 0),
+            }
         )
 
-        msg.pop("deleted", None)  # Don't broadcast large delete lists to UI
-        msg["agentId"] = agent_id
-        if loc_info:
-            msg["locationId"] = loc_info[0]
-            msg["location"] = loc_info[1]
-        msg.setdefault("duplicatesFound", 0)
-        msg.setdefault("staleFiles", 0)
-        msg.setdefault("filesSkipped", 0)
-        await broadcast(msg)
-
+        # Step 3: Release the scan queue slot so the next scan can start
         if loc_info:
             from file_hunter.services.scan_queue import notify_agent_scan_complete
 
             notify_agent_scan_complete(loc_info[0])
 
+        # Step 4: Slow DB finalization (stale marking, size/dup recalc)
+        files_ingested = await scan_ingest.complete_session(agent_id)
+
+        # Step 5: Broadcast real scan_completed
+        await broadcast(
+            {
+                "type": "scan_completed",
+                "agentId": agent_id,
+                "locationId": info["location_id"],
+                "location": info["location_name"],
+                "filesHashed": msg.get("filesHashed", 0),
+                "filesSkipped": msg.get("filesSkipped", 0),
+                "duplicatesFound": 0,
+                "staleFiles": 0,
+            }
+        )
+
+        # Step 6: Launch backfill if needed
         if loc_info:
             db = await get_db()
             row = await db.execute_fetchall(
