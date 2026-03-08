@@ -12,12 +12,22 @@ const ActivityLog = {
     el: null,
     listEl: null,
     toggleEl: null,
+    indicatorEl: null,
     open: false,
+    _autoScroll: true,
 
     init() {
         this.el = document.getElementById('activity-log');
         this.listEl = document.getElementById('activity-log-list');
         this.toggleEl = document.getElementById('activity-log-toggle');
+
+        // "New activity" indicator
+        const ind = document.createElement('div');
+        ind.className = 'activity-new-indicator hidden';
+        ind.textContent = 'New activity \u25BE';
+        ind.addEventListener('click', () => this._scrollToBottom());
+        this.el.appendChild(ind);
+        this.indicatorEl = ind;
 
         this.open = localStorage.getItem(STORAGE_KEY) !== 'false';
         this._apply();
@@ -27,11 +37,26 @@ const ActivityLog = {
             localStorage.setItem(STORAGE_KEY, this.open);
             this._apply();
         });
+
+        this.listEl.addEventListener('scroll', () => this._onScroll());
     },
 
     _apply() {
         this.el.classList.toggle('collapsed', !this.open);
         this.toggleEl.textContent = this.open ? 'Activity \u25BE' : 'Activity \u25B8';
+    },
+
+    _onScroll() {
+        const el = this.listEl;
+        const atBottom = el.scrollHeight - el.scrollTop - el.clientHeight < 8;
+        this._autoScroll = atBottom;
+        if (atBottom) this.indicatorEl.classList.add('hidden');
+    },
+
+    _scrollToBottom() {
+        this._autoScroll = true;
+        this.listEl.scrollTop = this.listEl.scrollHeight;
+        this.indicatorEl.classList.add('hidden');
     },
 
     add(text) {
@@ -42,7 +67,11 @@ const ActivityLog = {
         while (this.listEl.childElementCount > 100) {
             this.listEl.removeChild(this.listEl.firstElementChild);
         }
-        this.listEl.scrollTop = this.listEl.scrollHeight;
+        if (this._autoScroll) {
+            this.listEl.scrollTop = this.listEl.scrollHeight;
+        } else {
+            this.indicatorEl.classList.remove('hidden');
+        }
     },
 };
 

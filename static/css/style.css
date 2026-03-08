@@ -592,6 +592,7 @@ body::after {
     flex-shrink: 0;
     border-top: 1px solid var(--color-border-subtle);
     overflow: hidden;
+    position: relative;
 }
 
 #activity-log.collapsed {
@@ -615,6 +616,25 @@ body::after {
 .activity-ts {
     color: var(--color-text-muted);
     margin-right: 0.35rem;
+}
+
+.activity-new-indicator {
+    position: absolute;
+    bottom: 0;
+    left: 0;
+    right: 0;
+    text-align: center;
+    padding: 0.2rem 0;
+    font-size: var(--font-size-sm);
+    color: var(--color-primary);
+    background: var(--color-surface-raised);
+    border-top: 1px solid var(--color-border);
+    cursor: pointer;
+    user-select: none;
+}
+
+.activity-new-indicator:hover {
+    color: var(--color-text);
 }
 
 /* ── File list ── */
