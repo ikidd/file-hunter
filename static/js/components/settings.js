@@ -72,6 +72,13 @@ const Settings = {
                 <button class="btn btn-sm" id="settings-add-user" style="margin-top:0.5rem">+ Add User</button>
             </div>
             <div class="settings-section">
+                <h3 class="settings-section-title">Maintenance</h3>
+                <div class="settings-row">
+                    <button class="btn btn-sm" id="settings-repair-catalog">Repair Catalog</button>
+                    <span class="settings-hint">Clears incorrect stale flags, recalculates file counts and duplicate detection</span>
+                </div>
+            </div>
+            <div class="settings-section">
                 ${proActive ? '<h3 class="settings-section-title">Pro Updates</h3>' : ''}
                 <div class="settings-row">
                     <button class="btn btn-sm" id="settings-pro-updates">${proActive ? 'Manage Updates' : 'Upgrade to Pro'}</button>
@@ -110,6 +117,14 @@ const Settings = {
 
         // Add user
         document.getElementById('settings-add-user').addEventListener('click', () => this._showAddUser());
+
+        // Repair catalog
+        document.getElementById('settings-repair-catalog').addEventListener('click', async (e) => {
+            const btn = e.target;
+            btn.textContent = 'Repairing...';
+            btn.disabled = true;
+            await API.post('/api/stats/repair');
+        });
 
         // Pro updates / upgrade
         document.getElementById('settings-pro-updates').addEventListener('click', () => {
