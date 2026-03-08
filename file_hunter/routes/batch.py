@@ -94,4 +94,4 @@ async def batch_download_route(request: Request):
 
     db = await get_db()
     files = await batch_collect_files(db, file_ids, folder_ids)
-    return await build_streaming_zip(files, "selection.zip")
+    return await build_streaming_zip(files, "file-hunter-selection.zip")

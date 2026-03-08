@@ -140,7 +140,10 @@ function wireDownloadZipBtn(node) {
                     const blobUrl = URL.createObjectURL(blob);
                     const a = document.createElement('a');
                     a.href = blobUrl;
-                    a.download = '';
+                    // Extract filename from Content-Disposition header
+                    const cd = resp.headers.get('Content-Disposition') || '';
+                    const m = cd.match(/filename="(.+?)"/);
+                    a.download = m ? m[1] : 'download.zip';
                     document.body.appendChild(a);
                     a.click();
                     a.remove();
@@ -291,7 +294,7 @@ function wireBatchActions(items) {
                     const url = URL.createObjectURL(blob);
                     const a = document.createElement('a');
                     a.href = url;
-                    a.download = 'selection.zip';
+                    a.download = FileList._searchMode ? 'file-hunter-search.zip' : 'file-hunter-selection.zip';
                     document.body.appendChild(a);
                     a.click();
                     a.remove();
