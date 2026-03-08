@@ -43,6 +43,71 @@ find_python() {
 
 PYTHON=$(find_python) || error "Python 3.10+ is required but not found."
 
+# ── Self-update ──────────────────────────────────────────────────────
+
+if [ "${1:-}" = "update" ]; then
+    REPO="zen-logic/file-hunter"
+    CURRENT=$(cat "$SCRIPT_DIR/VERSION" 2>/dev/null | tr -d '[:space:]')
+    FORCE=false
+    [ "${2:-}" = "--force" ] && FORCE=true
+
+    info "Checking for updates (current: v${CURRENT})..."
+    LATEST_TAG=$(curl -fsSL "https://api.github.com/repos/${REPO}/releases/latest" \
+        | "$PYTHON" -c "import sys,json; print(json.load(sys.stdin).get('tag_name',''))" 2>/dev/null)
+
+    if [ -z "$LATEST_TAG" ]; then
+        error "Could not check for updates."
+    fi
+
+    LATEST="${LATEST_TAG#v}"
+
+    if [ "$CURRENT" = "$LATEST" ] && [ "$FORCE" = false ]; then
+        info "Already up to date (v${CURRENT})."
+        exit 0
+    fi
+
+    if [ "$CURRENT" = "$LATEST" ]; then
+        info "Reinstalling v${CURRENT}..."
+    else
+        info "Updating v${CURRENT} → v${LATEST}..."
+    fi
+
+    ARCHIVE="filehunter-${LATEST}.tar.gz"
+    URL="https://github.com/${REPO}/releases/download/${LATEST_TAG}/${ARCHIVE}"
+
+    curl -fSL "$URL" -o "/tmp/${ARCHIVE}" || error "Download failed."
+
+    TMPDIR=$(mktemp -d)
+    tar xzf "/tmp/${ARCHIVE}" -C "$TMPDIR"
+    rm -f "/tmp/${ARCHIVE}"
+
+    EXTRACTED="$TMPDIR/filehunter-${LATEST}"
+    if [ ! -d "$EXTRACTED" ]; then
+        rm -rf "$TMPDIR"
+        error "Unexpected archive structure."
+    fi
+
+    # Remove old code directories (handles deleted files between versions)
+    for dir in file_hunter file_hunter_core file_hunter_agent static; do
+        rm -rf "${SCRIPT_DIR:?}/$dir"
+    done
+
+    # Copy new files, preserving user data
+    for item in "$EXTRACTED"/*; do
+        name=$(basename "$item")
+        case "$name" in
+            data|config.json|venv) continue ;;
+        esac
+        cp -R "$item" "$SCRIPT_DIR/"
+    done
+
+    rm -rf "$TMPDIR"
+    chmod +x "$SCRIPT_DIR/filehunter"
+
+    info "Updated to v${LATEST}. Restart with: ./filehunter"
+    exit 0
+fi
+
 # ── First-run setup ─────────────────────────────────────────────────
 
 if [ ! -f "$CONFIG_FILE" ]; then
