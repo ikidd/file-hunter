@@ -615,7 +615,7 @@ const Detail = {
                 ${scansHtml || '<div class="detail-field"><span class="value">No scans yet.</span></div>'}
             </div>
             <div class="detail-section">
-                <button class="btn btn-sm" id="detail-recalc-stats">Recalculate Stats</button>
+                <div class="detail-btn-group"><button class="btn" id="detail-recalc-stats">Recalculate Stats</button></div>
             </div>
         `;
         const recalcBtn = this.el.querySelector('#detail-recalc-stats');
