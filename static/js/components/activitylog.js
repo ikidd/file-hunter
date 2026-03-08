@@ -55,7 +55,11 @@ const ActivityLog = {
         }
         const atBottom = el.scrollHeight - el.scrollTop - el.clientHeight < 8;
         this._autoScroll = atBottom;
-        if (atBottom) this.indicatorEl.classList.add('hidden');
+        if (atBottom) {
+            this.indicatorEl.classList.add('hidden');
+        } else {
+            this.indicatorEl.classList.remove('hidden');
+        }
     },
 
     _scrollToBottom() {
