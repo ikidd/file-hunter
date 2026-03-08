@@ -22,6 +22,8 @@ async def run_consolidation(db, file_id: int, mode: str, dest_folder_id: str | N
     """
     hash_strong = None
     filename = None
+    stubs_written = 0
+    stubs_queued = 0
     try:
         # Load the selected file
         rows = await db.execute_fetchall(
@@ -95,8 +97,6 @@ async def run_consolidation(db, file_id: int, mode: str, dest_folder_id: str | N
         all_copies = [dict(r) for r in all_copies]
 
         now_iso = datetime.now(timezone.utc).isoformat(timespec="seconds")
-        stubs_written = 0
-        stubs_queued = 0
 
         if mode == "keep_here":
             canonical_path = selected["full_path"]
@@ -116,6 +116,14 @@ async def run_consolidation(db, file_id: int, mode: str, dest_folder_id: str | N
                 return
 
             # Compute real hashes (seed data may have fakes)
+            await broadcast(
+                {
+                    "type": "consolidate_progress",
+                    "fileId": file_id,
+                    "filename": filename,
+                    "phase": "verifying",
+                }
+            )
             real_fast, real_strong = await fs.file_hash(canonical_path, selected_loc_id)
             if real_strong != hash_strong:
                 # DB hash was stale — update the canonical record
@@ -188,8 +196,44 @@ async def run_consolidation(db, file_id: int, mode: str, dest_folder_id: str | N
                 )
                 return
 
-            # Copy and hash-verify against source (not DB hash, which may be stale)
-            await fs.copy_file(source_path, source_loc_id, canonical_path, dest_loc_id)
+            # Copy with progress — streaming, constant memory
+            async def _copy_progress(bytes_sent, total_bytes):
+                await broadcast(
+                    {
+                        "type": "consolidate_progress",
+                        "fileId": file_id,
+                        "filename": filename,
+                        "phase": "copying",
+                        "bytesSent": bytes_sent,
+                        "bytesTotal": total_bytes,
+                    }
+                )
+
+            try:
+                await fs.copy_file(
+                    source_path,
+                    source_loc_id,
+                    canonical_path,
+                    dest_loc_id,
+                    on_progress=_copy_progress,
+                )
+            except Exception as copy_exc:
+                # Clean up partial file at destination
+                try:
+                    await fs.file_delete(canonical_path, dest_loc_id)
+                except Exception:
+                    pass
+                raise RuntimeError(f"Copy failed: {copy_exc}") from copy_exc
+
+            # Hash-verify against source (not DB hash, which may be stale)
+            await broadcast(
+                {
+                    "type": "consolidate_progress",
+                    "fileId": file_id,
+                    "filename": filename,
+                    "phase": "verifying",
+                }
+            )
             source_hash_fast, source_hash_strong = await fs.file_hash(
                 source_path, source_loc_id
             )
@@ -238,18 +282,32 @@ async def run_consolidation(db, file_id: int, mode: str, dest_folder_id: str | N
             dest_loc_id,
             now_iso,
         )
+        await db.commit()
 
         # Process each duplicate (everything except the canonical)
-        for copy in all_copies:
-            if copy["id"] == canonical_id:
-                continue
+        duplicates = [c for c in all_copies if c["id"] != canonical_id]
+        total_dups = len(duplicates)
 
+        for idx, copy in enumerate(duplicates, 1):
             original_path = copy["full_path"]
             loc_root = copy["root_path"]
             copy_loc_id = copy["location_id"]
             location_online = await fs.dir_exists(loc_root, copy_loc_id)
             file_on_disk = location_online and await fs.file_exists(
                 original_path, copy_loc_id
+            )
+
+            await broadcast(
+                {
+                    "type": "consolidate_progress",
+                    "fileId": file_id,
+                    "filename": filename,
+                    "phase": "stubs",
+                    "current": idx,
+                    "total": total_dups,
+                    "currentFile": copy["filename"],
+                    "location": copy["location_name"],
+                }
             )
 
             if file_on_disk:
@@ -285,6 +343,7 @@ async def run_consolidation(db, file_id: int, mode: str, dest_folder_id: str | N
                         ),
                     )
                     stubs_written += 1
+                    await db.commit()
                 except Exception:
                     stubs_queued += 1
                     await db.execute(
@@ -300,6 +359,7 @@ async def run_consolidation(db, file_id: int, mode: str, dest_folder_id: str | N
                             now_iso,
                         ),
                     )
+                    await db.commit()
             else:
                 # Offline or file missing — queue for later
                 stubs_queued += 1
@@ -316,8 +376,7 @@ async def run_consolidation(db, file_id: int, mode: str, dest_folder_id: str | N
                         now_iso,
                     ),
                 )
-
-        await db.commit()
+                await db.commit()
 
         await broadcast(
             {
@@ -352,6 +411,8 @@ async def run_consolidation(db, file_id: int, mode: str, dest_folder_id: str | N
                 "fileId": file_id,
                 "filename": filename or "",
                 "error": str(exc),
+                "stubsWritten": stubs_written,
+                "stubsQueued": stubs_queued,
             }
         )
 
@@ -399,7 +460,7 @@ async def run_batch_consolidation(
 async def drain_pending_jobs(db, location_id: int, root_path: str):
     """Drain queued consolidation jobs for a location that's now online.
 
-    Called at scan start before the discovery walk.
+    Called when an agent reconnects and its locations come online.
     """
     rows = await db.execute_fetchall(
         """SELECT id, source_file, source_path, destination_path

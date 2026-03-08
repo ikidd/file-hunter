@@ -215,6 +215,16 @@ async def run_backfill(agent_id: int, location_id: int, location_name: str):
         # Cross-agent backfill: hash files on other connected agents
         cross_agent_hashed = 0
         if not cancelled:
+            await broadcast(
+                {
+                    "type": "backfill_progress",
+                    "locationId": location_id,
+                    "location": location_name,
+                    "filesHashed": agent_hashed,
+                    "totalFiles": total,
+                    "phase": "cross_agent",
+                }
+            )
             cross_agent_hashed = await _backfill_agents(
                 db, agent_id, location_id, affected_hashes
             )
@@ -222,6 +232,16 @@ async def run_backfill(agent_id: int, location_id: int, location_name: str):
         if affected_hashes:
             from file_hunter.services.dup_counts import recalculate_dup_counts
 
+            await broadcast(
+                {
+                    "type": "backfill_progress",
+                    "locationId": location_id,
+                    "location": location_name,
+                    "filesHashed": agent_hashed,
+                    "totalFiles": total,
+                    "phase": "dup_counts",
+                }
+            )
             await recalculate_dup_counts(
                 db, affected_hashes, source=f"backfill {location_name}"
             )
@@ -306,7 +326,9 @@ async def _backfill_agents(
     from file_hunter.services.agent_ops import dispatch
     from file_hunter.services.online_check import agent_online_check
 
-    logger.info("Cross-agent backfill: querying candidates for location %d", agent_location_id)
+    logger.info(
+        "Cross-agent backfill: querying candidates for location %d", agent_location_id
+    )
 
     rows = await db.execute_fetchall(
         """SELECT f.id, f.full_path, f.location_id
@@ -375,5 +397,3 @@ async def _backfill_agents(
 
     logger.info("Cross-agent backfill: complete, %d files hashed", hashed)
     return hashed
-
-

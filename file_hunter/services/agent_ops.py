@@ -245,6 +245,86 @@ async def dispatch(operation: str, location_id: int, **kwargs):
         raise ValueError(f"Unknown agent operation: {operation}")
 
 
+async def stream_copy(
+    src_path: str,
+    src_loc_id: int,
+    dst_path: str,
+    dst_loc_id: int,
+    on_progress=None,
+):
+    """Stream a file from one agent to another without buffering in RAM.
+
+    Pipes GET /files/content (source) -> POST /files/stream-write (dest)
+    one chunk at a time. on_progress(bytes_sent, total_bytes) called per chunk.
+    """
+    src_agent_id = await _get_agent_id(src_loc_id)
+    dst_agent_id = await _get_agent_id(dst_loc_id)
+    src_resolved = _resolve_agent(src_agent_id)
+    dst_resolved = _resolve_agent(dst_agent_id)
+    if not src_resolved:
+        raise ConnectionError(f"Source agent for location {src_loc_id} is offline")
+    if not dst_resolved:
+        raise ConnectionError(f"Destination agent for location {dst_loc_id} is offline")
+
+    s_host, s_port, s_token = src_resolved
+    d_host, d_port, d_token = dst_resolved
+
+    src_url = f"http://{s_host}:{s_port}/files/content"
+    dst_url = f"http://{d_host}:{d_port}/files/stream-write"
+
+    src_client = httpx.AsyncClient(timeout=httpx.Timeout(None, connect=10.0))
+    try:
+        src_req = src_client.build_request(
+            "GET",
+            src_url,
+            params={"path": src_path},
+            headers={"Authorization": f"Bearer {s_token}"},
+        )
+        src_resp = await src_client.send(src_req, stream=True)
+
+        if src_resp.status_code != 200:
+            body = (await src_resp.aread())[:500]
+            await src_resp.aclose()
+            raise RuntimeError(
+                f"Source agent returned {src_resp.status_code}: "
+                f"{body.decode(errors='replace')}"
+            )
+
+        total_bytes = int(src_resp.headers.get("content-length", 0))
+        bytes_sent = 0
+
+        async def _pipe_chunks():
+            nonlocal bytes_sent
+            try:
+                async for chunk in src_resp.aiter_bytes(chunk_size=1048576):
+                    bytes_sent += len(chunk)
+                    if on_progress:
+                        await on_progress(bytes_sent, total_bytes)
+                    yield chunk
+            finally:
+                await src_resp.aclose()
+
+        async with httpx.AsyncClient(
+            timeout=httpx.Timeout(None, connect=10.0)
+        ) as dst_client:
+            resp = await dst_client.post(
+                dst_url,
+                params={"path": dst_path},
+                content=_pipe_chunks(),
+                headers={
+                    "Authorization": f"Bearer {d_token}",
+                    "Content-Type": "application/octet-stream",
+                },
+            )
+            result = resp.json()
+            if not result.get("ok"):
+                raise RuntimeError(
+                    f"Destination agent error: {result.get('error', resp.text)}"
+                )
+    finally:
+        await src_client.aclose()
+
+
 async def rename_agent_location(agent_id: int, root_path: str, new_name: str):
     """Tell an agent to rename a location in its config.json."""
     resolved = _resolve_agent(agent_id)

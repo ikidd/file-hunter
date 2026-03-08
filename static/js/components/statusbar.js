@@ -136,6 +136,12 @@ const StatusBar = {
         }
     },
 
+    formatCopyProgress(filename, bytesSent, bytesTotal) {
+        if (!bytesTotal) return `${filename} — Copying...`;
+        const pct = Math.round((bytesSent / bytesTotal) * 100);
+        return `${filename} — Copying ${formatSize(bytesSent)}/${formatSize(bytesTotal)} (${pct}%)`;
+    },
+
     isScanning() {
         return this._scanningLocationId !== null;
     },

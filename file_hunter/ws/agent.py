@@ -81,9 +81,7 @@ async def _adopt_orphaned_locations(agent_id: int):
     if not orphans:
         return
 
-    logger.info(
-        "Agent #%d: adopting %d orphaned locations", agent_id, len(orphans)
-    )
+    logger.info("Agent #%d: adopting %d orphaned locations", agent_id, len(orphans))
 
     # Update DB: set agent_id on all orphaned locations
     async def _assign(conn, aid, ids):
@@ -113,17 +111,24 @@ async def _adopt_orphaned_locations(agent_id: int):
             from file_hunter.services.agent_ops import _post
 
             await _post(
-                host, port, token, "/locations/add",
+                host,
+                port,
+                token,
+                "/locations/add",
                 {"name": o["name"], "path": o["root_path"]},
             )
             logger.info(
                 "Agent #%d: pushed orphaned location '%s' (%s) to agent config",
-                agent_id, o["name"], o["root_path"],
+                agent_id,
+                o["name"],
+                o["root_path"],
             )
         except Exception as e:
             logger.warning(
                 "Agent #%d: failed to push location '%s' to agent: %s",
-                agent_id, o["name"], e,
+                agent_id,
+                o["name"],
+                e,
             )
 
     # Add orphan location IDs to the in-memory set
@@ -196,6 +201,33 @@ async def _sync_agent_locations(agent_id: int, agent_locations: list[dict]):
             else:
                 path_status[loc_id] = True
     update_location_path_status(agent_id, path_status)
+
+    # Drain any pending consolidation jobs for online locations
+    from file_hunter.services.consolidate import drain_pending_jobs
+    from file_hunter.db import open_connection
+
+    for loc_id, online in path_status.items():
+        if not online:
+            continue
+        cursor = await db.execute(
+            "SELECT root_path FROM locations WHERE id = ?", (loc_id,)
+        )
+        loc_row = await cursor.fetchone()
+        if not loc_row:
+            continue
+        # Check if there are pending jobs before opening a connection
+        pending = await db.execute(
+            "SELECT COUNT(*) as cnt FROM consolidation_jobs "
+            "WHERE source_location_id = ? AND status = 'pending'",
+            (loc_id,),
+        )
+        cnt_row = await pending.fetchone()
+        if cnt_row and cnt_row["cnt"] > 0:
+            drain_db = await open_connection()
+            try:
+                await drain_pending_jobs(drain_db, loc_id, loc_row["root_path"])
+            finally:
+                await drain_db.close()
 
     return location_ids
 
@@ -570,7 +602,8 @@ async def agent_ws_endpoint(websocket: WebSocket):
                     await enqueue(loc_id, loc_name, row[0]["root_path"])
                     logger.info(
                         "Re-queued interrupted scan for location #%d (%s)",
-                        loc_id, loc_name,
+                        loc_id,
+                        loc_name,
                     )
                 except ValueError:
                     pass  # Already queued or running

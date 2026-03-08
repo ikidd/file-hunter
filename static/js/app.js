@@ -1090,8 +1090,20 @@ WS.on('backfill_started', (msg) => {
 });
 
 WS.on('backfill_progress', (msg) => {
-    StatusBar.renderActivity('scanning', `${msg.location} — backfilling hashes (${msg.filesHashed.toLocaleString()}/${msg.totalFiles.toLocaleString()})`);
-    ActivityLog.add(`Hash backfill: <b>${msg.location}</b> — ${msg.filesHashed.toLocaleString()} / ${msg.totalFiles.toLocaleString()} files`);
+    let detail;
+    if (msg.phase === 'cross_agent') {
+        detail = `${msg.location} — checking other agents for matches`;
+    } else if (msg.phase === 'local') {
+        detail = `${msg.location} — hashing local matches`;
+    } else if (msg.phase === 'dup_counts') {
+        detail = `${msg.location} — updating duplicate counts`;
+    } else {
+        detail = `${msg.location} — backfilling hashes (${msg.filesHashed.toLocaleString()}/${msg.totalFiles.toLocaleString()})`;
+    }
+    StatusBar.renderActivity('scanning', detail);
+    if (!msg.phase) {
+        ActivityLog.add(`Hash backfill: <b>${msg.location}</b> — ${msg.filesHashed.toLocaleString()} / ${msg.totalFiles.toLocaleString()} files`);
+    }
     Tree.setBackfillingLocation(msg.locationId);
     FileList.refreshDupCounts();
     StatusBar.loadStats();
@@ -1258,6 +1270,17 @@ WS.on('consolidate_started', (msg) => {
     ActivityLog.add(`Consolidation started: <b>${msg.filename}</b>`);
 });
 
+WS.on('consolidate_progress', (msg) => {
+    if (msg.phase === 'copying') {
+        const detail = StatusBar.formatCopyProgress(msg.filename, msg.bytesSent, msg.bytesTotal);
+        StatusBar.renderActivity('consolidating', detail);
+    } else if (msg.phase === 'verifying') {
+        StatusBar.renderActivity('consolidating', `${msg.filename} — Verifying hashes`);
+    } else if (msg.phase === 'stubs') {
+        StatusBar.renderActivity('consolidating', `${msg.filename} — Writing stubs ${msg.current}/${msg.total}`);
+    }
+});
+
 WS.on('consolidate_completed', async (msg) => {
     StatusBar.renderActivity('idle');
     ActivityLog.add(`Consolidation completed: <b>${msg.filename}</b> — ${msg.stubsWritten} stubs written, ${msg.stubsQueued} queued`);
@@ -1278,7 +1301,11 @@ WS.on('consolidate_completed', async (msg) => {
 
 WS.on('consolidate_error', (msg) => {
     StatusBar.renderActivity('idle');
-    ActivityLog.add(`Consolidation error: <b>${msg.filename}</b> — ${msg.error}`);
+    let detail = msg.error;
+    if (msg.stubsWritten > 0 || msg.stubsQueued > 0) {
+        detail += ` (${msg.stubsWritten} stubs written, ${msg.stubsQueued} queued before error)`;
+    }
+    ActivityLog.add(`Consolidation error: <b>${msg.filename}</b> — ${detail}`);
     Toast.error(`Consolidation error: ${msg.error}`);
 });
 
