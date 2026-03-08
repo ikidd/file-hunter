@@ -643,9 +643,9 @@ async def agent_ws_endpoint(websocket: WebSocket):
 
             logger.info("Agent #%d disconnected", agent_id)
 
-        # Re-queue interrupted backfill regardless
+        # Re-queue interrupted backfill at head so it resumes first
         if interrupted_backfill:
-            await queue_pending_backfill(agent_id, *interrupted_backfill)
+            await queue_pending_backfill(agent_id, *interrupted_backfill, front=True)
             logger.info(
                 "Queued interrupted backfill for location #%d (%s)",
                 interrupted_backfill[0],

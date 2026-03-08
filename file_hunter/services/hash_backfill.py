@@ -21,8 +21,8 @@ logger = logging.getLogger("file_hunter")
 _active_backfills: dict[int, bool] = {}
 # agent_id -> (location_id, location_name) for running backfills
 _backfill_info: dict[int, tuple[int, str]] = {}
-# agent_id -> (location_id, location_name) for backfills to resume on reconnect
-_pending_backfills: dict[int, tuple[int, str]] = {}
+# agent_id -> queue of (location_id, location_name) awaiting backfill
+_pending_backfills: dict[int, list[tuple[int, str]]] = {}
 
 
 def cancel_backfill(agent_id: int):
@@ -45,18 +45,33 @@ def get_active_backfill_info(agent_id: int) -> tuple[int, str] | None:
     return _backfill_info.get(agent_id)
 
 
-async def queue_pending_backfill(agent_id: int, location_id: int, location_name: str):
-    """Store a backfill to resume when the agent reconnects."""
-    _pending_backfills[agent_id] = (location_id, location_name)
+async def queue_pending_backfill(
+    agent_id: int, location_id: int, location_name: str, *, front: bool = False
+):
+    """Add a backfill to the per-agent queue. Deduplicates by location_id.
+
+    Use front=True to re-queue an interrupted backfill at the head of the queue.
+    """
+    queue = _pending_backfills.setdefault(agent_id, [])
+    if any(lid == location_id for lid, _ in queue):
+        return
+    if front:
+        queue.insert(0, (location_id, location_name))
+    else:
+        queue.append((location_id, location_name))
     await persist_backfill(agent_id, location_id, location_name)
 
 
 async def pop_pending_backfill(agent_id: int) -> tuple[int, str] | None:
-    """Pop and return a pending backfill for this agent, or None."""
-    result = _pending_backfills.pop(agent_id, None)
-    if result is not None:
-        await clear_persisted_backfill(agent_id, result[0])
-    return result
+    """Pop and return the next queued backfill for this agent, or None."""
+    queue = _pending_backfills.get(agent_id, [])
+    if not queue:
+        return None
+    item = queue.pop(0)
+    await clear_persisted_backfill(agent_id, item[0])
+    if not queue:
+        _pending_backfills.pop(agent_id, None)
+    return item
 
 
 async def persist_backfill(agent_id: int, location_id: int, location_name: str):
@@ -100,7 +115,8 @@ async def restore_backfills():
     """Reload pending backfills from DB into memory on startup."""
     rows = await load_persisted_backfills()
     for agent_id, location_id, location_name in rows:
-        _pending_backfills[agent_id] = (location_id, location_name)
+        queue = _pending_backfills.setdefault(agent_id, [])
+        queue.append((location_id, location_name))
     if rows:
         logger.info("Restored %d pending backfill(s) from previous session", len(rows))
 
@@ -109,6 +125,17 @@ async def run_backfill(agent_id: int, location_id: int, location_name: str):
     """Find files missing hash_strong that have cross-location size+partial
     matches, request full hashes from the agent, then backfill local matches.
     """
+    # One backfill at a time per agent — queue if already running
+    if agent_id in _active_backfills:
+        await queue_pending_backfill(agent_id, location_id, location_name)
+        logger.info(
+            "Backfill queued for %s (location %d) — agent #%d already running backfill",
+            location_name,
+            location_id,
+            agent_id,
+        )
+        return
+
     from file_hunter.services.agent_ops import dispatch
 
     _active_backfills[agent_id] = False
@@ -307,6 +334,17 @@ async def run_backfill(agent_id: int, location_id: int, location_name: str):
         await clear_persisted_backfill(agent_id, location_id)
         if db:
             await db.close()
+
+        # Chain to next queued backfill for this agent
+        next_item = await pop_pending_backfill(agent_id)
+        if next_item:
+            logger.info(
+                "Chaining backfill to %s (location %d) for agent #%d",
+                next_item[1],
+                next_item[0],
+                agent_id,
+            )
+            asyncio.create_task(run_backfill(agent_id, next_item[0], next_item[1]))
 
 
 async def _flush_writes(db, writes: list[tuple[int, str, str]]):
