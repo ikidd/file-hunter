@@ -197,8 +197,6 @@ while true; do
         AGENT_PID=$!
     fi
 
-    echo "File Hunter starting on http://${FH_HOST}:${FH_PORT}"
-
     set +e
     "$VENV_PYTHON" -m file_hunter --host "$FH_HOST" --port "$FH_PORT"
     SERVER_EXIT=$?

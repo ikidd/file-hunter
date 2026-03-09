@@ -206,9 +206,13 @@ async def init_db(db: aiosqlite.Connection):
     await db.commit()
 
     # Run column migrations (idempotent — silently ignores "duplicate column")
+    migrated = False
     for sql in _MIGRATIONS:
         try:
             await db.execute(sql)
+            if not migrated:
+                print("Updating database...")
+                migrated = True
         except sqlite3.OperationalError:
             pass  # column already exists
     await db.commit()
