@@ -1163,13 +1163,16 @@ WS.on('dup_backfill_completed', msg => {
     } else {
         ActivityLog.add(`Duplicate counts fixed (${(msg.updated || 0).toLocaleString()} hashes)`);
     }
+    StatusBar.loadStats();
 });
 WS.on('size_recalc_completed', msg => {
     ActivityLog.add('Location sizes recalculated');
+    StatusBar.loadStats();
 });
 WS.on('dup_recalc_completed', msg => {
     const src = msg.source ? ` (${msg.source})` : '';
     ActivityLog.add(`Duplicate counts updated${src}`);
+    StatusBar.loadStats();
 });
 
 WS.on('dup_exclude_started', msg => {
