@@ -19,10 +19,10 @@ logger = logging.getLogger("file_hunter")
 
 # agent_id -> cancel flag (True = cancel requested)
 _active_backfills: dict[int, bool] = {}
-# agent_id -> (location_id, location_name) for running backfills
-_backfill_info: dict[int, tuple[int, str]] = {}
-# agent_id -> queue of (location_id, location_name) awaiting backfill
-_pending_backfills: dict[int, list[tuple[int, str]]] = {}
+# agent_id -> (location_id, location_name, scan_prefix) for running backfills
+_backfill_info: dict[int, tuple[int, str, str | None]] = {}
+# agent_id -> queue of (location_id, location_name, scan_prefix) awaiting backfill
+_pending_backfills: dict[int, list[tuple[int, str, str | None]]] = {}
 
 
 def cancel_backfill(agent_id: int):
@@ -40,29 +40,34 @@ def cancel_backfill_by_location(location_id: int) -> bool:
     return False
 
 
-def get_active_backfill_info(agent_id: int) -> tuple[int, str] | None:
-    """Return (location_id, location_name) if a backfill is running for this agent."""
+def get_active_backfill_info(agent_id: int) -> tuple[int, str, str | None] | None:
+    """Return (location_id, location_name, scan_prefix) if a backfill is running for this agent."""
     return _backfill_info.get(agent_id)
 
 
 async def queue_pending_backfill(
-    agent_id: int, location_id: int, location_name: str, *, front: bool = False
+    agent_id: int,
+    location_id: int,
+    location_name: str,
+    scan_prefix: str | None = None,
+    *,
+    front: bool = False,
 ):
     """Add a backfill to the per-agent queue. Deduplicates by location_id.
 
     Use front=True to re-queue an interrupted backfill at the head of the queue.
     """
     queue = _pending_backfills.setdefault(agent_id, [])
-    if any(lid == location_id for lid, _ in queue):
+    if any(lid == location_id for lid, _, _sp in queue):
         return
     if front:
-        queue.insert(0, (location_id, location_name))
+        queue.insert(0, (location_id, location_name, scan_prefix))
     else:
-        queue.append((location_id, location_name))
-    await persist_backfill(agent_id, location_id, location_name)
+        queue.append((location_id, location_name, scan_prefix))
+    await persist_backfill(agent_id, location_id, location_name, scan_prefix)
 
 
-async def pop_pending_backfill(agent_id: int) -> tuple[int, str] | None:
+async def pop_pending_backfill(agent_id: int) -> tuple[int, str, str | None] | None:
     """Pop and return the next queued backfill for this agent, or None."""
     queue = _pending_backfills.get(agent_id, [])
     if not queue:
@@ -74,19 +79,25 @@ async def pop_pending_backfill(agent_id: int) -> tuple[int, str] | None:
     return item
 
 
-async def persist_backfill(agent_id: int, location_id: int, location_name: str):
+async def persist_backfill(
+    agent_id: int,
+    location_id: int,
+    location_name: str,
+    scan_prefix: str | None = None,
+):
     """Persist a pending backfill to the database."""
     now = datetime.now(timezone.utc).isoformat(timespec="seconds")
 
-    async def _write(conn, aid, lid, lname, ts):
+    async def _write(conn, aid, lid, lname, sp, ts):
         await conn.execute(
             "INSERT OR REPLACE INTO pending_backfills "
-            "(agent_id, location_id, location_name, created_at) VALUES (?, ?, ?, ?)",
-            (aid, lid, lname, ts),
+            "(agent_id, location_id, location_name, scan_prefix, created_at) "
+            "VALUES (?, ?, ?, ?, ?)",
+            (aid, lid, lname, sp, ts),
         )
         await conn.commit()
 
-    await execute_write(_write, agent_id, location_id, location_name, now)
+    await execute_write(_write, agent_id, location_id, location_name, scan_prefix, now)
 
 
 async def clear_persisted_backfill(agent_id: int, location_id: int):
@@ -102,32 +113,42 @@ async def clear_persisted_backfill(agent_id: int, location_id: int):
     await execute_write(_delete, agent_id, location_id)
 
 
-async def load_persisted_backfills() -> list[tuple[int, int, str]]:
+async def load_persisted_backfills() -> list[tuple[int, int, str, str | None]]:
     """Load all persisted backfills from the database."""
     db = await get_db()
     rows = await db.execute_fetchall(
-        "SELECT agent_id, location_id, location_name FROM pending_backfills"
+        "SELECT agent_id, location_id, location_name, scan_prefix FROM pending_backfills"
     )
-    return [(r["agent_id"], r["location_id"], r["location_name"]) for r in rows]
+    return [
+        (r["agent_id"], r["location_id"], r["location_name"], r.get("scan_prefix"))
+        for r in rows
+    ]
 
 
 async def restore_backfills():
     """Reload pending backfills from DB into memory on startup."""
     rows = await load_persisted_backfills()
-    for agent_id, location_id, location_name in rows:
+    for agent_id, location_id, location_name, scan_prefix in rows:
         queue = _pending_backfills.setdefault(agent_id, [])
-        queue.append((location_id, location_name))
+        queue.append((location_id, location_name, scan_prefix))
     if rows:
         logger.info("Restored %d pending backfill(s) from previous session", len(rows))
 
 
-async def run_backfill(agent_id: int, location_id: int, location_name: str):
+async def run_backfill(
+    agent_id: int,
+    location_id: int,
+    location_name: str,
+    scan_prefix: str | None = None,
+):
     """Find files missing hash_strong that have cross-location size+partial
     matches, request full hashes from the agent, then backfill local matches.
+
+    When scan_prefix is set, only backfills files within that subtree.
     """
     # One backfill at a time per agent — queue if already running
     if agent_id in _active_backfills:
-        await queue_pending_backfill(agent_id, location_id, location_name)
+        await queue_pending_backfill(agent_id, location_id, location_name, scan_prefix)
         logger.info(
             "Backfill queued for %s (location %d) — agent #%d already running backfill",
             location_name,
@@ -139,8 +160,8 @@ async def run_backfill(agent_id: int, location_id: int, location_name: str):
     from file_hunter.services.agent_ops import dispatch
 
     _active_backfills[agent_id] = False
-    _backfill_info[agent_id] = (location_id, location_name)
-    await persist_backfill(agent_id, location_id, location_name)
+    _backfill_info[agent_id] = (location_id, location_name, scan_prefix)
+    await persist_backfill(agent_id, location_id, location_name, scan_prefix)
     db = None
 
     try:
@@ -156,21 +177,28 @@ async def run_backfill(agent_id: int, location_id: int, location_name: str):
 
         db = await open_connection()
 
+        prefix_clause = ""
+        params = [location_id]
+        if scan_prefix:
+            prefix_clause = "AND f.rel_path LIKE ?"
+            params.append(scan_prefix + "/%")
+
         candidates = await db.execute_fetchall(
-            """SELECT f.id, f.full_path, f.file_size, f.hash_partial
+            f"""SELECT f.id, f.full_path, f.file_size, f.hash_partial
                FROM files f
                WHERE f.location_id = ?
                  AND f.hash_strong IS NULL
                  AND f.hash_partial IS NOT NULL
                  AND f.file_size > 0
                  AND f.stale = 0
+                 {prefix_clause}
                  AND EXISTS (
                      SELECT 1 FROM files f2
                      WHERE f2.file_size = f.file_size
                        AND f2.hash_partial = f.hash_partial
                        AND f2.location_id != f.location_id
                  )""",
-            (location_id,),
+            params,
         )
 
         if not candidates:
@@ -376,7 +404,9 @@ async def run_backfill(agent_id: int, location_id: int, location_name: str):
                 next_item[0],
                 agent_id,
             )
-            asyncio.create_task(run_backfill(agent_id, next_item[0], next_item[1]))
+            asyncio.create_task(
+                run_backfill(agent_id, next_item[0], next_item[1], next_item[2])
+            )
 
 
 async def _flush_writes(db, writes: list[tuple[int, str, str]]):

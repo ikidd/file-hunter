@@ -108,6 +108,7 @@ async def prepare_finalization(agent_id: int, msg: dict) -> dict | None:
         "location_name": session.location_name,
         "scan_id": session.scan_id,
         "files_ingested": session.files_ingested,
+        "scan_prefix": scan_prefix,
     }
 
 

@@ -301,7 +301,14 @@ async def _finalize_scan(
                     loc_info[1],
                     files_ingested,
                 )
-                asyncio.create_task(run_backfill(agent_id, loc_info[0], loc_info[1]))
+                asyncio.create_task(
+                    run_backfill(
+                        agent_id,
+                        loc_info[0],
+                        loc_info[1],
+                        scan_prefix=info.get("scan_prefix"),
+                    )
+                )
             else:
                 logger.info(
                     "Agent #%d scan_completed: skipping backfill for "
@@ -472,7 +479,9 @@ async def agent_ws_endpoint(websocket: WebSocket):
             pending_bf[0],
             pending_bf[1],
         )
-        asyncio.create_task(run_backfill(agent_id, pending_bf[0], pending_bf[1]))
+        asyncio.create_task(
+            run_backfill(agent_id, pending_bf[0], pending_bf[1], pending_bf[2])
+        )
 
     # Message loop
     try:

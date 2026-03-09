@@ -167,6 +167,7 @@ _MIGRATIONS = [
     "ALTER TABLE scans ADD COLUMN scan_prefix TEXT",
     "ALTER TABLE scans ADD COLUMN incremental INTEGER NOT NULL DEFAULT 0",
     "ALTER TABLE scans ADD COLUMN deleted_json TEXT",
+    "ALTER TABLE pending_backfills ADD COLUMN scan_prefix TEXT",
 ]
 
 
