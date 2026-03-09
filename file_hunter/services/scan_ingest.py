@@ -93,7 +93,7 @@ async def prepare_finalization(agent_id: int, msg: dict) -> dict | None:
     if session.scan_path:
         scan_prefix = posixpath.relpath(session.scan_path, session.root_path)
 
-    deleted_json = json.dumps(deleted) if deleted else None
+    deleted_json = json.dumps(deleted) if deleted is not None else None
 
     await db.execute(
         """UPDATE scans SET status='finalizing',
