@@ -1,18 +1,21 @@
-"""Persistent size recalculation for folders and locations.
+"""Persistent counter recalculation for folders and locations.
 
-Sizes are stored in the database and recalculated after mutations (scan,
-delete, move, upload, merge, consolidate).  This eliminates expensive
-recursive CTEs and SUM aggregates on every tree/stats request.
+All four stored counters (file_count, total_size, duplicate_count,
+type_counts) are recalculated after mutations (scan, delete, move,
+upload, merge, consolidate).  This eliminates expensive recursive CTEs
+and SUM/GROUP BY aggregates on every tree/stats request.
 """
 
 import asyncio
+import json
 import logging
+from collections import defaultdict
 
 log = logging.getLogger(__name__)
 
 
 def schedule_size_recalc(*location_ids: int):
-    """Fire-and-forget size recalculation on its own connection.
+    """Fire-and-forget counter recalculation on its own connection.
 
     Safe to call from route handlers — runs in a background task so the
     HTTP response is not blocked by O(files+folders) DB work.
@@ -37,25 +40,34 @@ async def _bg_recalc_sizes(location_ids: list[int]):
         await db.close()
 
 
+def _merge_type_counts(a: dict, b: dict) -> dict:
+    """Merge two type_counts dicts by summing values."""
+    merged = dict(a)
+    for k, v in b.items():
+        merged[k] = merged.get(k, 0) + v
+    return merged
+
+
 async def recalculate_location_sizes(db, location_id: int):
-    """Recompute total_size and file_count for all folders in a location,
+    """Recompute all four stored counters for every folder in a location,
     then update the location totals.
 
+    Counters: file_count, total_size, duplicate_count, type_counts (JSON).
+
     Strategy:
-    1. Direct sizes per folder via indexed GROUP BY on files.
+    1. Direct values per folder via indexed GROUP BY on files.
     2. Build folder tree in memory from (id, parent_id).
-    3. Bottom-up accumulation: leaf folders get direct sizes, parents sum children.
+    3. Bottom-up accumulation: leaf folders get direct values, parents sum children.
     4. Batch UPDATE folders, then UPDATE the location row.
     """
-    # 1. Direct file sizes and counts per folder
+    # 1a. Direct file sizes and counts per folder
     direct_rows = await db.execute_fetchall(
         "SELECT folder_id, SUM(file_size) AS total, COUNT(*) AS cnt "
         "FROM files WHERE location_id = ? AND stale = 0 GROUP BY folder_id",
         (location_id,),
     )
-    direct_size = {}
-    direct_count = {}
-    # folder_id=None means files at the location root (no folder)
+    direct_size: dict[int, int] = {}
+    direct_count: dict[int, int] = {}
     root_file_size = 0
     root_file_count = 0
     for r in direct_rows:
@@ -67,13 +79,44 @@ async def recalculate_location_sizes(db, location_id: int):
             direct_size[fid] = r["total"] or 0
             direct_count[fid] = r["cnt"] or 0
 
+    # 1b. Direct duplicate counts per folder
+    dup_rows = await db.execute_fetchall(
+        "SELECT folder_id, COUNT(*) AS cnt "
+        "FROM files WHERE location_id = ? AND stale = 0 "
+        "AND hidden = 0 AND dup_exclude = 0 AND dup_count > 0 "
+        "GROUP BY folder_id",
+        (location_id,),
+    )
+    direct_dup: dict[int, int] = {}
+    root_dup_count = 0
+    for r in dup_rows:
+        fid = r["folder_id"]
+        if fid is None:
+            root_dup_count = r["cnt"] or 0
+        else:
+            direct_dup[fid] = r["cnt"] or 0
+
+    # 1c. Direct type counts per folder
+    type_rows = await db.execute_fetchall(
+        "SELECT folder_id, file_type_high, COUNT(*) AS cnt "
+        "FROM files WHERE location_id = ? AND stale = 0 "
+        "GROUP BY folder_id, file_type_high",
+        (location_id,),
+    )
+    direct_types: dict[int | None, dict[str, int]] = defaultdict(dict)
+    for r in type_rows:
+        fid = r["folder_id"]
+        ftype = r["file_type_high"] or ""
+        direct_types[fid][ftype] = r["cnt"] or 0
+    root_type_counts = dict(direct_types.get(None, {}))
+
     # 2. Build folder tree in memory
     folder_rows = await db.execute_fetchall(
         "SELECT id, parent_id FROM folders WHERE location_id = ?",
         (location_id,),
     )
-    children_of = {}  # parent_id -> [child_id, ...]
-    all_folder_ids = []
+    children_of: dict[int | None, list[int]] = {}
+    all_folder_ids: list[int] = []
     for f in folder_rows:
         fid = f["id"]
         pid = f["parent_id"]
@@ -83,27 +126,44 @@ async def recalculate_location_sizes(db, location_id: int):
         children_of[pid].append(fid)
 
     # 3. Bottom-up accumulation
-    cum_size = {}
-    cum_count = {}
+    cum_size: dict[int, int] = {}
+    cum_count: dict[int, int] = {}
+    cum_dup: dict[int, int] = {}
+    cum_types: dict[int, dict[str, int]] = {}
 
     def accumulate(fid):
         size = direct_size.get(fid, 0)
         count = direct_count.get(fid, 0)
+        dup = direct_dup.get(fid, 0)
+        types = dict(direct_types.get(fid, {}))
         for child_id in children_of.get(fid, []):
             accumulate(child_id)
             size += cum_size[child_id]
             count += cum_count[child_id]
+            dup += cum_dup[child_id]
+            types = _merge_type_counts(types, cum_types[child_id])
         cum_size[fid] = size
         cum_count[fid] = count
+        cum_dup[fid] = dup
+        cum_types[fid] = types
 
-    # Start from roots (parent_id IS NULL)
     for root_id in children_of.get(None, []):
         accumulate(root_id)
 
-    # 4. Batch UPDATE folders
+    # 4. Batch UPDATE folders (all four counters)
     await db.executemany(
-        "UPDATE folders SET total_size = ?, file_count = ? WHERE id = ?",
-        [(cum_size.get(fid, 0), cum_count.get(fid, 0), fid) for fid in all_folder_ids],
+        "UPDATE folders SET total_size = ?, file_count = ?, "
+        "duplicate_count = ?, type_counts = ? WHERE id = ?",
+        [
+            (
+                cum_size.get(fid, 0),
+                cum_count.get(fid, 0),
+                cum_dup.get(fid, 0),
+                json.dumps(cum_types.get(fid, {})),
+                fid,
+            )
+            for fid in all_folder_ids
+        ],
     )
 
     # 5. UPDATE location totals (sum of all files, including root-level)
@@ -113,9 +173,24 @@ async def recalculate_location_sizes(db, location_id: int):
     loc_total_count = root_file_count + sum(
         direct_count.get(fid, 0) for fid in all_folder_ids
     )
+    loc_dup_count = root_dup_count + sum(
+        direct_dup.get(fid, 0) for fid in all_folder_ids
+    )
+    loc_type_counts = dict(root_type_counts)
+    for fid in all_folder_ids:
+        for ftype, cnt in direct_types.get(fid, {}).items():
+            loc_type_counts[ftype] = loc_type_counts.get(ftype, 0) + cnt
+
     await db.execute(
-        "UPDATE locations SET total_size = ?, file_count = ? WHERE id = ?",
-        (loc_total_size, loc_total_count, location_id),
+        "UPDATE locations SET total_size = ?, file_count = ?, "
+        "duplicate_count = ?, type_counts = ? WHERE id = ?",
+        (
+            loc_total_size,
+            loc_total_count,
+            loc_dup_count,
+            json.dumps(loc_type_counts),
+            location_id,
+        ),
     )
     await db.commit()
 

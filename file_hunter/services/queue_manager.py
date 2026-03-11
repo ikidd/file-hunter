@@ -314,8 +314,7 @@ async def update_params(op_id: int, params: dict):
 async def _set_running(op_id: int):
     db = await get_db()
     await db.execute(
-        "UPDATE operation_queue SET status = 'running', started_at = ? "
-        "WHERE id = ?",
+        "UPDATE operation_queue SET status = 'running', started_at = ? WHERE id = ?",
         (_now(), op_id),
     )
     await db.commit()
@@ -344,8 +343,7 @@ async def _set_failed(op_id: int, error: str):
 async def _set_status_pending(op_id: int):
     db = await get_db()
     await db.execute(
-        "UPDATE operation_queue SET status = 'pending', started_at = NULL "
-        "WHERE id = ?",
+        "UPDATE operation_queue SET status = 'pending', started_at = NULL WHERE id = ?",
         (op_id,),
     )
     await db.commit()

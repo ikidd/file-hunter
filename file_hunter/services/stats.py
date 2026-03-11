@@ -3,9 +3,14 @@
 Results are cached on first access and refreshed in the background after any
 catalog mutation.  invalidate_stats_cache() schedules an async refresh rather
 than clearing the cache, so the UI always gets an instant response.
+
+All four counters (file_count, total_size, duplicate_count, type_counts) are
+stored on locations and folders tables — no aggregate queries against files
+at read time.
 """
 
 import asyncio
+import json
 import logging
 import os
 
@@ -69,15 +74,13 @@ async def _refresh_all():
 
 
 async def _refresh_dashboard(db):
-    """Run the expensive dashboard queries and update the cache atomically."""
-    loc_agg_rows, dup_rows, recent_scans_rows, type_rows = await asyncio.gather(
+    """Refresh dashboard stats from stored counters on locations table."""
+    loc_agg_rows, recent_scans_rows = await asyncio.gather(
         db.execute_fetchall(
             "SELECT COUNT(*) as c, COALESCE(SUM(total_size), 0) as s, "
-            "COALESCE(SUM(file_count), 0) as fc FROM locations"
-        ),
-        db.execute_fetchall(
-            "SELECT COUNT(*) as c FROM files "
-            "WHERE dup_count > 0 AND stale = 0 AND hidden = 0 AND dup_exclude = 0"
+            "COALESCE(SUM(file_count), 0) as fc, "
+            "COALESCE(SUM(duplicate_count), 0) as dc "
+            "FROM locations"
         ),
         db.execute_fetchall(
             """SELECT s.id, l.name as location_name, s.status, s.started_at,
@@ -87,18 +90,26 @@ async def _refresh_dashboard(db):
                ORDER BY s.started_at DESC
                LIMIT 5"""
         ),
-        db.execute_fetchall(
-            """SELECT file_type_high, COUNT(*) as c
-               FROM files WHERE stale = 0
-               GROUP BY file_type_high ORDER BY c DESC"""
-        ),
     )
 
     total_locations = loc_agg_rows[0]["c"]
     total_size = loc_agg_rows[0]["s"]
     total_files = loc_agg_rows[0]["fc"]
-    dup_count = dup_rows[0]["c"]
-    type_breakdown = [{"type": r["file_type_high"], "count": r["c"]} for r in type_rows]
+    dup_count = loc_agg_rows[0]["dc"]
+
+    # Aggregate type_counts from all locations
+    loc_type_rows = await db.execute_fetchall(
+        "SELECT type_counts FROM locations WHERE type_counts != '{}'"
+    )
+    merged_types: dict[str, int] = {}
+    for r in loc_type_rows:
+        for ftype, cnt in json.loads(r["type_counts"] or "{}").items():
+            merged_types[ftype] = merged_types.get(ftype, 0) + cnt
+    type_breakdown = sorted(
+        [{"type": t, "count": c} for t, c in merged_types.items()],
+        key=lambda x: x["count"],
+        reverse=True,
+    )
 
     recent_scans = [
         {
@@ -126,10 +137,10 @@ async def _refresh_dashboard(db):
 
 
 async def _refresh_all_locations(db):
-    """Refresh cached stats for all locations."""
+    """Refresh cached stats for all locations from stored counters."""
     loc_rows = await db.execute_fetchall(
         "SELECT id, name, root_path, date_added, "
-        "total_size, file_count, "
+        "total_size, file_count, duplicate_count, type_counts, "
         "scan_schedule_enabled, scan_schedule_days, scan_schedule_time, "
         "scan_schedule_last_run FROM locations"
     )
@@ -138,33 +149,25 @@ async def _refresh_all_locations(db):
 
 
 async def _refresh_location(db, loc):
-    """Refresh cached stats for a single location."""
+    """Refresh cached stats for a single location using stored counters."""
     location_id = loc["id"]
 
-    dup_rows, folder_rows, type_rows = await asyncio.gather(
-        db.execute_fetchall(
-            "SELECT COUNT(*) as c FROM files "
-            "WHERE location_id = ? AND dup_count > 0 AND stale = 0 "
-            "AND hidden = 0 AND dup_exclude = 0",
-            (location_id,),
-        ),
-        db.execute_fetchall(
-            "SELECT COUNT(*) as c FROM folders WHERE location_id = ?",
-            (location_id,),
-        ),
-        db.execute_fetchall(
-            """SELECT file_type_high, COUNT(*) as c
-               FROM files WHERE location_id = ? AND stale = 0
-               GROUP BY file_type_high ORDER BY c DESC""",
-            (location_id,),
-        ),
+    folder_rows = await db.execute_fetchall(
+        "SELECT COUNT(*) as c FROM folders WHERE location_id = ?",
+        (location_id,),
     )
 
     file_count = loc["file_count"] or 0
     total_size = loc["total_size"] or 0
-    dup_count = dup_rows[0]["c"]
+    dup_count = loc["duplicate_count"] or 0
     folder_count = folder_rows[0]["c"]
-    type_breakdown = [{"type": r["file_type_high"], "count": r["c"]} for r in type_rows]
+
+    tc = json.loads(loc["type_counts"] or "{}")
+    type_breakdown = sorted(
+        [{"type": t, "count": c} for t, c in tc.items()],
+        key=lambda x: x["count"],
+        reverse=True,
+    )
 
     days_str = loc["scan_schedule_days"] or ""
     schedule_days = [int(d) for d in days_str.split(",") if d.strip()]
@@ -197,19 +200,37 @@ async def get_stats(db):
     if cached is not None:
         return cached
 
-    # Cache miss — return fast partial data, don't block on expensive queries.
-    loc_agg_rows = await db.execute_fetchall(
-        "SELECT COUNT(*) as c, COALESCE(SUM(total_size), 0) as s, "
-        "COALESCE(SUM(file_count), 0) as fc FROM locations"
+    # Cache miss — all four counters are stored on locations, so this is fast.
+    loc_agg_rows, loc_type_rows, recent_scans_rows = await asyncio.gather(
+        db.execute_fetchall(
+            "SELECT COUNT(*) as c, COALESCE(SUM(total_size), 0) as s, "
+            "COALESCE(SUM(file_count), 0) as fc, "
+            "COALESCE(SUM(duplicate_count), 0) as dc "
+            "FROM locations"
+        ),
+        db.execute_fetchall(
+            "SELECT type_counts FROM locations WHERE type_counts != '{}'"
+        ),
+        db.execute_fetchall(
+            """SELECT s.id, l.name as location_name, s.status, s.started_at,
+                      s.completed_at, s.files_found, s.files_hashed, s.duplicates_found
+               FROM scans s
+               JOIN locations l ON l.id = s.location_id
+               ORDER BY s.started_at DESC
+               LIMIT 5"""
+        ),
     )
-    recent_scans_rows = await db.execute_fetchall(
-        """SELECT s.id, l.name as location_name, s.status, s.started_at,
-                  s.completed_at, s.files_found, s.files_hashed, s.duplicates_found
-           FROM scans s
-           JOIN locations l ON l.id = s.location_id
-           ORDER BY s.started_at DESC
-           LIMIT 5"""
+
+    merged_types: dict[str, int] = {}
+    for r in loc_type_rows:
+        for ftype, cnt in json.loads(r["type_counts"] or "{}").items():
+            merged_types[ftype] = merged_types.get(ftype, 0) + cnt
+    type_breakdown = sorted(
+        [{"type": t, "count": c} for t, c in merged_types.items()],
+        key=lambda x: x["count"],
+        reverse=True,
     )
+
     recent_scans = [
         {
             "id": r["id"],
@@ -229,10 +250,10 @@ async def get_stats(db):
     return {
         "totalFiles": total_files,
         "totalLocations": loc_agg_rows[0]["c"],
-        "duplicateFiles": 0,  # filled by background refresh
+        "duplicateFiles": loc_agg_rows[0]["dc"],
         "totalSize": total_size,
         "totalSizeFormatted": format_size(total_size),
-        "typeBreakdown": [],  # filled by background refresh
+        "typeBreakdown": type_breakdown,
         "recentScans": recent_scans,
     }
 
@@ -276,11 +297,10 @@ async def get_location_stats(db, location_id: int):
             "dateLastScanned": None,
         }
 
-    # Cache miss — return fast partial data from locations/folders tables.
-    # Skip expensive files-table queries; background refresh fills those in.
+    # Cache miss — all four counters stored on locations table, so this is fast.
     loc_row = await db.execute_fetchall(
         "SELECT id, name, root_path, date_added, date_last_scanned, "
-        "total_size, file_count, "
+        "total_size, file_count, duplicate_count, type_counts, "
         "scan_schedule_enabled, scan_schedule_days, scan_schedule_time, "
         "scan_schedule_last_run FROM locations WHERE id = ?",
         (location_id,),
@@ -302,6 +322,13 @@ async def get_location_stats(db, location_id: int):
     days_str = loc["scan_schedule_days"] or ""
     schedule_days = [int(d) for d in days_str.split(",") if d.strip()]
 
+    tc = json.loads(loc["type_counts"] or "{}")
+    type_breakdown = sorted(
+        [{"type": t, "count": c} for t, c in tc.items()],
+        key=lambda x: x["count"],
+        reverse=True,
+    )
+
     return {
         "name": loc["name"],
         "rootPath": loc["root_path"],
@@ -310,8 +337,8 @@ async def get_location_stats(db, location_id: int):
         "folderCount": folder_rows[0]["c"],
         "totalSize": loc["total_size"] or 0,
         "totalSizeFormatted": format_size(loc["total_size"] or 0),
-        "duplicateFiles": 0,  # filled by background refresh
-        "typeBreakdown": [],  # filled by background refresh
+        "duplicateFiles": loc["duplicate_count"] or 0,
+        "typeBreakdown": type_breakdown,
         "scheduleEnabled": bool(loc["scan_schedule_enabled"]),
         "scheduleDays": schedule_days,
         "scheduleTime": loc["scan_schedule_time"] or "03:00",
@@ -349,10 +376,10 @@ async def get_folder_stats(db, folder_id: int):
         result["online"] = folder_online
         return result
 
-    # Folder metadata must be fetched first (need location_id, root_path, etc.)
+    # Folder metadata — includes stored counters (duplicate_count is cumulative)
     folder_row = await db.execute_fetchall(
         """SELECT f.id, f.name, f.rel_path, f.location_id,
-                  f.total_size, f.file_count, f.dup_exclude,
+                  f.total_size, f.file_count, f.duplicate_count, f.dup_exclude,
                   l.name as location_name, l.root_path as location_root_path
            FROM folders f JOIN locations l ON l.id = f.location_id
            WHERE f.id = ?""",
@@ -362,24 +389,12 @@ async def get_folder_stats(db, folder_id: int):
         return None
     fld = folder_row[0]
 
-    # Run remaining queries concurrently
+    # Run remaining queries concurrently — no recursive CTE against files needed
     (
-        dup_rows,
         subfolder_rows,
         chain_rows,
         loc_online,
     ) = await asyncio.gather(
-        db.execute_fetchall(
-            """WITH RECURSIVE descendants(id) AS (
-                       SELECT ?
-                       UNION ALL
-                       SELECT fo.id FROM folders fo JOIN descendants d ON fo.parent_id = d.id
-                   )
-                   SELECT COUNT(*) as c FROM files f
-                   WHERE f.folder_id IN (SELECT id FROM descendants)
-                     AND f.dup_count > 0 AND f.stale = 0 AND f.hidden = 0 AND f.dup_exclude = 0""",
-            (folder_id,),
-        ),
         db.execute_fetchall(
             """WITH RECURSIVE descendants(id) AS (
                        SELECT fo.id FROM folders fo WHERE fo.parent_id = ?
@@ -404,7 +419,7 @@ async def get_folder_stats(db, folder_id: int):
         ),
     )
 
-    dup_count = dup_rows[0]["c"]
+    dup_count = fld["duplicate_count"] or 0
     subfolder_count = subfolder_rows[0]["c"]
 
     # Build breadcrumb from chain query results

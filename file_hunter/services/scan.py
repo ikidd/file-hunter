@@ -129,9 +129,7 @@ async def run_scan(op_id: int, agent_id: int, params: dict):
                     "WHERE location_id = ? AND rel_path = ?",
                     (location_id, rel_path),
                 )
-                size_changed = old_row and old_row[0]["file_size"] != f.get(
-                    "file_size"
-                )
+                size_changed = old_row and old_row[0]["file_size"] != f.get("file_size")
                 if size_changed:
                     await db.execute(
                         "UPDATE files SET hash_fast = NULL, hash_strong = NULL "
@@ -317,9 +315,7 @@ async def run_scan(op_id: int, agent_id: int, params: dict):
         invalidate_stats_cache()
 
         # Launch cross-agent backfill if needed
-        await _maybe_launch_backfill(
-            agent_id, location_id, location_name, scan_prefix
-        )
+        await _maybe_launch_backfill(agent_id, location_id, location_name, scan_prefix)
 
     except asyncio.CancelledError:
         # Operation was cancelled via queue_manager
@@ -437,9 +433,7 @@ async def _maybe_launch_backfill(
         location_id,
         location_name,
     )
-    asyncio.create_task(
-        run_backfill(agent_id, location_id, location_name, scan_prefix)
-    )
+    asyncio.create_task(run_backfill(agent_id, location_id, location_name, scan_prefix))
 
 
 def _now() -> str:

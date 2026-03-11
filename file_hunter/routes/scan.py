@@ -43,7 +43,9 @@ async def start_scan(request: Request):
     status = await get_queue_status()
     for item in status:
         if item.get("location_id") == loc_id:
-            return json_error(f"'{location_name}' already has a pending operation.", 409)
+            return json_error(
+                f"'{location_name}' already has a pending operation.", 409
+            )
 
     # Resolve scan path (full location or subfolder)
     scan_path = root_path
@@ -76,9 +78,7 @@ async def start_scan(request: Request):
     )
 
     label = f"{location_name} / {folder_name}" if folder_name else location_name
-    return json_ok(
-        {"message": f"Scan queued for '{label}'", "queue_id": op_id}
-    )
+    return json_ok({"message": f"Scan queued for '{label}'", "queue_id": op_id})
 
 
 async def cancel_scan(request: Request):
