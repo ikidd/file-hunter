@@ -279,21 +279,35 @@ async def get_location_stats(db, location_id: int):
             lr = live_row[0]
             days_str = lr["scan_schedule_days"] or ""
             sched_days = [int(d) for d in days_str.split(",") if d.strip()]
-            return {
+            result = {
                 **cached,
                 "online": online,
                 "diskStats": disk_stats,
                 "dateLastScanned": lr["date_last_scanned"],
+                "lastScanStatus": None,
                 "scheduleEnabled": bool(lr["scan_schedule_enabled"]),
                 "scheduleDays": sched_days,
                 "scheduleTime": lr["scan_schedule_time"] or "03:00",
                 "scheduleLastRun": lr["scan_schedule_last_run"],
             }
+            if not lr["date_last_scanned"]:
+                last_scan = await db.execute_fetchall(
+                    "SELECT status, started_at, completed_at FROM scans "
+                    "WHERE location_id = ? ORDER BY started_at DESC LIMIT 1",
+                    (location_id,),
+                )
+                if last_scan:
+                    result["lastScanStatus"] = last_scan[0]["status"]
+                    result["dateLastScanned"] = (
+                        last_scan[0]["completed_at"] or last_scan[0]["started_at"]
+                    )
+            return result
         return {
             **cached,
             "online": online,
             "diskStats": disk_stats,
             "dateLastScanned": None,
+            "lastScanStatus": None,
         }
 
     # Cache miss — all four counters stored on locations table, so this is fast.
@@ -328,7 +342,7 @@ async def get_location_stats(db, location_id: int):
         reverse=True,
     )
 
-    return {
+    result = {
         "name": loc["name"],
         "rootPath": loc["root_path"],
         "dateAdded": loc["date_added"],
@@ -345,7 +359,23 @@ async def get_location_stats(db, location_id: int):
         "online": online,
         "diskStats": disk_stats,
         "dateLastScanned": loc["date_last_scanned"],
+        "lastScanStatus": None,
     }
+
+    # If date_last_scanned is NULL, check the scans table for the most recent attempt
+    if not loc["date_last_scanned"]:
+        last_scan = await db.execute_fetchall(
+            "SELECT status, started_at, completed_at FROM scans "
+            "WHERE location_id = ? ORDER BY started_at DESC LIMIT 1",
+            (location_id,),
+        )
+        if last_scan:
+            result["lastScanStatus"] = last_scan[0]["status"]
+            result["dateLastScanned"] = (
+                last_scan[0]["completed_at"] or last_scan[0]["started_at"]
+            )
+
+    return result
 
 
 async def get_folder_stats(db, folder_id: int):

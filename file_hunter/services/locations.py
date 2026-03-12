@@ -223,15 +223,21 @@ async def get_expand_path(db, target_id: int):
         parent_ids_to_fetch.append(a["id"])  # children of this ancestor
 
     # Fetch children for all ancestor folders (batch)
+    from file_hunter.services.settings import get_setting
+
+    show_hidden = await get_setting(db, "showHiddenFiles") == "1"
+    hidden_filter = "" if show_hidden else " AND f.hidden = 0"
+    child_hidden_filter = "" if show_hidden else " AND c.hidden = 0"
+
     children_by_parent = {}
 
     if parent_ids_to_fetch:
         placeholders = ",".join("?" * len(parent_ids_to_fetch))
         rows = await db.execute_fetchall(
-            f"""SELECT f.id, f.parent_id, f.name, f.total_size,
-                       EXISTS(SELECT 1 FROM folders c WHERE c.parent_id = f.id) AS has_children
+            f"""SELECT f.id, f.parent_id, f.name, f.total_size, f.hidden,
+                       EXISTS(SELECT 1 FROM folders c WHERE c.parent_id = f.id{child_hidden_filter}) AS has_children
                 FROM folders f
-                WHERE f.parent_id IN ({placeholders})
+                WHERE f.parent_id IN ({placeholders}){hidden_filter}
                 ORDER BY f.name""",
             parent_ids_to_fetch,
         )
@@ -240,30 +246,32 @@ async def get_expand_path(db, target_id: int):
             key = f"fld-{r['parent_id']}"
             if key not in children_by_parent:
                 children_by_parent[key] = []
-            children_by_parent[key].append(
-                {
-                    "id": f"fld-{r['id']}",
-                    "type": "folder",
-                    "label": r["name"],
-                    "hasChildren": bool(r["has_children"]),
-                    "totalSize": r["total_size"],
-                    "children": None,
-                }
-            )
+            child_node = {
+                "id": f"fld-{r['id']}",
+                "type": "folder",
+                "label": r["name"],
+                "hasChildren": bool(r["has_children"]),
+                "totalSize": r["total_size"],
+                "children": None,
+            }
+            if r["hidden"]:
+                child_node["hidden"] = True
+            children_by_parent[key].append(child_node)
 
     # Also fetch root-level siblings (children of the location)
     root_rows = await db.execute_fetchall(
-        """SELECT f.id, f.name, f.total_size,
-                  EXISTS(SELECT 1 FROM folders c WHERE c.parent_id = f.id) AS has_children
+        f"""SELECT f.id, f.name, f.total_size, f.hidden,
+                  EXISTS(SELECT 1 FROM folders c WHERE c.parent_id = f.id{child_hidden_filter}) AS has_children
            FROM folders f
-           WHERE f.location_id = ? AND f.parent_id IS NULL
+           WHERE f.location_id = ? AND f.parent_id IS NULL{hidden_filter}
            ORDER BY f.name""",
         (location_id,),
     )
 
     loc_key = f"loc-{location_id}"
-    children_by_parent[loc_key] = [
-        {
+    children_by_parent[loc_key] = []
+    for r in root_rows:
+        child_node = {
             "id": f"fld-{r['id']}",
             "type": "folder",
             "label": r["name"],
@@ -271,8 +279,9 @@ async def get_expand_path(db, target_id: int):
             "totalSize": r["total_size"],
             "children": None,
         }
-        for r in root_rows
-    ]
+        if r["hidden"]:
+            child_node["hidden"] = True
+        children_by_parent[loc_key].append(child_node)
 
     return {
         "locationId": loc_key,

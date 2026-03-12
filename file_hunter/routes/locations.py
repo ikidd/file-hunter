@@ -42,8 +42,23 @@ async def add_location(request: Request):
         resolved = _resolve_agent(agent_id)
         if resolved:
             host, port, token = resolved
-            data = await _post(host, port, token, "/files/exists", {"path": path})
-            if not data.get("is_dir"):
+            # Use /browse-system to validate — /files/exists rejects paths
+            # not yet in a configured location, but we're adding a new one.
+            from urllib.parse import quote
+            from file_hunter.services.agent_ops import _get
+
+            try:
+                browse_data = await _get(
+                    host,
+                    port,
+                    token,
+                    f"/browse-system?path={quote(path, safe='')}",
+                )
+            except Exception:
+                return json_error(
+                    f"Path does not exist or is not a directory: {path}", 400
+                )
+            if not browse_data.get("path"):
                 return json_error(
                     f"Path does not exist or is not a directory: {path}", 400
                 )

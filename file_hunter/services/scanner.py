@@ -62,12 +62,19 @@ async def _ensure_folder_hierarchy(
 
         # Check DB
         row = await db.execute_fetchall(
-            "SELECT id, dup_exclude FROM folders WHERE location_id = ? AND rel_path = ?",
+            "SELECT id, dup_exclude, hidden FROM folders WHERE location_id = ? AND rel_path = ?",
             (location_id, current_path),
         )
         if row:
             folder_id = row[0]["id"]
             leaf_dup_exclude = row[0]["dup_exclude"]
+            # Fix hidden flag on existing folders (e.g. after migration defaulted to 0)
+            expected_hidden = 1 if is_hidden else 0
+            if row[0]["hidden"] != expected_hidden:
+                await db.execute(
+                    "UPDATE folders SET hidden = ? WHERE id = ?",
+                    (expected_hidden, folder_id),
+                )
         else:
             cursor = await db.execute(
                 "INSERT INTO folders (location_id, parent_id, name, rel_path, hidden) VALUES (?, ?, ?, ?, ?)",

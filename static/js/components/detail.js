@@ -162,7 +162,7 @@ const Detail = {
         const dup = this.el.querySelector('[data-stat="duplicates"]');
         if (dup) dup.textContent = s.duplicateFiles.toLocaleString();
         const ls = this.el.querySelector('[data-stat="lastScanned"]');
-        if (ls) ls.textContent = s.dateLastScanned ? _timeAgo(s.dateLastScanned) : 'Never';
+        if (ls) ls.textContent = s.dateLastScanned ? _timeAgo(s.dateLastScanned) + (s.lastScanStatus && s.lastScanStatus !== 'completed' ? ' (' + s.lastScanStatus + ')' : '') : 'Never';
         const tb = this.el.querySelector('[data-stat="typeBreakdown"]');
         if (tb && s.typeBreakdown) {
             tb.innerHTML = '<h3>File Types</h3>' + s.typeBreakdown.map(t =>
@@ -683,9 +683,10 @@ const Detail = {
         if (s.recentScans && s.recentScans.length > 0) {
             scansHtml = s.recentScans.map(scan => {
                 const ago = _timeAgo(scan.completedAt || scan.startedAt);
+                const suffix = scan.status && scan.status !== 'completed' ? ` (${scan.status})` : '';
                 return `<div class="detail-field">
                     <span class="label">${scan.location}</span>
-                    <span class="value">${ago}</span>
+                    <span class="value">${ago}${suffix}</span>
                 </div>`;
             }).join('');
         }
@@ -1390,7 +1391,7 @@ const Detail = {
                 </div>
                 <div class="detail-field">
                     <span class="label">Last Scanned</span>
-                    <span class="value" data-stat="lastScanned">${s.dateLastScanned ? _timeAgo(s.dateLastScanned) : 'Never'}</span>
+                    <span class="value" data-stat="lastScanned">${s.dateLastScanned ? _timeAgo(s.dateLastScanned) + (s.lastScanStatus && s.lastScanStatus !== 'completed' ? ' (' + s.lastScanStatus + ')' : '') : 'Never'}</span>
                 </div>
             </div>
             ${s.online ? `<div class="detail-section">
