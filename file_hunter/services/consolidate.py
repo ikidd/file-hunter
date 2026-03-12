@@ -3,6 +3,7 @@
 import os
 from datetime import datetime, timezone
 
+from file_hunter.db import db_writer, get_db
 from file_hunter.services import fs
 from file_hunter.ws.scan import broadcast
 
@@ -14,17 +15,20 @@ def is_consolidation_running(hash_strong: str) -> bool:
     return hash_strong in _active_consolidations
 
 
-async def run_consolidation(db, file_id: int, mode: str, dest_folder_id: str | None):
+async def run_consolidation(file_id: int, mode: str, dest_folder_id: str | None):
     """Main consolidation background task.
 
     mode: 'keep_here' or 'copy_to'
     dest_folder_id: required for copy_to (e.g. 'loc-4' or 'fld-7')
+
+    Reads via get_db(), writes via db_writer(). No owned connection.
     """
     hash_strong = None
     filename = None
     stubs_written = 0
     stubs_queued = 0
     try:
+        db = await get_db()
         # Load the selected file
         rows = await db.execute_fetchall(
             """SELECT f.*, l.name as location_name, l.root_path
@@ -127,10 +131,11 @@ async def run_consolidation(db, file_id: int, mode: str, dest_folder_id: str | N
             real_fast, real_strong = await fs.file_hash(canonical_path, selected_loc_id)
             if real_strong != hash_strong:
                 # DB hash was stale — update the canonical record
-                await db.execute(
-                    "UPDATE files SET hash_fast=?, hash_strong=? WHERE id=?",
-                    (real_fast, real_strong, file_id),
-                )
+                async with db_writer() as wdb:
+                    await wdb.execute(
+                        "UPDATE files SET hash_fast=?, hash_strong=? WHERE id=?",
+                        (real_fast, real_strong, file_id),
+                    )
                 selected["hash_fast"] = real_fast
                 selected["hash_strong"] = real_strong
 
@@ -259,7 +264,7 @@ async def run_consolidation(db, file_id: int, mode: str, dest_folder_id: str | N
 
             # Create DB record for the canonical copy at destination
             canonical_id = await _ensure_canonical_record(
-                db, canonical_path, dest_folder_id, dest_loc_id, selected, now_iso
+                canonical_path, dest_folder_id, dest_loc_id, selected, now_iso
             )
 
         else:
@@ -276,13 +281,11 @@ async def run_consolidation(db, file_id: int, mode: str, dest_folder_id: str | N
         # Write .sources file next to canonical
         await fs.write_sources_file(canonical_path, all_copies, now_iso, dest_loc_id)
         await _insert_stub_record(
-            db,
             canonical_path + ".sources",
             canonical_id,
             dest_loc_id,
             now_iso,
         )
-        await db.commit()
 
         # Process each duplicate (everything except the canonical)
         duplicates = [c for c in all_copies if c["id"] != canonical_id]
@@ -325,28 +328,46 @@ async def run_consolidation(db, file_id: int, mode: str, dest_folder_id: str | N
                     stub_rel = copy["rel_path"] + ".moved"
                     st = await fs.file_stat(stub_path, copy_loc_id)
                     stub_size = st["size"] if st else 0
-                    await db.execute(
-                        """UPDATE files SET
-                            filename=?, full_path=?, rel_path=?,
-                            file_type_high='text', file_type_low='moved',
-                            file_size=?, hash_fast=NULL, hash_strong=NULL,
-                            modified_date=?, date_last_seen=?
-                           WHERE id=?""",
-                        (
-                            stub_name,
-                            stub_path,
-                            stub_rel,
-                            stub_size,
-                            now_iso,
-                            now_iso,
-                            copy["id"],
-                        ),
-                    )
+                    async with db_writer() as wdb:
+                        await wdb.execute(
+                            """UPDATE files SET
+                                filename=?, full_path=?, rel_path=?,
+                                file_type_high='text', file_type_low='moved',
+                                file_size=?, hash_fast=NULL, hash_strong=NULL,
+                                modified_date=?, date_last_seen=?
+                               WHERE id=?""",
+                            (
+                                stub_name,
+                                stub_path,
+                                stub_rel,
+                                stub_size,
+                                now_iso,
+                                now_iso,
+                                copy["id"],
+                            ),
+                        )
                     stubs_written += 1
-                    await db.commit()
                 except Exception:
                     stubs_queued += 1
-                    await db.execute(
+                    async with db_writer() as wdb:
+                        await wdb.execute(
+                            """INSERT INTO consolidation_jobs
+                               (source_file, source_location_id, source_path,
+                                destination_path, status, date_created)
+                               VALUES (?, ?, ?, ?, 'pending', ?)""",
+                            (
+                                copy["filename"],
+                                copy_loc_id,
+                                original_path,
+                                canonical_path,
+                                now_iso,
+                            ),
+                        )
+            else:
+                # Offline or file missing — queue for later
+                stubs_queued += 1
+                async with db_writer() as wdb:
+                    await wdb.execute(
                         """INSERT INTO consolidation_jobs
                            (source_file, source_location_id, source_path,
                             destination_path, status, date_created)
@@ -359,24 +380,6 @@ async def run_consolidation(db, file_id: int, mode: str, dest_folder_id: str | N
                             now_iso,
                         ),
                     )
-                    await db.commit()
-            else:
-                # Offline or file missing — queue for later
-                stubs_queued += 1
-                await db.execute(
-                    """INSERT INTO consolidation_jobs
-                       (source_file, source_location_id, source_path,
-                        destination_path, status, date_created)
-                       VALUES (?, ?, ?, ?, 'pending', ?)""",
-                    (
-                        copy["filename"],
-                        copy_loc_id,
-                        original_path,
-                        canonical_path,
-                        now_iso,
-                    ),
-                )
-                await db.commit()
 
         await broadcast(
             {
@@ -396,13 +399,11 @@ async def run_consolidation(db, file_id: int, mode: str, dest_folder_id: str | N
 
         affected_loc_ids = {c["location_id"] for c in all_copies}
         for lid in affected_loc_ids:
-            await recalculate_location_sizes(db, lid)
+            await recalculate_location_sizes(lid)
 
         from file_hunter.services.dup_counts import recalculate_dup_counts
 
-        await recalculate_dup_counts(
-            db, {hash_strong}, source=f"consolidate {filename}"
-        )
+        await recalculate_dup_counts({hash_strong}, source=f"consolidate {filename}")
 
     except Exception as exc:
         await broadcast(
@@ -419,25 +420,18 @@ async def run_consolidation(db, file_id: int, mode: str, dest_folder_id: str | N
     finally:
         if hash_strong:
             _active_consolidations.discard(hash_strong)
-        try:
-            await db.close()
-        except Exception:
-            pass
 
 
 async def run_batch_consolidation(
-    db, file_ids: list[int], mode: str, dest_folder_id: str | None
+    file_ids: list[int], mode: str, dest_folder_id: str | None
 ):
     """Run consolidation for multiple files sequentially in the background."""
-    from file_hunter.db import open_connection
-
     completed = 0
     errors = 0
 
     for file_id in file_ids:
         try:
-            task_db = await open_connection()
-            await run_consolidation(task_db, file_id, mode, dest_folder_id)
+            await run_consolidation(file_id, mode, dest_folder_id)
             completed += 1
         except Exception:
             errors += 1
@@ -451,17 +445,14 @@ async def run_batch_consolidation(
         }
     )
 
-    try:
-        await db.close()
-    except Exception:
-        pass
 
-
-async def drain_pending_jobs(db, location_id: int, root_path: str):
+async def drain_pending_jobs(location_id: int, root_path: str):
     """Drain queued consolidation jobs for a location that's now online.
 
     Called when an agent reconnects and its locations come online.
+    Reads via get_db(), writes via db_writer().
     """
+    db = await get_db()
     rows = await db.execute_fetchall(
         """SELECT id, source_file, source_path, destination_path
            FROM consolidation_jobs
@@ -492,50 +483,52 @@ async def drain_pending_jobs(db, location_id: int, root_path: str):
                     "SELECT id, rel_path FROM files WHERE full_path = ? AND location_id = ?",
                     (source_path, location_id),
                 )
-                if file_rows:
-                    fid = file_rows[0]["id"]
-                    stub_rel = file_rows[0]["rel_path"] + ".moved"
-                    st = await fs.file_stat(stub_path, location_id)
-                    stub_size = st["size"] if st else 0
-                    await db.execute(
-                        """UPDATE files SET
-                            filename=?, full_path=?, rel_path=?,
-                            file_type_high='text', file_type_low='moved',
-                            file_size=?, hash_fast=NULL, hash_strong=NULL,
-                            modified_date=?, date_last_seen=?
-                           WHERE id=?""",
-                        (
-                            stub_name,
-                            stub_path,
-                            stub_rel,
-                            stub_size,
-                            now_iso,
-                            now_iso,
-                            fid,
-                        ),
+
+                async with db_writer() as wdb:
+                    if file_rows:
+                        fid = file_rows[0]["id"]
+                        stub_rel = file_rows[0]["rel_path"] + ".moved"
+                        st = await fs.file_stat(stub_path, location_id)
+                        stub_size = st["size"] if st else 0
+                        await wdb.execute(
+                            """UPDATE files SET
+                                filename=?, full_path=?, rel_path=?,
+                                file_type_high='text', file_type_low='moved',
+                                file_size=?, hash_fast=NULL, hash_strong=NULL,
+                                modified_date=?, date_last_seen=?
+                               WHERE id=?""",
+                            (
+                                stub_name,
+                                stub_path,
+                                stub_rel,
+                                stub_size,
+                                now_iso,
+                                now_iso,
+                                fid,
+                            ),
+                        )
+                    else:
+                        await wdb.execute(
+                            "DELETE FROM files WHERE full_path = ? AND location_id = ?",
+                            (source_path, location_id),
+                        )
+                    await wdb.execute(
+                        "UPDATE consolidation_jobs SET status = 'completed', date_completed = ? WHERE id = ?",
+                        (now_iso, job["id"]),
                     )
-                else:
-                    await db.execute(
-                        "DELETE FROM files WHERE full_path = ? AND location_id = ?",
-                        (source_path, location_id),
-                    )
-                await db.execute(
-                    "UPDATE consolidation_jobs SET status = 'completed', date_completed = ? WHERE id = ?",
-                    (now_iso, job["id"]),
-                )
                 jobs_completed += 1
             except Exception:
                 pass
         else:
             # File already gone — mark job completed
-            await db.execute(
-                "UPDATE consolidation_jobs SET status = 'completed', date_completed = ? WHERE id = ?",
-                (now_iso, job["id"]),
-            )
+            async with db_writer() as wdb:
+                await wdb.execute(
+                    "UPDATE consolidation_jobs SET status = 'completed', date_completed = ? WHERE id = ?",
+                    (now_iso, job["id"]),
+                )
             jobs_completed += 1
 
     if jobs_completed > 0:
-        await db.commit()
         await broadcast(
             {
                 "type": "consolidate_queue_drained",
@@ -602,7 +595,6 @@ async def _resolve_folder_path_with_loc(
 
 
 async def _ensure_canonical_record(
-    db,
     canonical_path: str,
     dest_folder_id: str,
     dest_loc_id: int,
@@ -611,6 +603,8 @@ async def _ensure_canonical_record(
 ) -> int:
     """Insert a file record for the canonical copy at its destination."""
     from file_hunter.core import classify_file
+
+    db = await get_db()
 
     # Determine location_id and folder_id from dest_folder_id
     if dest_folder_id.startswith("loc-"):
@@ -634,39 +628,41 @@ async def _ensure_canonical_record(
     st = await fs.file_stat(canonical_path, dest_loc_id)
     file_size = st["size"] if st else source.get("file_size", 0)
 
-    cursor = await db.execute(
-        """INSERT INTO files
-           (filename, full_path, rel_path, location_id, folder_id,
-            file_type_high, file_type_low, file_size,
-            hash_fast, hash_strong, description, tags,
-            created_date, modified_date, date_cataloged, date_last_seen, scan_id)
-           VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, NULL)""",
-        (
-            source["filename"],
-            canonical_path,
-            rel_path,
-            location_id,
-            folder_id,
-            type_high,
-            type_low,
-            file_size,
-            source["hash_fast"],
-            source["hash_strong"],
-            source.get("description", ""),
-            source.get("tags", ""),
-            source.get("created_date", now_iso),
-            source.get("modified_date", now_iso),
-            now_iso,
-            now_iso,
-        ),
-    )
-    return cursor.lastrowid
+    async with db_writer() as wdb:
+        cursor = await wdb.execute(
+            """INSERT INTO files
+               (filename, full_path, rel_path, location_id, folder_id,
+                file_type_high, file_type_low, file_size,
+                hash_fast, hash_strong, description, tags,
+                created_date, modified_date, date_cataloged, date_last_seen, scan_id)
+               VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, NULL)""",
+            (
+                source["filename"],
+                canonical_path,
+                rel_path,
+                location_id,
+                folder_id,
+                type_high,
+                type_low,
+                file_size,
+                source["hash_fast"],
+                source["hash_strong"],
+                source.get("description", ""),
+                source.get("tags", ""),
+                source.get("created_date", now_iso),
+                source.get("modified_date", now_iso),
+                now_iso,
+                now_iso,
+            ),
+        )
+        return cursor.lastrowid
 
 
 async def _insert_stub_record(
-    db, stub_path: str, sibling_file_id: int, location_id: int, now_iso: str
+    stub_path: str, sibling_file_id: int, location_id: int, now_iso: str
 ):
     """Insert a DB record for a .moved or .sources stub file alongside its sibling."""
+    db = await get_db()
     # Get location/folder info from the sibling file record
     rows = await db.execute_fetchall(
         "SELECT location_id, folder_id, rel_path FROM files WHERE id = ?",
@@ -685,24 +681,25 @@ async def _insert_stub_record(
     if st is None:
         return
 
-    await db.execute(
-        """INSERT OR IGNORE INTO files
-           (filename, full_path, rel_path, location_id, folder_id,
-            file_type_high, file_type_low, file_size,
-            hash_fast, hash_strong, description, tags,
-            created_date, modified_date, date_cataloged, date_last_seen, scan_id)
-           VALUES (?, ?, ?, ?, ?, 'text', 'sources', ?, NULL, NULL, '', '',
-                   ?, ?, ?, ?, NULL)""",
-        (
-            stub_name,
-            stub_path,
-            stub_rel,
-            sibling["location_id"],
-            sibling["folder_id"],
-            st["size"],
-            now_iso,
-            now_iso,
-            now_iso,
-            now_iso,
-        ),
-    )
+    async with db_writer() as wdb:
+        await wdb.execute(
+            """INSERT OR IGNORE INTO files
+               (filename, full_path, rel_path, location_id, folder_id,
+                file_type_high, file_type_low, file_size,
+                hash_fast, hash_strong, description, tags,
+                created_date, modified_date, date_cataloged, date_last_seen, scan_id)
+               VALUES (?, ?, ?, ?, ?, 'text', 'sources', ?, NULL, NULL, '', '',
+                       ?, ?, ?, ?, NULL)""",
+            (
+                stub_name,
+                stub_path,
+                stub_rel,
+                sibling["location_id"],
+                sibling["folder_id"],
+                st["size"],
+                now_iso,
+                now_iso,
+                now_iso,
+                now_iso,
+            ),
+        )

@@ -1,9 +1,14 @@
+import asyncio
 import os
+from contextlib import asynccontextmanager
+
 import aiosqlite
 from pathlib import Path
 from file_hunter.config import load_config
 
 _db = None
+_write_db = None
+_write_lock = asyncio.Lock()
 
 SCHEMA = """
 PRAGMA journal_mode=WAL;
@@ -300,7 +305,11 @@ async def init_db(db: aiosqlite.Connection):
 
 
 async def open_connection() -> aiosqlite.Connection:
-    """Open a standalone database connection (caller must close it)."""
+    """Open a read-only database connection (caller must close it).
+
+    For long-lived read operations that need their own transaction
+    lifetime. All writes must go through db_writer().
+    """
     config = load_config()
     db_path = Path(config.get("database", "file_hunter.db"))
     if not db_path.is_absolute():
@@ -309,44 +318,63 @@ async def open_connection() -> aiosqlite.Connection:
     conn.row_factory = aiosqlite.Row
     await conn.execute("PRAGMA foreign_keys=ON")
     await conn.execute("PRAGMA journal_mode=WAL")
-    await conn.execute("PRAGMA busy_timeout=30000")
     return conn
 
 
-_write_lock_requested = False
+async def _get_write_db() -> aiosqlite.Connection:
+    """Lazy-init the single write connection."""
+    global _write_db
+    if _write_db is None:
+        config = load_config()
+        db_path = Path(config.get("database", "file_hunter.db"))
+        if not db_path.is_absolute():
+            db_path = Path(__file__).resolve().parent.parent / db_path
+        _write_db = await aiosqlite.connect(db_path)
+        _write_db.row_factory = aiosqlite.Row
+        await _write_db.execute("PRAGMA foreign_keys=ON")
+        await _write_db.execute("PRAGMA journal_mode=WAL")
+    return _write_db
 
 
-def request_write_lock():
-    """Signal the scanner to yield the DB write lock."""
-    global _write_lock_requested
-    _write_lock_requested = True
+@asynccontextmanager
+async def db_writer():
+    """Acquire exclusive write access to the database.
 
+    Returns the single write connection. Only one caller at a time
+    (asyncio serialization — no SQLite lock contention, no timeouts).
+    Auto-commits on clean exit; rolls back on exception.
 
-def check_write_lock_requested():
-    """Check and clear the write lock request flag. Called by the scanner."""
-    global _write_lock_requested
-    if _write_lock_requested:
-        _write_lock_requested = False
-        return True
-    return False
+    Callers may commit intermediately; the exit commit is a no-op
+    if nothing is pending.
+    """
+    async with _write_lock:
+        db = await _get_write_db()
+        try:
+            yield db
+            await db.commit()
+        except BaseException:
+            try:
+                await db.rollback()
+            except Exception:
+                pass
+            raise
 
 
 async def execute_write(func, *args, **kwargs):
-    """Run a write function on its own connection.
+    """Run a write function on the single write connection.
 
-    Signals the scanner to yield the write lock, then lets SQLite's
-    busy_timeout (30s from open_connection) handle contention.
+    The function receives the write connection as its first argument.
+    Serialized through the same lock as db_writer().
     """
-    request_write_lock()
-    conn = await open_connection()
-    try:
-        return await func(conn, *args, **kwargs)
-    finally:
-        await conn.close()
+    async with db_writer() as db:
+        return await func(db, *args, **kwargs)
 
 
 async def close_db():
-    global _db
+    global _db, _write_db
     if _db is not None:
         await _db.close()
         _db = None
+    if _write_db is not None:
+        await _write_db.close()
+        _write_db = None

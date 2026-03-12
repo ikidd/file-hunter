@@ -32,7 +32,9 @@ async def run_delete_location(op_id: int, agent_id: int | None, params: dict):
         await delete_agent_location(agent_id, root_path, location_id=location_id)
         logger.info(
             "Agent #%d confirmed delete of '%s' (location %d)",
-            agent_id, location_name, location_id,
+            agent_id,
+            location_name,
+            location_id,
         )
 
     # Step 2: Clean up catalog
@@ -52,7 +54,9 @@ async def run_delete_location(op_id: int, agent_id: int | None, params: dict):
     )
 
     logger.info(
-        "Location deleted: #%d '%s'", location_id, location_name,
+        "Location deleted: #%d '%s'",
+        location_id,
+        location_name,
     )
 
 

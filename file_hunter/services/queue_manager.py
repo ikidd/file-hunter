@@ -12,7 +12,7 @@ from datetime import datetime, timezone
 
 import httpx
 
-from file_hunter.db import get_db
+from file_hunter.db import db_writer, get_db
 
 logger = logging.getLogger("file_hunter")
 
@@ -25,14 +25,13 @@ _running_ops: dict[int, tuple[int | None, asyncio.Task]] = {}
 
 async def enqueue(op_type: str, agent_id: int | None, params: dict) -> int:
     """Insert a new operation into the queue. Returns the operation ID."""
-    db = await get_db()
-    cursor = await db.execute(
-        "INSERT INTO operation_queue (type, agent_id, params, created_at) "
-        "VALUES (?, ?, ?, ?)",
-        (op_type, agent_id, json.dumps(params), _now()),
-    )
-    op_id = cursor.lastrowid
-    await db.commit()
+    async with db_writer() as db:
+        cursor = await db.execute(
+            "INSERT INTO operation_queue (type, agent_id, params, created_at) "
+            "VALUES (?, ?, ?, ?)",
+            (op_type, agent_id, json.dumps(params), _now()),
+        )
+        op_id = cursor.lastrowid
     await _broadcast_queue_state()
     return op_id
 
@@ -50,14 +49,14 @@ async def cancel(op_id: int) -> bool:
         # broadcast happens when _reap_finished picks up the CancelledError
         return True
 
-    db = await get_db()
-    cursor = await db.execute(
-        "UPDATE operation_queue SET status = 'cancelled', completed_at = ? "
-        "WHERE id = ? AND status = 'pending'",
-        (_now(), op_id),
-    )
-    await db.commit()
-    if cursor.rowcount > 0:
+    async with db_writer() as db:
+        cursor = await db.execute(
+            "UPDATE operation_queue SET status = 'cancelled', completed_at = ? "
+            "WHERE id = ? AND status = 'pending'",
+            (_now(), op_id),
+        )
+        changed = cursor.rowcount
+    if changed > 0:
         await _broadcast_queue_state()
         return True
     return False
@@ -65,9 +64,10 @@ async def cancel(op_id: int) -> bool:
 
 async def cancel_by_location(location_id: int) -> bool:
     """Cancel a running or pending operation for a location. Returns True if found."""
+    db = await get_db()
+
     # Check running ops first
     for op_id, (_, task) in list(_running_ops.items()):
-        db = await get_db()
         row = await db.execute_fetchall(
             "SELECT params FROM operation_queue WHERE id = ?", (op_id,)
         )
@@ -79,19 +79,18 @@ async def cancel_by_location(location_id: int) -> bool:
                 return True
 
     # Check pending ops
-    db = await get_db()
     rows = await db.execute_fetchall(
         "SELECT id, params FROM operation_queue WHERE status = 'pending' ORDER BY id"
     )
     for row in rows:
         params = json.loads(row["params"] or "{}")
         if params.get("location_id") == location_id:
-            await db.execute(
-                "UPDATE operation_queue SET status = 'cancelled', completed_at = ? "
-                "WHERE id = ?",
-                (_now(), row["id"]),
-            )
-            await db.commit()
+            async with db_writer() as wdb:
+                await wdb.execute(
+                    "UPDATE operation_queue SET status = 'cancelled', completed_at = ? "
+                    "WHERE id = ?",
+                    (_now(), row["id"]),
+                )
             await _broadcast_queue_state()
             return True
 
@@ -183,12 +182,37 @@ def start():
     logger.info("Queue manager started")
 
 
-def stop():
-    """Stop the queue manager."""
+async def stop():
+    """Stop the queue manager and wait for running operations to finish."""
     global _running, _task
     _running = False
+
+    # Wait for running operations to complete gracefully
+    running_tasks = [task for _, task in _running_ops.values()]
+    if running_tasks:
+        logger.info("Waiting for %d operation(s) to complete...", len(running_tasks))
+        done, pending = await asyncio.wait(running_tasks, timeout=10)
+        for task in done:
+            try:
+                task.result()
+            except Exception:
+                pass
+        for task in pending:
+            task.cancel()
+        if pending:
+            done2, _ = await asyncio.wait(pending, timeout=2)
+            for task in done2:
+                try:
+                    task.result()
+                except Exception:
+                    pass
+
     if _task and not _task.done():
         _task.cancel()
+        try:
+            await _task
+        except (asyncio.CancelledError, Exception):
+            pass
     _task = None
     logger.info("Queue manager stopped")
 
@@ -196,25 +220,24 @@ def stop():
 async def _recover_interrupted():
     """On startup, reset any 'running' operations back to 'pending'
     and mark orphaned scan records as 'interrupted'."""
-    db = await get_db()
-    cursor = await db.execute(
-        "UPDATE operation_queue SET status = 'pending', started_at = NULL "
-        "WHERE status = 'running'"
-    )
-    if cursor.rowcount > 0:
-        logger.info(
-            "Queue manager: recovered %d interrupted operations", cursor.rowcount
+    async with db_writer() as db:
+        cursor = await db.execute(
+            "UPDATE operation_queue SET status = 'pending', started_at = NULL "
+            "WHERE status = 'running'"
         )
-    # Mark any scan records left as 'running' (server crashed mid-scan)
-    scan_cursor = await db.execute(
-        "UPDATE scans SET status = 'interrupted' WHERE status = 'running'"
-    )
-    if scan_cursor.rowcount > 0:
-        logger.info(
-            "Queue manager: marked %d orphaned scans as interrupted",
-            scan_cursor.rowcount,
+        if cursor.rowcount > 0:
+            logger.info(
+                "Queue manager: recovered %d interrupted operations", cursor.rowcount
+            )
+        # Mark any scan records left as 'running' (server crashed mid-scan)
+        scan_cursor = await db.execute(
+            "UPDATE scans SET status = 'interrupted' WHERE status = 'running'"
         )
-    await db.commit()
+        if scan_cursor.rowcount > 0:
+            logger.info(
+                "Queue manager: marked %d orphaned scans as interrupted",
+                scan_cursor.rowcount,
+            )
 
 
 async def _run():
@@ -255,8 +278,7 @@ async def _run():
             logger.exception("Queue manager: unexpected error in main loop")
             await asyncio.sleep(5)
 
-    for op_id, (_, task) in list(_running_ops.items()):
-        task.cancel()
+    # Running ops are handled by stop() — don't cancel here
 
 
 async def _reap_finished():
@@ -328,59 +350,53 @@ async def _next_pending_ops(busy_agents: set) -> list[dict]:
 
 async def update_params(op_id: int, params: dict):
     """Persist updated params for a running operation (e.g. traversal state)."""
-    db = await get_db()
-    await db.execute(
-        "UPDATE operation_queue SET params = ? WHERE id = ?",
-        (json.dumps(params), op_id),
-    )
-    await db.commit()
+    async with db_writer() as db:
+        await db.execute(
+            "UPDATE operation_queue SET params = ? WHERE id = ?",
+            (json.dumps(params), op_id),
+        )
 
 
 async def _set_running(op_id: int):
-    db = await get_db()
-    await db.execute(
-        "UPDATE operation_queue SET status = 'running', started_at = ? WHERE id = ?",
-        (_now(), op_id),
-    )
-    await db.commit()
+    async with db_writer() as db:
+        await db.execute(
+            "UPDATE operation_queue SET status = 'running', started_at = ? WHERE id = ?",
+            (_now(), op_id),
+        )
 
 
 async def _set_completed(op_id: int):
-    db = await get_db()
-    await db.execute(
-        "UPDATE operation_queue SET status = 'completed', completed_at = ? "
-        "WHERE id = ?",
-        (_now(), op_id),
-    )
-    await db.commit()
+    async with db_writer() as db:
+        await db.execute(
+            "UPDATE operation_queue SET status = 'completed', completed_at = ? "
+            "WHERE id = ?",
+            (_now(), op_id),
+        )
 
 
 async def _set_failed(op_id: int, error: str):
-    db = await get_db()
-    await db.execute(
-        "UPDATE operation_queue SET status = 'failed', completed_at = ?, error = ? "
-        "WHERE id = ?",
-        (_now(), error, op_id),
-    )
-    await db.commit()
+    async with db_writer() as db:
+        await db.execute(
+            "UPDATE operation_queue SET status = 'failed', completed_at = ?, error = ? "
+            "WHERE id = ?",
+            (_now(), error, op_id),
+        )
 
 
 async def _set_status_pending(op_id: int):
-    db = await get_db()
-    await db.execute(
-        "UPDATE operation_queue SET status = 'pending', started_at = NULL WHERE id = ?",
-        (op_id,),
-    )
-    await db.commit()
+    async with db_writer() as db:
+        await db.execute(
+            "UPDATE operation_queue SET status = 'pending', started_at = NULL WHERE id = ?",
+            (op_id,),
+        )
 
 
 async def _set_status(op_id: int, status: str):
-    db = await get_db()
-    await db.execute(
-        "UPDATE operation_queue SET status = ?, completed_at = ? WHERE id = ?",
-        (status, _now(), op_id),
-    )
-    await db.commit()
+    async with db_writer() as db:
+        await db.execute(
+            "UPDATE operation_queue SET status = ?, completed_at = ? WHERE id = ?",
+            (status, _now(), op_id),
+        )
 
 
 async def _execute(op_type: str, op_id: int, agent_id: int | None, params: dict):
@@ -412,10 +428,17 @@ async def _handle_delete_location(op_id: int, agent_id: int | None, params: dict
     await run_delete_location(op_id, agent_id, params)
 
 
+async def _handle_rehash_partial(op_id: int, agent_id: int | None, params: dict):
+    from file_hunter.services.rehash_partial import run_rehash_partial
+
+    await run_rehash_partial(op_id, agent_id, params)
+
+
 _HANDLERS = {
     "scan_dir": _handle_scan_dir,
     "backfill_location": _handle_backfill_location,
     "delete_location": _handle_delete_location,
+    "rehash_partial": _handle_rehash_partial,
 }
 
 

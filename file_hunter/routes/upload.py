@@ -4,7 +4,7 @@ import asyncio
 import os
 
 from file_hunter.core import json_ok, json_error
-from file_hunter.db import get_db, open_connection
+from file_hunter.db import get_db
 from file_hunter.services import fs
 from file_hunter.services.upload import run_upload
 from file_hunter.ws.scan import broadcast
@@ -133,12 +133,9 @@ async def upload_files(request):
     if not saved_files:
         return json_error("No new files to upload (all skipped or already exist).", 400)
 
-    # Launch background processing with its own DB connection
-    task_db = await open_connection()
+    # Launch background processing
     asyncio.create_task(
-        run_upload(
-            task_db, location_id, location_name, root_path, folder_id, saved_files
-        )
+        run_upload(location_id, location_name, root_path, folder_id, saved_files)
     )
 
     return json_ok(

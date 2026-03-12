@@ -11,7 +11,7 @@ import asyncio
 import logging
 from datetime import datetime, timezone
 
-from file_hunter.db import get_db, execute_write, open_connection
+from file_hunter.db import db_writer, get_db, execute_write
 from file_hunter.services.stats import invalidate_stats_cache
 from file_hunter.ws.scan import broadcast
 
@@ -167,7 +167,6 @@ async def run_backfill(
     _active_backfills[agent_id] = False
     _backfill_info[agent_id] = (location_id, location_name, scan_prefix)
     await persist_backfill(agent_id, location_id, location_name, scan_prefix)
-    db = None
 
     try:
         # Broadcast immediately so UI shows backfill state before slow query
@@ -180,7 +179,7 @@ async def run_backfill(
             }
         )
 
-        db = await open_connection()
+        db = await get_db()
 
         prefix_clause = ""
         params = [location_id]
@@ -275,7 +274,7 @@ async def run_backfill(
             await _hash_one(row["id"], row["full_path"])
 
             if len(pending_writes) >= batch_size:
-                await _flush_writes(db, pending_writes)
+                await _flush_writes(pending_writes)
                 pending_writes.clear()
                 await broadcast(
                     {
@@ -288,7 +287,7 @@ async def run_backfill(
                 )
 
         if pending_writes:
-            await _flush_writes(db, pending_writes)
+            await _flush_writes(pending_writes)
             pending_writes.clear()
 
         invalidate_stats_cache()
@@ -298,11 +297,11 @@ async def run_backfill(
         # Mark complete and notify UI immediately — don't block on
         # cross-agent hashing or dup count recalculation
         if not cancelled:
-            await db.execute(
-                "UPDATE locations SET backfill_needed = 0 WHERE id = ?",
-                (location_id,),
-            )
-            await db.commit()
+            async with db_writer() as wdb:
+                await wdb.execute(
+                    "UPDATE locations SET backfill_needed = 0 WHERE id = ?",
+                    (location_id,),
+                )
 
         await broadcast(
             {
@@ -326,7 +325,7 @@ async def run_backfill(
         # Cross-agent backfill: hash files on other connected agents
         if not cancelled:
             await _backfill_agents(
-                db, agent_id, location_id, location_name, affected_hashes
+                agent_id, location_id, location_name, affected_hashes
             )
 
         if affected_hashes:
@@ -355,8 +354,6 @@ async def run_backfill(
         _active_backfills.pop(agent_id, None)
         _backfill_info.pop(agent_id, None)
         await clear_persisted_backfill(agent_id, location_id)
-        if db:
-            await db.close()
 
         # Chain to next queued backfill for this agent
         next_item = await pop_pending_backfill(agent_id)
@@ -372,18 +369,17 @@ async def run_backfill(
             )
 
 
-async def _flush_writes(db, writes: list[tuple[int, str, str]]):
+async def _flush_writes(writes: list[tuple[int, str, str]]):
     """Batch-update hash_fast and hash_strong for a list of file IDs."""
-    for file_id, hash_fast, hash_strong in writes:
-        await db.execute(
-            "UPDATE files SET hash_fast = ?, hash_strong = ? WHERE id = ?",
-            (hash_fast, hash_strong, file_id),
-        )
-    await db.commit()
+    async with db_writer() as wdb:
+        for file_id, hash_fast, hash_strong in writes:
+            await wdb.execute(
+                "UPDATE files SET hash_fast = ?, hash_strong = ? WHERE id = ?",
+                (hash_fast, hash_strong, file_id),
+            )
 
 
 async def _backfill_agents(
-    db,
     agent_id: int,
     agent_location_id: int,
     location_name: str,
@@ -397,6 +393,7 @@ async def _backfill_agents(
         "Cross-agent backfill: querying candidates for location %d", agent_location_id
     )
 
+    db = await get_db()
     rows = await db.execute_fetchall(
         """SELECT f.id, f.full_path, f.location_id
            FROM files f
@@ -461,7 +458,7 @@ async def _backfill_agents(
             )
 
         if len(pending) >= 20:
-            await _flush_writes(db, pending)
+            await _flush_writes(pending)
             pending.clear()
 
         if (hashed + errors) % 10 == 0:
@@ -477,7 +474,7 @@ async def _backfill_agents(
             )
 
     if pending:
-        await _flush_writes(db, pending)
+        await _flush_writes(pending)
 
     logger.info("Cross-agent backfill: complete, %d files hashed", hashed)
     return hashed

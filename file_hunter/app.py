@@ -48,6 +48,7 @@ from file_hunter.routes.stats import (
     stats,
     recalculate_stats,
     repair_catalog,
+    rehash_partial,
     location_stats,
     folder_stats,
 )
@@ -139,7 +140,7 @@ async def on_startup():
 
     from file_hunter.services.sizes import populate_all_sizes_if_needed
 
-    await populate_all_sizes_if_needed(db)
+    await populate_all_sizes_if_needed()
     _elapsed("sizes checked")
 
     from file_hunter.services.scheduler import start_scheduler
@@ -196,8 +197,10 @@ async def on_startup():
 
 async def on_shutdown():
     from file_hunter.services.queue_manager import stop as stop_queue_manager
+    from file_hunter.services.dup_counts import stop_writer as stop_dup_writer
 
-    stop_queue_manager()
+    await stop_queue_manager()
+    await stop_dup_writer()
     await close_db()
 
 
@@ -271,6 +274,7 @@ app = Starlette(
         Route("/api/stats", stats, methods=["GET"]),
         Route("/api/stats/recalculate", recalculate_stats, methods=["POST"]),
         Route("/api/stats/repair", repair_catalog, methods=["POST"]),
+        Route("/api/admin/rehash-partial", rehash_partial, methods=["POST"]),
         Route("/api/locations/{id:int}/stats", location_stats, methods=["GET"]),
         Route("/api/folders/{id:int}/stats", folder_stats, methods=["GET"]),
         WebSocketRoute("/ws", ws_endpoint),

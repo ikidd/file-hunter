@@ -3,7 +3,7 @@
 import asyncio
 import logging
 
-from file_hunter.db import check_write_lock_requested, open_connection
+from file_hunter.db import db_writer, get_db
 from file_hunter.services.stats import invalidate_stats_cache
 from file_hunter.ws.scan import broadcast
 
@@ -19,7 +19,6 @@ async def restore_pending():
     the operation from scratch on a background task. Zero cost if no
     pending operation exists.
     """
-    from file_hunter.db import get_db
     from file_hunter.services.settings import get_setting
 
     db = await get_db()
@@ -33,8 +32,8 @@ async def restore_pending():
         exclude = flag_str == "1"
     except (ValueError, IndexError):
         log.warning("Invalid dup_exclude_pending value: %s, clearing", pending)
-        await db.execute("DELETE FROM settings WHERE key = 'dup_exclude_pending'")
-        await db.commit()
+        async with db_writer() as wdb:
+            await wdb.execute("DELETE FROM settings WHERE key = 'dup_exclude_pending'")
         return
 
     row = await db.execute_fetchall(
@@ -42,8 +41,8 @@ async def restore_pending():
     )
     if not row:
         log.warning("dup_exclude_pending folder %d not found, clearing", folder_id)
-        await db.execute("DELETE FROM settings WHERE key = 'dup_exclude_pending'")
-        await db.commit()
+        async with db_writer() as wdb:
+            await wdb.execute("DELETE FROM settings WHERE key = 'dup_exclude_pending'")
         return
 
     folder_name = row[0]["name"]
@@ -62,21 +61,24 @@ async def restore_pending():
         }
     )
 
-    task_db = await open_connection()
-    asyncio.create_task(toggle_dup_exclude(task_db, folder_id, exclude))
+    asyncio.create_task(toggle_dup_exclude(folder_id, exclude))
 
 
-async def toggle_dup_exclude(db, folder_id: int, exclude: bool):
+async def toggle_dup_exclude(folder_id: int, exclude: bool):
     """Set dup_exclude on a folder subtree and recalculate affected dup_counts.
 
-    Runs on its own DB connection (caller provides it). The route handler has
-    already updated the top-level folder flag and broadcast dup_exclude_started,
-    so this function handles descendant folders, files, and dup_count recalc.
+    The route handler has already updated the top-level folder flag and
+    broadcast dup_exclude_started, so this function handles descendant
+    folders, files, and dup_count recalc.
+
+    Reads via get_db(), writes via db_writer().
     """
     flag = 1 if exclude else 0
     direction = "exclude" if exclude else "include"
 
     try:
+        db = await get_db()
+
         # Get folder name for logging
         folder_row = await db.execute_fetchall(
             "SELECT name FROM folders WHERE id = ?", (folder_id,)
@@ -100,11 +102,11 @@ async def toggle_dup_exclude(db, folder_id: int, exclude: bool):
         placeholders = ",".join("?" for _ in folder_ids)
 
         # Update all descendant folders (top-level already done by route)
-        await db.execute(
-            f"UPDATE folders SET dup_exclude = ? WHERE id IN ({placeholders})",
-            [flag] + folder_ids,
-        )
-        await db.commit()
+        async with db_writer() as wdb:
+            await wdb.execute(
+                f"UPDATE folders SET dup_exclude = ? WHERE id IN ({placeholders})",
+                [flag] + folder_ids,
+            )
         invalidate_stats_cache()
 
         # Count affected files
@@ -134,11 +136,11 @@ async def toggle_dup_exclude(db, folder_id: int, exclude: bool):
         for i in range(0, len(all_file_ids), FILE_UPDATE_BATCH):
             batch = all_file_ids[i : i + FILE_UPDATE_BATCH]
             batch_ph = ",".join("?" for _ in batch)
-            await db.execute(
-                f"UPDATE files SET dup_exclude = ? WHERE id IN ({batch_ph})",
-                [flag] + batch,
-            )
-            await db.commit()
+            async with db_writer() as wdb:
+                await wdb.execute(
+                    f"UPDATE files SET dup_exclude = ? WHERE id IN ({batch_ph})",
+                    [flag] + batch,
+                )
             updated += len(batch)
 
             # Broadcast progress at 5% intervals (phase 1 = 0-50%)
@@ -148,19 +150,16 @@ async def toggle_dup_exclude(db, folder_id: int, exclude: bool):
                     last_pct_step = step
                     await broadcast({"type": "dup_exclude_progress", "pct": step * 5})
 
-            if check_write_lock_requested():
-                await asyncio.sleep(0.2)
-            else:
-                await asyncio.sleep(0.05)
+            await asyncio.sleep(0.05)
 
         # Bulk-set dup_count=0 on all files in affected folders (always correct
         # for excluded files, and clears stale counts for included files that
         # will be recalculated below)
-        await db.execute(
-            f"UPDATE files SET dup_count = 0 WHERE folder_id IN ({placeholders})",
-            folder_ids,
-        )
-        await db.commit()
+        async with db_writer() as wdb:
+            await wdb.execute(
+                f"UPDATE files SET dup_count = 0 WHERE folder_id IN ({placeholders})",
+                folder_ids,
+            )
         invalidate_stats_cache()
 
         # --- Phase 2: Recalculate dup_counts for shared hashes only ---
@@ -202,15 +201,13 @@ async def toggle_dup_exclude(db, folder_id: int, exclude: bool):
                         {"type": "dup_exclude_progress", "pct": 50 + step * 5}
                     )
 
-        recalculated = await _batched_recalc(
-            db, shared_hashes, on_progress=_on_progress
-        )
+        recalculated = await _batched_recalc(shared_hashes, on_progress=_on_progress)
 
         invalidate_stats_cache()
 
         # Clear the pending marker — operation completed successfully
-        await db.execute("DELETE FROM settings WHERE key = 'dup_exclude_pending'")
-        await db.commit()
+        async with db_writer() as wdb:
+            await wdb.execute("DELETE FROM settings WHERE key = 'dup_exclude_pending'")
 
         log.info(
             "dup_exclude %s complete: folder '%s', %d files, %d shared hashes recalculated",
@@ -231,5 +228,3 @@ async def toggle_dup_exclude(db, folder_id: int, exclude: bool):
 
     except Exception:
         log.exception("toggle_dup_exclude failed for folder %d", folder_id)
-    finally:
-        await db.close()

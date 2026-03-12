@@ -3,7 +3,7 @@ import asyncio
 from starlette.requests import Request
 
 from file_hunter.core import json_ok, json_error
-from file_hunter.db import get_db, open_connection
+from file_hunter.db import get_db
 from file_hunter.services import fs
 from file_hunter.services.consolidate import (
     run_consolidation,
@@ -56,8 +56,7 @@ async def consolidate(request: Request):
         if not await fs.dir_exists(dest_path, dest_loc_id):
             return json_error("Destination is offline.", 400)
 
-    task_db = await open_connection()
-    asyncio.create_task(run_consolidation(task_db, file_id, mode, dest_folder_id))
+    asyncio.create_task(run_consolidation(file_id, mode, dest_folder_id))
 
     return json_ok({"message": f"Consolidation started for '{rows[0]['filename']}'"})
 
@@ -91,10 +90,7 @@ async def batch_consolidate(request: Request):
         if not await fs.dir_exists(dest_path, dest_loc_id):
             return json_error("Destination is offline.", 400)
 
-    task_db = await open_connection()
-    asyncio.create_task(
-        run_batch_consolidation(task_db, file_ids, mode, dest_folder_id)
-    )
+    asyncio.create_task(run_batch_consolidation(file_ids, mode, dest_folder_id))
 
     return json_ok(
         {"message": f"Batch consolidation started for {len(file_ids)} files"}

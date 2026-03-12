@@ -3,12 +3,12 @@
 from datetime import datetime, timezone
 
 from file_hunter.core import classify_file
+from file_hunter.db import db_writer, get_db
 from file_hunter.services import fs
 from file_hunter.ws.scan import broadcast
 
 
 async def run_upload(
-    db,
     location_id: int,
     location_name: str,
     root_path: str,
@@ -34,12 +34,13 @@ async def run_upload(
     )
 
     now_iso = datetime.now(timezone.utc).isoformat(timespec="seconds")
+    db = await get_db()
 
     for i, sf in enumerate(saved_files):
         try:
             hash_fast, hash_strong = await fs.file_hash(sf["full_path"], location_id)
 
-            # Check for existing file with same strong hash
+            # Check for existing file with same strong hash (read)
             rows = await db.execute_fetchall(
                 """SELECT f.id, f.filename, f.full_path, l.name as location_name
                    FROM files f
@@ -67,29 +68,30 @@ async def run_upload(
                 stub_size = st["size"] if st else 0
                 stub_name = sf["filename"] + ".moved"
                 stub_rel = sf["rel_path"] + ".moved"
-                await db.execute(
-                    """INSERT INTO files
-                       (filename, full_path, rel_path, location_id, folder_id,
-                        file_type_high, file_type_low, file_size,
-                        hash_fast, hash_strong, description, tags,
-                        created_date, modified_date, date_cataloged, date_last_seen, scan_id)
-                       VALUES (?, ?, ?, ?, ?, 'text', 'moved', ?, NULL, NULL, '', '',
-                               ?, ?, ?, ?, NULL)""",
-                    (
-                        stub_name,
-                        stub_path,
-                        stub_rel,
-                        location_id,
-                        folder_id,
-                        stub_size,
-                        now_iso,
-                        now_iso,
-                        now_iso,
-                        now_iso,
-                    ),
-                )
 
-                await db.commit()
+                async with db_writer() as wdb:
+                    await wdb.execute(
+                        """INSERT INTO files
+                           (filename, full_path, rel_path, location_id, folder_id,
+                            file_type_high, file_type_low, file_size,
+                            hash_fast, hash_strong, description, tags,
+                            created_date, modified_date, date_cataloged, date_last_seen, scan_id)
+                           VALUES (?, ?, ?, ?, ?, 'text', 'moved', ?, NULL, NULL, '', '',
+                                   ?, ?, ?, ?, NULL)""",
+                        (
+                            stub_name,
+                            stub_path,
+                            stub_rel,
+                            location_id,
+                            folder_id,
+                            stub_size,
+                            now_iso,
+                            now_iso,
+                            now_iso,
+                            now_iso,
+                        ),
+                    )
+
                 affected_hashes.add(hash_strong)
                 duplicates += 1
                 await broadcast(
@@ -116,33 +118,33 @@ async def run_upload(
                     created = now_iso
                     modified = now_iso
 
-                await db.execute(
-                    """INSERT INTO files
-                       (filename, full_path, rel_path, location_id, folder_id,
-                        file_type_high, file_type_low, file_size,
-                        hash_fast, hash_strong, description, tags,
-                        created_date, modified_date, date_cataloged, date_last_seen, scan_id)
-                       VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, '', '',
-                               ?, ?, ?, ?, NULL)""",
-                    (
-                        sf["filename"],
-                        sf["full_path"],
-                        sf["rel_path"],
-                        location_id,
-                        folder_id,
-                        type_high,
-                        type_low,
-                        file_size,
-                        hash_fast,
-                        hash_strong,
-                        created,
-                        modified,
-                        now_iso,
-                        now_iso,
-                    ),
-                )
+                async with db_writer() as wdb:
+                    await wdb.execute(
+                        """INSERT INTO files
+                           (filename, full_path, rel_path, location_id, folder_id,
+                            file_type_high, file_type_low, file_size,
+                            hash_fast, hash_strong, description, tags,
+                            created_date, modified_date, date_cataloged, date_last_seen, scan_id)
+                           VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, '', '',
+                                   ?, ?, ?, ?, NULL)""",
+                        (
+                            sf["filename"],
+                            sf["full_path"],
+                            sf["rel_path"],
+                            location_id,
+                            folder_id,
+                            type_high,
+                            type_low,
+                            file_size,
+                            hash_fast,
+                            hash_strong,
+                            created,
+                            modified,
+                            now_iso,
+                            now_iso,
+                        ),
+                    )
 
-                await db.commit()
                 affected_hashes.add(hash_strong)
                 cataloged += 1
 
@@ -169,8 +171,6 @@ async def run_upload(
                 }
             )
 
-    await db.commit()
-
     await broadcast(
         {
             "type": "upload_completed",
@@ -188,7 +188,7 @@ async def run_upload(
     from file_hunter.services.sizes import recalculate_location_sizes
 
     try:
-        await recalculate_location_sizes(db, location_id)
+        await recalculate_location_sizes(location_id)
     except Exception:
         pass
 
@@ -196,12 +196,7 @@ async def run_upload(
 
     try:
         await recalculate_dup_counts(
-            db, affected_hashes, source=f"upload to {location_name}"
+            affected_hashes, source=f"upload to {location_name}"
         )
-    except Exception:
-        pass
-
-    try:
-        await db.close()
     except Exception:
         pass

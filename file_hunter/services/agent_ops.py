@@ -245,6 +245,17 @@ async def dispatch(operation: str, location_id: int, **kwargs):
         raise ValueError(f"Unknown agent operation: {operation}")
 
 
+async def hash_partial_batch(agent_id: int, paths: list[str]) -> dict:
+    """Call agent /files/hash-partial-batch for a list of file paths."""
+    resolved = _resolve_agent(agent_id)
+    if not resolved:
+        raise ConnectionError(f"Agent {agent_id} is offline")
+    host, port, token = resolved
+    return await _post(
+        host, port, token, "/files/hash-partial-batch", {"paths": paths}, timeout=300.0
+    )
+
+
 async def reconcile_directory(
     agent_id: int, path: str, root_path: str, expected: list[dict]
 ) -> dict:

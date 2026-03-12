@@ -1,20 +1,15 @@
 """Stored dup_count maintenance — recalculate and backfill.
 
 Write serialization: all dup recalc work is submitted to a shared queue
-and processed by a single long-lived background task on one DB connection.
-This avoids unbounded concurrent writers when multiple agents scan
-simultaneously (up to 12 agents × per-directory submissions).
+and processed by a single long-lived background task. All writes go
+through the single db_writer() connection — no independent writers.
 """
 
 import asyncio
 import logging
 from collections import defaultdict
 
-from file_hunter.db import (
-    check_write_lock_requested,
-    open_connection,
-    request_write_lock,
-)
+from file_hunter.db import db_writer, get_db
 from file_hunter.services.stats import invalidate_stats_cache
 from file_hunter.ws.scan import broadcast
 
@@ -22,29 +17,31 @@ log = logging.getLogger(__name__)
 
 RECALC_BATCH = 200
 
-# Coalesced writer state — single background task, single DB connection
+# Coalesced writer state — single background task
 _recalc_queue: asyncio.Queue | None = None
 _writer_task: asyncio.Task | None = None
 
 
-async def _batched_recalc(db, hashes, *, on_progress=None):
+async def _batched_recalc(hashes, *, on_progress=None):
     """Recalculate dup_count for files sharing the given hashes.
 
     Uses batched GROUP BY for counts (one query per batch of RECALC_BATCH
-    hashes) and grouped UPDATEs by dup_count value. Yields between batches
-    and checks the cooperative write lock.
+    hashes) and grouped UPDATEs by dup_count value. Yields between batches.
+
+    Reads via get_db(), writes via db_writer() per batch.
 
     Returns the number of hashes processed.
     """
     hash_list = list(hashes)
     total = len(hash_list)
     processed = 0
+    db = await get_db()
 
     for i in range(0, total, RECALC_BATCH):
         batch = hash_list[i : i + RECALC_BATCH]
         ph = ",".join("?" for _ in batch)
 
-        # One GROUP BY query gives counts for the whole batch
+        # One GROUP BY query gives counts for the whole batch (read)
         rows = await db.execute_fetchall(
             f"""SELECT hash_strong, COUNT(*) as cnt FROM files
                 WHERE hash_strong IN ({ph})
@@ -64,36 +61,34 @@ async def _batched_recalc(db, hashes, *, on_progress=None):
             if dc == 0:
                 zero_hashes.append(h)
 
-        # Batched UPDATE per dup_count value (active files)
-        for dc, dc_hashes in by_dup_count.items():
-            dc_ph = ",".join("?" for _ in dc_hashes)
-            await db.execute(
-                f"UPDATE files SET dup_count = ? "
-                f"WHERE hash_strong IN ({dc_ph}) "
-                f"AND stale = 0 AND hidden = 0 AND dup_exclude = 0",
-                [dc] + dc_hashes,
-            )
+        # Write phase: db_writer() per batch
+        async with db_writer() as wdb:
+            # Batched UPDATE per dup_count value (active files)
+            for dc, dc_hashes in by_dup_count.items():
+                dc_ph = ",".join("?" for _ in dc_hashes)
+                await wdb.execute(
+                    f"UPDATE files SET dup_count = ? "
+                    f"WHERE hash_strong IN ({dc_ph}) "
+                    f"AND stale = 0 AND hidden = 0 AND dup_exclude = 0",
+                    [dc] + dc_hashes,
+                )
 
-        # Zero out inactive files (stale/hidden/excluded) for hashes with no dups
-        if zero_hashes:
-            z_ph = ",".join("?" for _ in zero_hashes)
-            await db.execute(
-                f"UPDATE files SET dup_count = 0 "
-                f"WHERE hash_strong IN ({z_ph}) "
-                f"AND (stale = 1 OR hidden = 1 OR dup_exclude = 1)",
-                zero_hashes,
-            )
+            # Zero out inactive files (stale/hidden/excluded) for hashes with no dups
+            if zero_hashes:
+                z_ph = ",".join("?" for _ in zero_hashes)
+                await wdb.execute(
+                    f"UPDATE files SET dup_count = 0 "
+                    f"WHERE hash_strong IN ({z_ph}) "
+                    f"AND (stale = 1 OR hidden = 1 OR dup_exclude = 1)",
+                    zero_hashes,
+                )
 
-        await db.commit()
         processed += len(batch)
 
         if on_progress:
             await on_progress(processed, total)
 
-        if check_write_lock_requested():
-            await asyncio.sleep(0.2)
-        else:
-            await asyncio.sleep(0.05)
+        await asyncio.sleep(0.05)
 
     return processed
 
@@ -121,14 +116,28 @@ def submit_hashes_for_recalc(
         _writer_task = asyncio.create_task(_dup_recalc_writer())
 
 
-async def _dup_recalc_writer():
-    """Single long-lived writer that drains the hash queue.
+async def stop_writer():
+    """Wait for the dup recalc writer to finish current work, then stop it."""
+    global _writer_task
+    if _writer_task and not _writer_task.done():
+        log.info("Waiting for dup recalc writer to complete...")
+        try:
+            await asyncio.wait_for(_writer_task, timeout=10)
+        except asyncio.TimeoutError:
+            _writer_task.cancel()
+            try:
+                await _writer_task
+            except (asyncio.CancelledError, Exception):
+                pass
+    _writer_task = None
 
-    Opens one DB connection, processes work items, coalesces rapid
-    submissions into larger batches. Cooperates with scan connections
-    via request_write_lock. Shuts down after 10s idle.
+
+async def _dup_recalc_writer():
+    """Single long-lived task that drains the hash queue.
+
+    Processes work items, coalesces rapid submissions into larger batches.
+    All writes go through db_writer(). Shuts down after 10s idle.
     """
-    db = await open_connection()
     try:
         while True:
             # Wait for work (shut down after 10s idle)
@@ -162,13 +171,11 @@ async def _dup_recalc_writer():
                 source_label or "unknown",
             )
 
-            # Signal scan connections to yield
-            request_write_lock()
-
             # Recalculate dup_count on files
-            await recalculate_dup_counts(db, merged_hashes, source=source_label)
+            await recalculate_dup_counts(merged_hashes, source=source_label)
 
             # Update stored duplicate_count for affected locations
+            db = await get_db()
             h_list = list(merged_hashes)
             h_ph = ",".join("?" for _ in h_list)
             rows = await db.execute_fetchall(
@@ -178,6 +185,8 @@ async def _dup_recalc_writer():
             affected = {r["location_id"] for r in rows}
             affected |= merged_location_ids
 
+            # Read counts per location, then batch-write
+            loc_updates = []
             for lid in affected:
                 dc_rows = await db.execute_fetchall(
                     "SELECT COUNT(*) as c FROM files "
@@ -185,11 +194,14 @@ async def _dup_recalc_writer():
                     "AND dup_exclude = 0 AND dup_count > 0",
                     (lid,),
                 )
-                await db.execute(
-                    "UPDATE locations SET duplicate_count = ? WHERE id = ?",
-                    (dc_rows[0]["c"], lid),
-                )
-            await db.commit()
+                loc_updates.append((dc_rows[0]["c"], lid))
+
+            async with db_writer() as wdb:
+                for dc, lid in loc_updates:
+                    await wdb.execute(
+                        "UPDATE locations SET duplicate_count = ? WHERE id = ?",
+                        (dc, lid),
+                    )
 
             invalidate_stats_cache()
 
@@ -198,8 +210,6 @@ async def _dup_recalc_writer():
             )
     except Exception:
         log.error("Coalesced dup recalc writer failed", exc_info=True)
-    finally:
-        await db.close()
 
 
 async def batch_dup_counts(db, hashes: list[str]) -> dict[str, int]:
@@ -222,11 +232,11 @@ async def batch_dup_counts(db, hashes: list[str]) -> dict[str, int]:
     return {r["hash_strong"]: r["cnt"] - 1 for r in rows}
 
 
-async def recalculate_dup_counts(db, hashes: set[str], source: str = ""):
+async def recalculate_dup_counts(hashes: set[str], source: str = ""):
     """Recalculate dup_count for all files sharing the given hashes.
 
     Uses batched GROUP BY queries with yields between batches.
-    Safe to call with an empty set (no-op).
+    All writes go through db_writer(). Safe to call with an empty set (no-op).
     """
     if not hashes:
         return
@@ -244,19 +254,19 @@ async def recalculate_dup_counts(db, hashes: set[str], source: str = ""):
                 source or "inline",
             )
 
-    await _batched_recalc(db, hashes, on_progress=_on_progress)
+    await _batched_recalc(hashes, on_progress=_on_progress)
 
 
 async def backfill_dup_counts():
     """Backfill dup_count for all files on startup.
 
-    Runs on a separate connection so the main DB stays responsive.
+    Reads via get_db(), writes via db_writer() (inside _batched_recalc).
     Skips if no files have stale dup_counts (quick consistency check).
     """
-    conn = await open_connection()
+    db = await get_db()
     try:
         # Quick check: any file with dup_count=0 that actually has duplicates?
-        stale = await conn.execute_fetchall(
+        stale = await db.execute_fetchall(
             """SELECT 1 FROM files f
                WHERE f.hash_strong IS NOT NULL AND f.hash_strong != ''
                  AND f.stale = 0 AND f.hidden = 0 AND f.dup_exclude = 0 AND f.dup_count = 0
@@ -273,7 +283,7 @@ async def backfill_dup_counts():
             return
 
         # Find which locations have stale counts
-        stale_locs = await conn.execute_fetchall(
+        stale_locs = await db.execute_fetchall(
             """SELECT DISTINCT l.name
                FROM files f
                JOIN locations l ON l.id = f.location_id
@@ -288,7 +298,7 @@ async def backfill_dup_counts():
         stale_loc_names = [r["name"] for r in stale_locs]
 
         # Only recalculate hashes that are actually wrong, not all hash groups
-        dup_rows = await conn.execute_fetchall(
+        dup_rows = await db.execute_fetchall(
             """SELECT DISTINCT f.hash_strong
                FROM files f
                WHERE f.hash_strong IS NOT NULL AND f.hash_strong != ''
@@ -302,7 +312,7 @@ async def backfill_dup_counts():
         stale_hashes = {r["hash_strong"] for r in dup_rows}
 
         # Also find hashes where dup_count > 0 but no longer have duplicates
-        false_positive_rows = await conn.execute_fetchall(
+        false_positive_rows = await db.execute_fetchall(
             """SELECT DISTINCT f.hash_strong
                FROM files f
                WHERE f.dup_count > 0 AND f.stale = 0 AND f.hidden = 0 AND f.dup_exclude = 0
@@ -345,7 +355,7 @@ async def backfill_dup_counts():
                     }
                 )
 
-        updated = await _batched_recalc(conn, all_stale, on_progress=_on_progress)
+        updated = await _batched_recalc(all_stale, on_progress=_on_progress)
 
         invalidate_stats_cache()
 
@@ -357,5 +367,3 @@ async def backfill_dup_counts():
 
     except Exception:
         log.exception("dup_count backfill failed")
-    finally:
-        await conn.close()

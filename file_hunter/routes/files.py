@@ -299,11 +299,13 @@ async def folder_dup_exclude(request: Request):
     body = await request.json()
     exclude = bool(body.get("exclude", False))
 
+    from file_hunter.db import db_writer
+
     db = await get_db()
     flag = 1 if exclude else 0
 
-    # Update the folder flag immediately on the shared connection so the
-    # detail panel shows the correct checkbox state right away.
+    # Update the folder flag immediately so the detail panel shows the
+    # correct checkbox state right away.
     row = await db.execute_fetchall(
         "SELECT name FROM folders WHERE id = ?", (folder_id,)
     )
@@ -311,10 +313,10 @@ async def folder_dup_exclude(request: Request):
         return json_error("Folder not found.", 404)
     folder_name = row[0]["name"]
 
-    await db.execute(
-        "UPDATE folders SET dup_exclude = ? WHERE id = ?", (flag, folder_id)
-    )
-    await db.commit()
+    async with db_writer() as wdb:
+        await wdb.execute(
+            "UPDATE folders SET dup_exclude = ? WHERE id = ?", (flag, folder_id)
+        )
 
     from file_hunter.services.stats import invalidate_stats_cache
 
@@ -336,11 +338,9 @@ async def folder_dup_exclude(request: Request):
     await set_setting(db, "dup_exclude_pending", f"{folder_id}:{1 if exclude else 0}")
 
     # Heavy work (descendant folders, files, dup_count recalc) in background
-    from file_hunter.db import open_connection
     from file_hunter.services.dup_exclude import toggle_dup_exclude
 
-    task_db = await open_connection()
-    asyncio.create_task(toggle_dup_exclude(task_db, folder_id, exclude))
+    asyncio.create_task(toggle_dup_exclude(folder_id, exclude))
     return json_ok({"queued": True})
 
 

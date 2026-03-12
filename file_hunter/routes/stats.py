@@ -1,7 +1,7 @@
 import asyncio
 
 from starlette.requests import Request
-from file_hunter.db import get_db, open_connection
+from file_hunter.db import get_db
 from file_hunter.core import json_ok, json_error
 from file_hunter.services.stats import get_stats, get_location_stats, get_folder_stats
 
@@ -29,11 +29,11 @@ async def _bg_recalculate():
 
     log = logging.getLogger("file_hunter")
 
-    conn = await open_connection()
     try:
-        loc_rows = await conn.execute_fetchall("SELECT id FROM locations")
+        db = await get_db()
+        loc_rows = await db.execute_fetchall("SELECT id FROM locations")
         for loc in loc_rows:
-            await recalculate_location_sizes(conn, loc["id"])
+            await recalculate_location_sizes(loc["id"])
         invalidate_stats_cache()
         log.info("Stats recalculated for %d locations", len(loc_rows))
         await broadcast(
@@ -44,8 +44,6 @@ async def _bg_recalculate():
         )
     except Exception:
         log.exception("Stats recalculation failed")
-    finally:
-        await conn.close()
 
 
 async def repair_catalog(request: Request):
@@ -60,6 +58,7 @@ async def repair_catalog(request: Request):
 
 async def _bg_repair():
     import logging
+    from file_hunter.db import db_writer
     from file_hunter.services.sizes import recalculate_location_sizes
     from file_hunter.services.dup_counts import recalculate_dup_counts
     from file_hunter.services.stats import invalidate_stats_cache
@@ -67,32 +66,32 @@ async def _bg_repair():
 
     log = logging.getLogger("file_hunter")
 
-    conn = await open_connection()
     try:
+        db = await get_db()
         log.info("Catalog repair: starting")
         await broadcast({"type": "repair_started"})
 
         # 1. Clear all stale flags — next scan will re-mark correctly
-        cursor = await conn.execute("UPDATE files SET stale = 0 WHERE stale = 1")
-        stale_cleared = cursor.rowcount
-        await conn.commit()
+        async with db_writer() as wdb:
+            cursor = await wdb.execute("UPDATE files SET stale = 0 WHERE stale = 1")
+            stale_cleared = cursor.rowcount
         log.info("Catalog repair: cleared %d stale flags", stale_cleared)
 
         # 2. Recalculate all location sizes
-        loc_rows = await conn.execute_fetchall("SELECT id FROM locations")
+        loc_rows = await db.execute_fetchall("SELECT id FROM locations")
         for loc in loc_rows:
-            await recalculate_location_sizes(conn, loc["id"])
+            await recalculate_location_sizes(loc["id"])
         log.info("Catalog repair: recalculated sizes for %d locations", len(loc_rows))
 
         # 3. Full dup recount — get all hash_strong values and recount
-        hash_rows = await conn.execute_fetchall(
+        hash_rows = await db.execute_fetchall(
             "SELECT DISTINCT hash_strong FROM files "
             "WHERE hash_strong IS NOT NULL AND hash_strong != ''"
         )
         all_hashes = {r["hash_strong"] for r in hash_rows}
         if all_hashes:
             log.info("Catalog repair: recounting dups for %d hashes", len(all_hashes))
-            await recalculate_dup_counts(conn, all_hashes, source="catalog repair")
+            await recalculate_dup_counts(all_hashes, source="catalog repair")
 
         invalidate_stats_cache()
 
@@ -113,8 +112,29 @@ async def _bg_repair():
     except Exception:
         log.exception("Catalog repair failed")
         await broadcast({"type": "repair_failed"})
-    finally:
-        await conn.close()
+
+
+async def rehash_partial(request: Request):
+    """Enqueue a rehash_partial operation for every agent-backed location."""
+    from file_hunter.services.queue_manager import enqueue
+
+    db = await get_db()
+    rows = await db.execute_fetchall(
+        "SELECT id, name, agent_id FROM locations WHERE agent_id IS NOT NULL"
+    )
+    if not rows:
+        return json_error("No agent-backed locations found.")
+
+    op_ids = []
+    for loc in rows:
+        op_id = await enqueue(
+            "rehash_partial",
+            loc["agent_id"],
+            {"location_id": loc["id"], "location_name": loc["name"]},
+        )
+        op_ids.append(op_id)
+
+    return json_ok({"queued": len(op_ids), "operation_ids": op_ids})
 
 
 async def location_stats(request: Request):

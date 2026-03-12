@@ -203,7 +203,6 @@ async def _sync_agent_locations(agent_id: int, agent_locations: list[dict]):
 
     # Drain any pending consolidation jobs for online locations
     from file_hunter.services.consolidate import drain_pending_jobs
-    from file_hunter.db import open_connection
 
     for loc_id, online in path_status.items():
         if not online:
@@ -214,7 +213,7 @@ async def _sync_agent_locations(agent_id: int, agent_locations: list[dict]):
         loc_row = await cursor.fetchone()
         if not loc_row:
             continue
-        # Check if there are pending jobs before opening a connection
+        # Check if there are pending jobs before draining
         pending = await db.execute(
             "SELECT COUNT(*) as cnt FROM consolidation_jobs "
             "WHERE source_location_id = ? AND status = 'pending'",
@@ -222,11 +221,7 @@ async def _sync_agent_locations(agent_id: int, agent_locations: list[dict]):
         )
         cnt_row = await pending.fetchone()
         if cnt_row and cnt_row["cnt"] > 0:
-            drain_db = await open_connection()
-            try:
-                await drain_pending_jobs(drain_db, loc_id, loc_row["root_path"])
-            finally:
-                await drain_db.close()
+            await drain_pending_jobs(loc_id, loc_row["root_path"])
 
     return location_ids
 
