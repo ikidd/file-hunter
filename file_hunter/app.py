@@ -155,7 +155,9 @@ async def on_startup():
 
     # Reset stale agent status from previous session
     async with db_writer() as wdb:
-        await wdb.execute("UPDATE agents SET status = 'offline' WHERE status = 'online'")
+        await wdb.execute(
+            "UPDATE agents SET status = 'offline' WHERE status = 'online'"
+        )
     _elapsed("stale agent status reset")
 
     from file_hunter.services.dup_exclude import restore_pending as restore_dup_exclude
