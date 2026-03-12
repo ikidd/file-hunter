@@ -5,12 +5,9 @@ async def get_setting(db, key: str):
 
 
 async def set_setting(db, key: str, value: str):
-    from file_hunter.db import db_writer
-
-    async with db_writer() as wdb:
-        await wdb.execute(
-            "INSERT OR REPLACE INTO settings (key, value) VALUES (?, ?)", (key, value)
-        )
+    await db.execute(
+        "INSERT OR REPLACE INTO settings (key, value) VALUES (?, ?)", (key, value)
+    )
 
 
 async def get_all_settings(db) -> dict:

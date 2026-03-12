@@ -335,7 +335,8 @@ async def folder_dup_exclude(request: Request):
     # Persist pending operation so it survives restarts
     from file_hunter.services.settings import set_setting
 
-    await set_setting(db, "dup_exclude_pending", f"{folder_id}:{1 if exclude else 0}")
+    async with db_writer() as wdb:
+        await set_setting(wdb, "dup_exclude_pending", f"{folder_id}:{1 if exclude else 0}")
 
     # Heavy work (descendant folders, files, dup_count recalc) in background
     from file_hunter.services.dup_exclude import toggle_dup_exclude

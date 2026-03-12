@@ -5,7 +5,7 @@ from starlette.routing import Route, Mount, WebSocketRoute
 from starlette.staticfiles import StaticFiles
 from pathlib import Path
 
-from file_hunter.db import get_db, close_db
+from file_hunter.db import get_db, close_db, db_writer
 from file_hunter.ws.scan import ws_endpoint
 from file_hunter.ws.agent import agent_ws_endpoint
 from file_hunter.routes.locations import (
@@ -125,7 +125,8 @@ async def on_startup():
     # If somehow missed (e.g. manual startup), create it now.
     from file_hunter.services.agents import ensure_local_agent
 
-    token = await ensure_local_agent(db)
+    async with db_writer() as wdb:
+        token = await ensure_local_agent(wdb)
     if token:
         logger.warning(
             "Local agent created during startup (preflight was skipped). "
@@ -153,8 +154,8 @@ async def on_startup():
     _elapsed("extension hooks done")
 
     # Reset stale agent status from previous session
-    await db.execute("UPDATE agents SET status = 'offline' WHERE status = 'online'")
-    await db.commit()
+    async with db_writer() as wdb:
+        await wdb.execute("UPDATE agents SET status = 'offline' WHERE status = 'online'")
     _elapsed("stale agent status reset")
 
     from file_hunter.services.dup_exclude import restore_pending as restore_dup_exclude
@@ -166,13 +167,13 @@ async def on_startup():
         "SELECT id FROM scans WHERE status IN ('running', 'interrupted', 'finalizing')"
     )
     if interrupted:
-        for row in interrupted:
-            await db.execute(
-                "UPDATE scans SET status = 'error', error = 'Server restarted' "
-                "WHERE id = ?",
-                (row["id"],),
-            )
-        await db.commit()
+        async with db_writer() as wdb:
+            for row in interrupted:
+                await wdb.execute(
+                    "UPDATE scans SET status = 'error', error = 'Server restarted' "
+                    "WHERE id = ?",
+                    (row["id"],),
+                )
         logger.info("Marked %d interrupted scan(s) as error", len(interrupted))
 
     from file_hunter.services.hash_backfill import restore_backfills
