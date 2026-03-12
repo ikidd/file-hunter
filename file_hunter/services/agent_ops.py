@@ -262,7 +262,7 @@ async def reconcile_directory(
         token,
         "/reconcile",
         {"path": path, "root_path": root_path, "expected": expected},
-        timeout=120.0,
+        timeout=None,
     )
 
 
@@ -368,13 +368,16 @@ async def rename_agent_location(agent_id: int, root_path: str, new_name: str):
 
 
 async def delete_agent_location(agent_id: int, root_path: str, location_id: int = None):
-    """Tell an agent to remove a location from its config.json."""
+    """Tell an agent to remove a location from its config.json.
+
+    Raises ConnectionError if the agent is offline so callers (e.g.
+    queue_manager) can retry later.
+    """
     resolved = _resolve_agent(agent_id)
     if not resolved:
-        logger.warning(
-            "Agent %d offline — skipping location delete for %s", agent_id, root_path
+        raise ConnectionError(
+            f"Agent {agent_id} offline — cannot delete location {root_path}"
         )
-        return
     host, port, token = resolved
     await _post(host, port, token, "/locations/delete", {"path": root_path})
     if location_id:

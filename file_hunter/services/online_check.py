@@ -66,34 +66,27 @@ def clear_location_path_status(agent_id: int):
 
 
 def agent_online_check(loc):
-    """Return True if this is an agent-backed location with an online agent.
+    """Return True if this location's agent is online and the path is accessible.
 
-    Returns None if not an agent location (falls through to os.path.isdir).
-    Called from a thread — uses only in-memory lookups, no async.
+    All locations are agent-backed. Returns False if agent is offline or
+    location is unknown. Called from a thread — in-memory lookups only.
     """
     from file_hunter.ws.agent import get_agent_location_ids, get_online_agent_ids
 
     loc_id = loc["id"]
-
-    if loc_id in _all_agent_loc_ids:
-        agent_locs = get_agent_location_ids()
-        online_agents = get_online_agent_ids()
-        for agent_id, location_ids in agent_locs.items():
-            if loc_id in location_ids:
-                if agent_id not in online_agents:
-                    return False
-                path_status = _agent_location_path_status.get(agent_id, {})
-                return path_status.get(loc_id, False)
-        return False
-
-    return None
+    agent_locs = get_agent_location_ids()
+    online_agents = get_online_agent_ids()
+    for agent_id, location_ids in agent_locs.items():
+        if loc_id in location_ids:
+            if agent_id not in online_agents:
+                return False
+            path_status = _agent_location_path_status.get(agent_id, {})
+            return path_status.get(loc_id, False)
+    return False
 
 
 async def agent_disk_stats(location_id: int, root_path: str) -> dict | None:
-    """Get disk stats from the agent for an agent-backed location."""
-    if location_id not in _all_agent_loc_ids:
-        return None
-
+    """Get disk stats from the agent for a location."""
     from file_hunter.services.agent_ops import dispatch
 
     try:

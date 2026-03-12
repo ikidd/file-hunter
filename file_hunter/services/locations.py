@@ -2,7 +2,6 @@
 
 import asyncio
 import os
-import shutil
 from datetime import datetime
 
 
@@ -283,87 +282,34 @@ async def get_expand_path(db, target_id: int):
 
 
 def check_location_online(location_id: int, root_path: str) -> bool:
-    """Check if a single location is online (runs in thread).
+    """Check if a location is online via agent status (runs in thread)."""
+    from file_hunter.services.online_check import agent_online_check
 
-    Checks the extension hook first for agent locations, then falls
-    through to os.path.isdir for local locations.
-    """
-    from file_hunter.extensions import get_online_check
-
-    online_check = get_online_check()
-    if online_check:
-        result = online_check({"id": location_id, "root_path": root_path})
-        if result is not None:
-            return result
-    return os.path.isdir(root_path)
+    return agent_online_check({"id": location_id, "root_path": root_path})
 
 
 async def get_disk_stats(location_id: int, root_path: str) -> dict | None:
-    """Return disk stats for a location if its root path is a mount point.
+    """Return disk stats for a location via its agent.
 
-    Checks the extension hook first (for agent locations), then falls
-    through to local filesystem checks.
     Returns {mount, total, free, readonly} or {mount: false}, or None on error.
     """
-    from file_hunter.extensions import get_disk_stats as get_disk_stats_hook
-
-    hook = get_disk_stats_hook()
-    if hook:
-        try:
-            result = await hook(location_id, root_path)
-            if result is not None:
-                return result
-        except Exception:
-            return None
-
-    # Local check — run in thread to avoid blocking
-    return await asyncio.to_thread(_local_disk_stats, root_path)
-
-
-def _local_disk_stats(root_path: str) -> dict:
-    """Check local disk stats (runs in thread)."""
-    if not os.path.ismount(root_path):
-        return {"mount": False}
+    from file_hunter.services.online_check import agent_disk_stats
 
     try:
-        usage = shutil.disk_usage(root_path)
-    except OSError:
-        return {"mount": False}
-
-    readonly = False
-    try:
-        st = os.statvfs(root_path)
-        readonly = bool(st.f_flag & os.ST_RDONLY)
-    except (OSError, AttributeError):
-        pass
-
-    return {
-        "mount": True,
-        "total": usage.total,
-        "free": usage.free,
-        "readonly": readonly,
-    }
+        return await agent_disk_stats(location_id, root_path)
+    except Exception:
+        return None
 
 
 def _check_paths_exist(locations: list) -> list[bool]:
     """Check online status for a list of location dicts (runs in thread).
 
     Each location must have at least 'id' and 'root_path'.
-    Falls through to the extension online_check hook for non-local paths.
+    All locations are agent-backed — delegates to agent_online_check.
     """
-    from file_hunter.extensions import get_online_check
+    from file_hunter.services.online_check import agent_online_check
 
-    online_check = get_online_check()
-    results = []
-    for loc in locations:
-        # Check extension hook first (agent locations override os.path.isdir)
-        if online_check:
-            result = online_check(loc)
-            if result is not None:
-                results.append(result)
-                continue
-        results.append(os.path.isdir(loc["root_path"]))
-    return results
+    return [agent_online_check(loc) for loc in locations]
 
 
 def _build_folder_tree(folders, parent_id):
@@ -489,11 +435,6 @@ async def create_location(db, name: str, root_path: str, agent_id: int = None) -
         "online": online,
         "children": [],
     }
-
-
-async def delete_location(db, loc_id: int):
-    await db.execute("DELETE FROM locations WHERE id = ?", (loc_id,))
-    await db.commit()
 
 
 async def rename_location(db, loc_id: int, new_name: str) -> dict | None:
@@ -747,20 +688,7 @@ async def move_folder(db, folder_id: int, destination_parent_id: str):
     if existing:
         raise ValueError("A folder with that name already exists in the catalog.")
 
-    # Move on disk — same location uses dir_move, cross-location not supported
-    # for folder-level moves (would need recursive copy, out of scope for now)
-    if cross_location:
-        # For cross-location folder moves, use dir_move if same type (both local or both agent)
-        # For mixed (agent<->local), this would require recursive copy which we don't attempt here
-        from file_hunter.extensions import is_agent_location
-
-        src_is_agent = is_agent_location(src_loc_id)
-        dst_is_agent = is_agent_location(dest_loc_id)
-        if src_is_agent != dst_is_agent:
-            raise ValueError(
-                "Cross-location folder moves between local and agent locations are not supported. "
-                "Use merge instead."
-            )
+    # Move on disk via the source location's agent
     await fs.dir_move(src_abs, dest_abs, src_loc_id)
 
     # Compute old/new rel_path prefix for batch updates

@@ -33,6 +33,7 @@ async def enqueue(op_type: str, agent_id: int | None, params: dict) -> int:
     )
     op_id = cursor.lastrowid
     await db.commit()
+    await _broadcast_queue_state()
     return op_id
 
 
@@ -46,6 +47,7 @@ async def cancel(op_id: int) -> bool:
     if op_id in _running_ops:
         _, task = _running_ops[op_id]
         task.cancel()
+        # broadcast happens when _reap_finished picks up the CancelledError
         return True
 
     db = await get_db()
@@ -55,7 +57,10 @@ async def cancel(op_id: int) -> bool:
         (_now(), op_id),
     )
     await db.commit()
-    return cursor.rowcount > 0
+    if cursor.rowcount > 0:
+        await _broadcast_queue_state()
+        return True
+    return False
 
 
 async def cancel_by_location(location_id: int) -> bool:
@@ -70,6 +75,7 @@ async def cancel_by_location(location_id: int) -> bool:
             params = json.loads(row[0]["params"] or "{}")
             if params.get("location_id") == location_id:
                 task.cancel()
+                # broadcast happens when _reap_finished picks up the CancelledError
                 return True
 
     # Check pending ops
@@ -86,6 +92,7 @@ async def cancel_by_location(location_id: int) -> bool:
                 (_now(), row["id"]),
             )
             await db.commit()
+            await _broadcast_queue_state()
             return True
 
     return False
@@ -187,7 +194,8 @@ def stop():
 
 
 async def _recover_interrupted():
-    """On startup, reset any 'running' operations back to 'pending'."""
+    """On startup, reset any 'running' operations back to 'pending'
+    and mark orphaned scan records as 'interrupted'."""
     db = await get_db()
     cursor = await db.execute(
         "UPDATE operation_queue SET status = 'pending', started_at = NULL "
@@ -196,6 +204,15 @@ async def _recover_interrupted():
     if cursor.rowcount > 0:
         logger.info(
             "Queue manager: recovered %d interrupted operations", cursor.rowcount
+        )
+    # Mark any scan records left as 'running' (server crashed mid-scan)
+    scan_cursor = await db.execute(
+        "UPDATE scans SET status = 'interrupted' WHERE status = 'running'"
+    )
+    if scan_cursor.rowcount > 0:
+        logger.info(
+            "Queue manager: marked %d orphaned scans as interrupted",
+            scan_cursor.rowcount,
         )
     await db.commit()
 
@@ -229,6 +246,9 @@ async def _run():
                 task = asyncio.create_task(_execute(op_type, op_id, agent_id, params))
                 _running_ops[op_id] = (agent_id, task)
 
+            # Broadcast updated queue state (pending→running transitions)
+            await _broadcast_queue_state()
+
         except asyncio.CancelledError:
             break
         except Exception:
@@ -241,11 +261,13 @@ async def _run():
 
 async def _reap_finished():
     """Check running tasks for completion and update their status."""
+    reaped = False
     for op_id in list(_running_ops):
         agent_id, task = _running_ops[op_id]
         if not task.done():
             continue
 
+        reaped = True
         del _running_ops[op_id]
 
         # Untrack location
@@ -274,6 +296,9 @@ async def _reap_finished():
         except Exception as e:
             logger.exception("Queue manager: failed (id=%d)", op_id)
             await _set_failed(op_id, str(e))
+
+    if reaped:
+        await _broadcast_queue_state()
 
 
 async def _next_pending_ops(busy_agents: set) -> list[dict]:
@@ -381,10 +406,50 @@ async def _handle_backfill_location(op_id: int, agent_id: int | None, params: di
     await run_backfill(agent_id, location_id, location_name, scan_prefix)
 
 
+async def _handle_delete_location(op_id: int, agent_id: int | None, params: dict):
+    from file_hunter.services.location_delete import run_delete_location
+
+    await run_delete_location(op_id, agent_id, params)
+
+
 _HANDLERS = {
     "scan_dir": _handle_scan_dir,
     "backfill_location": _handle_backfill_location,
+    "delete_location": _handle_delete_location,
 }
+
+
+async def get_queue_status_for_broadcast() -> dict:
+    """Build the queue state dict in the format the frontend expects."""
+    status = await get_queue_status()
+    running_ids = [
+        item["location_id"]
+        for item in status
+        if item.get("status") == "running" and item.get("location_id")
+    ]
+    pending = [
+        {
+            "queue_id": item["id"],
+            "location_id": item.get("location_id"),
+            "name": item.get("location_name", ""),
+            "queued_at": item.get("created_at", ""),
+        }
+        for item in status
+        if item.get("status") == "pending"
+    ]
+    return {
+        "running_location_ids": running_ids,
+        "running_location_id": running_ids[0] if running_ids else None,
+        "pending": pending,
+    }
+
+
+async def _broadcast_queue_state():
+    """Build and broadcast the current queue state to all connected browsers."""
+    from file_hunter.ws.scan import broadcast
+
+    queue = await get_queue_status_for_broadcast()
+    await broadcast({"type": "scan_queue_updated", "queue": queue})
 
 
 def _now() -> str:

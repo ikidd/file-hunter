@@ -41,10 +41,10 @@ async def delete_file(db, file_id: int) -> dict:
     invalidate_stats_cache()
 
     from file_hunter.services.sizes import schedule_size_recalc
-    from file_hunter.services.dup_counts import schedule_dup_recalc
+    from file_hunter.services.dup_counts import submit_hashes_for_recalc
 
     schedule_size_recalc(location_id)
-    schedule_dup_recalc({hash_strong}, source=f"delete {filename}")
+    submit_hashes_for_recalc({hash_strong}, source=f"delete {filename}")
 
     return {"filename": filename, "deleted_from_disk": deleted_from_disk}
 
@@ -102,11 +102,11 @@ async def delete_file_and_duplicates(db, file_id: int) -> dict:
     invalidate_stats_cache()
 
     from file_hunter.services.sizes import schedule_size_recalc
-    from file_hunter.services.dup_counts import schedule_dup_recalc
+    from file_hunter.services.dup_counts import submit_hashes_for_recalc
 
     affected_loc_ids = {rec["location_id"] for rec in all_rows}
     schedule_size_recalc(*affected_loc_ids)
-    schedule_dup_recalc({hash_strong}, source=f"delete {filename} + duplicates")
+    submit_hashes_for_recalc({hash_strong}, source=f"delete {filename} + duplicates")
 
     return {
         "filename": filename,
@@ -189,10 +189,10 @@ async def delete_folder(db, folder_id: int) -> dict:
     invalidate_stats_cache()
 
     from file_hunter.services.sizes import schedule_size_recalc
-    from file_hunter.services.dup_counts import schedule_dup_recalc
+    from file_hunter.services.dup_counts import submit_hashes_for_recalc
 
     schedule_size_recalc(location_id)
-    schedule_dup_recalc(affected_hashes, source=f"delete folder {name}")
+    submit_hashes_for_recalc(affected_hashes, source=f"delete folder {name}")
 
     return {
         "name": name,

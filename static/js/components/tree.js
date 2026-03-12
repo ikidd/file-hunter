@@ -25,6 +25,7 @@ const Tree = {
     _scanningLocations: new Set(),
     _queuedLocations: new Map(),  // node id -> queue_id
     _backfillingLocations: new Set(),
+    _deletingLocations: new Set(),
 
     init(onSelect, onDeselect) {
         this.el = document.getElementById('tree-content');
@@ -199,6 +200,18 @@ const Tree = {
 
     clearBackfillingLocation(locationId) {
         this._backfillingLocations.delete('loc-' + locationId);
+    },
+
+    setDeletingLocation(locationId) {
+        const key = typeof locationId === 'string' && locationId.startsWith('loc-') ? locationId : 'loc-' + locationId;
+        if (this._deletingLocations.has(key)) return;
+        this._deletingLocations.add(key);
+        this.render();
+    },
+
+    clearDeletingLocation(locationId) {
+        const key = typeof locationId === 'string' && locationId.startsWith('loc-') ? locationId : 'loc-' + locationId;
+        this._deletingLocations.delete(key);
     },
 
     async reload() {
@@ -540,6 +553,11 @@ const Tree = {
                     await API.post('/api/scan/cancel', { location_id: node.id, type: 'backfill' });
                 });
                 item.appendChild(cb);
+            } else if (this._deletingLocations.has(node.id)) {
+                const db = document.createElement('span');
+                db.className = 'tree-badge deleting';
+                db.textContent = 'deleting';
+                item.appendChild(db);
             }
         }
 

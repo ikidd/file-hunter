@@ -1,16 +1,30 @@
-"""Stored dup_count maintenance — recalculate and backfill."""
+"""Stored dup_count maintenance — recalculate and backfill.
+
+Write serialization: all dup recalc work is submitted to a shared queue
+and processed by a single long-lived background task on one DB connection.
+This avoids unbounded concurrent writers when multiple agents scan
+simultaneously (up to 12 agents × per-directory submissions).
+"""
 
 import asyncio
 import logging
 from collections import defaultdict
 
-from file_hunter.db import check_write_lock_requested, open_connection
+from file_hunter.db import (
+    check_write_lock_requested,
+    open_connection,
+    request_write_lock,
+)
 from file_hunter.services.stats import invalidate_stats_cache
 from file_hunter.ws.scan import broadcast
 
 log = logging.getLogger(__name__)
 
 RECALC_BATCH = 200
+
+# Coalesced writer state — single background task, single DB connection
+_recalc_queue: asyncio.Queue | None = None
+_writer_task: asyncio.Task | None = None
 
 
 async def _batched_recalc(db, hashes, *, on_progress=None):
@@ -84,33 +98,106 @@ async def _batched_recalc(db, hashes, *, on_progress=None):
     return processed
 
 
-def schedule_dup_recalc(hashes: set[str], source: str = ""):
-    """Fire-and-forget dup_count recalculation on its own connection.
+def submit_hashes_for_recalc(
+    hashes: set[str], source: str = "", location_ids: set[int] | None = None
+):
+    """Submit hashes to the coalesced dup recalc writer.
 
-    Safe to call from route handlers — runs in a background task so the
-    HTTP response is not blocked by per-hash UPDATE loops.
-    source: human-readable label for logs/activity (e.g. location name).
+    Non-blocking. Hashes are merged with any pending work and processed
+    by a single background task on one DB connection. Safe to call from
+    any context — scan loops, route handlers, backfill tasks.
+
+    Also updates stored locations.duplicate_count for all affected
+    locations after recalculating files.dup_count.
     """
+    global _recalc_queue, _writer_task
     hashes = {h for h in hashes if h}
-    if hashes:
-        asyncio.create_task(_bg_recalc_dups(hashes, source))
+    if not hashes:
+        return
+    if _recalc_queue is None:
+        _recalc_queue = asyncio.Queue()
+    _recalc_queue.put_nowait((hashes, source, location_ids or set()))
+    if _writer_task is None or _writer_task.done():
+        _writer_task = asyncio.create_task(_dup_recalc_writer())
 
 
-async def _bg_recalc_dups(hashes: set[str], source: str = ""):
+async def _dup_recalc_writer():
+    """Single long-lived writer that drains the hash queue.
+
+    Opens one DB connection, processes work items, coalesces rapid
+    submissions into larger batches. Cooperates with scan connections
+    via request_write_lock. Shuts down after 10s idle.
+    """
     db = await open_connection()
     try:
-        log.info(
-            "Recalculating duplicate counts for %d hashes (%s)",
-            len(hashes),
-            source or "unknown",
-        )
-        await recalculate_dup_counts(db, hashes)
-        msg = {"type": "dup_recalc_completed", "hashCount": len(hashes)}
-        if source:
-            msg["source"] = source
-        await broadcast(msg)
+        while True:
+            # Wait for work (shut down after 10s idle)
+            try:
+                item = await asyncio.wait_for(_recalc_queue.get(), timeout=10.0)
+            except asyncio.TimeoutError:
+                break
+
+            # Coalesce: drain any additional items that accumulated
+            merged_hashes: set[str] = set(item[0])
+            merged_sources: list[str] = [item[1]] if item[1] else []
+            merged_location_ids: set[int] = set(item[2])
+
+            while not _recalc_queue.empty():
+                try:
+                    more = _recalc_queue.get_nowait()
+                    merged_hashes.update(more[0])
+                    if more[1]:
+                        merged_sources.append(more[1])
+                    merged_location_ids.update(more[2])
+                except asyncio.QueueEmpty:
+                    break
+
+            source_label = ", ".join(merged_sources[:3])
+            if len(merged_sources) > 3:
+                source_label += f" +{len(merged_sources) - 3}"
+
+            log.info(
+                "Coalesced dup recalc: %d hashes (%s)",
+                len(merged_hashes),
+                source_label or "unknown",
+            )
+
+            # Signal scan connections to yield
+            request_write_lock()
+
+            # Recalculate dup_count on files
+            await recalculate_dup_counts(db, merged_hashes, source=source_label)
+
+            # Update stored duplicate_count for affected locations
+            h_list = list(merged_hashes)
+            h_ph = ",".join("?" for _ in h_list)
+            rows = await db.execute_fetchall(
+                f"SELECT DISTINCT location_id FROM files WHERE hash_strong IN ({h_ph})",
+                h_list,
+            )
+            affected = {r["location_id"] for r in rows}
+            affected |= merged_location_ids
+
+            for lid in affected:
+                dc_rows = await db.execute_fetchall(
+                    "SELECT COUNT(*) as c FROM files "
+                    "WHERE location_id = ? AND stale = 0 AND hidden = 0 "
+                    "AND dup_exclude = 0 AND dup_count > 0",
+                    (lid,),
+                )
+                await db.execute(
+                    "UPDATE locations SET duplicate_count = ? WHERE id = ?",
+                    (dc_rows[0]["c"], lid),
+                )
+            await db.commit()
+
+            invalidate_stats_cache()
+
+            await broadcast(
+                {"type": "dup_recalc_completed", "hashCount": len(merged_hashes)}
+            )
     except Exception:
-        log.error("Background dup_count recalc failed", exc_info=True)
+        log.error("Coalesced dup recalc writer failed", exc_info=True)
     finally:
         await db.close()
 

@@ -1,6 +1,3 @@
-import asyncio
-import os
-
 from starlette.requests import Request
 from file_hunter.db import get_db, execute_write
 from file_hunter.core import json_ok, json_error
@@ -10,7 +7,6 @@ from file_hunter.services.locations import (
     get_expand_path,
     create_folder,
     create_location,
-    delete_location,
     rename_location,
     update_schedule,
     move_folder,
@@ -32,14 +28,29 @@ async def add_location(request: Request):
     path = body.get("path", "").strip()
     if not name or not path:
         return json_error("Name and path are required.")
-    if not await asyncio.to_thread(os.path.isdir, path):
-        return json_error(f"Path does not exist or is not a directory: {path}", 400)
 
     # Find the local agent to assign this location to
     db = await get_db()
     cursor = await db.execute("SELECT id FROM agents WHERE name = 'Local Agent'")
     local_agent = await cursor.fetchone()
     agent_id = local_agent["id"] if local_agent else None
+
+    # Validate path via the local agent
+    if agent_id:
+        from file_hunter.services.agent_ops import _resolve_agent, _post
+
+        resolved = _resolve_agent(agent_id)
+        if resolved:
+            host, port, token = resolved
+            data = await _post(host, port, token, "/files/exists", {"path": path})
+            if not data.get("is_dir"):
+                return json_error(
+                    f"Path does not exist or is not a directory: {path}", 400
+                )
+        else:
+            return json_error("Local agent is offline.", 503)
+    else:
+        return json_error("Local agent not configured.", 503)
 
     try:
         loc = await execute_write(create_location, name, path, agent_id)
@@ -49,26 +60,14 @@ async def add_location(request: Request):
         raise
 
     # Push location to agent config so it knows about the new path
-    if agent_id:
-        try:
-            from file_hunter.services.agent_ops import _resolve_agent, _post
+    try:
+        await _post(host, port, token, "/locations/add", {"name": name, "path": path})
+    except Exception as e:
+        import logging
 
-            resolved = _resolve_agent(agent_id)
-            if resolved:
-                host, port, token = resolved
-                await _post(
-                    host,
-                    port,
-                    token,
-                    "/locations/add",
-                    {"name": name, "path": path},
-                )
-        except Exception as e:
-            import logging
-
-            logging.getLogger("file_hunter").warning(
-                "Failed to push new location to agent: %s", e
-            )
+        logging.getLogger("file_hunter").warning(
+            "Failed to push new location to agent: %s", e
+        )
 
     # Notify all connected browsers so they reload the tree
     await broadcast({"type": "location_changed", "action": "added", "location": loc})
@@ -79,25 +78,44 @@ async def add_location(request: Request):
 async def remove_location(request: Request):
     raw_id = request.path_params["id"]
     loc_id = int(raw_id.replace("loc-", ""))
-    # Look up root_path before delete so we can notify the agent
     db = await get_db()
     row = await db.execute_fetchall(
-        "SELECT root_path, agent_id FROM locations WHERE id = ?", (loc_id,)
+        "SELECT name, root_path, agent_id FROM locations WHERE id = ?", (loc_id,)
     )
-    root_path = row[0]["root_path"] if row else None
-    agent_id = row[0]["agent_id"] if row else None
-    await execute_write(delete_location, loc_id)
-    await broadcast(
-        {"type": "location_changed", "action": "deleted", "locationId": f"loc-{loc_id}"}
-    )
-    invalidate_stats_cache()
-    # Notify agent (if agent-backed) so its config.json stays in sync
-    from file_hunter.extensions import get_location_changed
+    if not row:
+        return json_error("Location not found.", 404)
 
-    hook = get_location_changed()
-    if hook and root_path:
-        await hook("deleted", loc_id, root_path=root_path, agent_id=agent_id)
-    return json_ok({"deleted": loc_id})
+    location_name = row[0]["name"]
+    root_path = row[0]["root_path"]
+    agent_id = row[0]["agent_id"]
+
+    # Cancel any running scan/backfill for this location first
+    from file_hunter.services.queue_manager import cancel_by_location, enqueue
+    from file_hunter.services.hash_backfill import cancel_backfill_by_location
+
+    await cancel_by_location(loc_id)
+    cancel_backfill_by_location(loc_id)
+
+    # Enqueue the delete as a persistent operation
+    op_id = await enqueue(
+        "delete_location",
+        agent_id,
+        {
+            "location_id": loc_id,
+            "location_name": location_name,
+            "root_path": root_path,
+        },
+    )
+
+    await broadcast(
+        {
+            "type": "location_deleting",
+            "locationId": f"loc-{loc_id}",
+            "name": location_name,
+        }
+    )
+
+    return json_ok({"message": f"Deleting '{location_name}'...", "queue_id": op_id})
 
 
 async def update_location(request: Request):

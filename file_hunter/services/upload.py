@@ -89,6 +89,7 @@ async def run_upload(
                     ),
                 )
 
+                await db.commit()
                 affected_hashes.add(hash_strong)
                 duplicates += 1
                 await broadcast(
@@ -141,6 +142,7 @@ async def run_upload(
                     ),
                 )
 
+                await db.commit()
                 affected_hashes.add(hash_strong)
                 cataloged += 1
 

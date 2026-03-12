@@ -977,6 +977,7 @@ WS.on('scan_progress', (msg) => {
     const matchesSuffix = msg.potentialMatches ? `, ${msg.potentialMatches.toLocaleString()} matches` : '';
     StatusBar.renderActivity('scanning', `${msg.location} — ${msg.filesHashed.toLocaleString()} hashed${skippedSuffix}${matchesSuffix}`, msg.locationId);
     StatusBar.updateStatsFromProgress(msg);
+    Detail.updateFromScanProgress(msg);
     const skippedLog = msg.filesSkipped ? `, ${msg.filesSkipped.toLocaleString()} skipped` : '';
     const matchesPart = msg.potentialMatches ? `, ${msg.potentialMatches.toLocaleString()} matches` : '';
     ActivityLog.add(`${msg.location} — ${msg.filesFound.toLocaleString()} found, ${msg.filesHashed.toLocaleString()} hashed${skippedLog}${matchesPart}`);
@@ -1003,7 +1004,7 @@ WS.on('scan_completed', async (msg) => {
         if (selectedFile) FileList.pendingFocusFile = selectedFile.id;
         if (selectedNode) await FileList.showFolder(selectedNode.id);
     }
-    await refreshDetailPanel();
+    await Detail.refreshStats();
 });
 
 WS.on('scan_finalizing', (msg) => {
@@ -1030,10 +1031,11 @@ WS.on('scan_cancelled', async (msg) => {
         if (selectedFile) FileList.pendingFocusFile = selectedFile.id;
         if (selectedNode) await FileList.showFolder(selectedNode.id);
     }
-    await refreshDetailPanel();
+    await Detail.refreshStats();
 });
 
 WS.on('scan_interrupted', async (msg) => {
+    StatusBar.renderActivity('idle');
     ActivityLog.add(`Scan interrupted: <b>${msg.location}</b> — agent disconnected, will resume automatically`);
     Toast.info(`Scan interrupted: ${msg.location} — will resume when agent reconnects`);
     Tree.clearScanningLocation(msg.locationId);
@@ -1144,7 +1146,7 @@ WS.on('backfill_completed', async (msg) => {
         if (selectedFile) FileList.pendingFocusFile = selectedFile.id;
         if (selectedNode) await FileList.showFolder(selectedNode.id);
     }
-    await refreshDetailPanel();
+    await Detail.refreshStats();
 });
 
 WS.on('dup_backfill_started', msg => {
@@ -1166,7 +1168,7 @@ WS.on('dup_backfill_completed', msg => {
 WS.on('size_recalc_completed', msg => {
     ActivityLog.add('Location sizes recalculated');
     StatusBar.loadStats();
-    refreshDetailPanel();
+    Detail.refreshStats();
 });
 WS.on('dup_recalc_completed', msg => {
     const src = msg.source ? ` (${msg.source})` : '';
@@ -1186,7 +1188,7 @@ WS.on('dup_exclude_completed', async msg => {
     const verb = msg.direction === 'exclude' ? 'excluded' : 'included';
     ActivityLog.add(`Duplicate exclusion updated: <b>${msg.folder}</b> ${verb} — ${(msg.fileCount || 0).toLocaleString()} files, ${(msg.hashCount || 0).toLocaleString()} hashes recalculated`);
     if (selectedNode) await FileList.showFolder(selectedNode.id);
-    await refreshDetailPanel();
+    await Detail.refreshStats();
     await StatusBar.loadStats();
 });
 
@@ -1198,9 +1200,28 @@ WS.on('location_changed', async (msg) => {
     await refreshDetailPanel();
 });
 
-WS.on('stats_updated', async () => {
+WS.on('location_deleting', (msg) => {
+    ActivityLog.add(`Deleting location: <b>${msg.name}</b>...`);
+    Tree.setDeletingLocation(msg.locationId);
+});
+
+WS.on('location_deleted', async (msg) => {
+    ActivityLog.add(`Location deleted: <b>${msg.name}</b>`);
+    Toast.success(`Location deleted: ${msg.name}`);
+    Tree.clearDeletingLocation(msg.locationId);
+    if (selectedNode && selectedNode.id === msg.locationId) {
+        selectedNode = null;
+        selectedFile = null;
+    }
+    await Tree.reload();
+    if (selectedNode) selectedNode = Tree._findNode(selectedNode.id);
     await StatusBar.loadStats();
     await refreshDetailPanel();
+});
+
+WS.on('stats_updated', async () => {
+    await StatusBar.loadStats();
+    await Detail.refreshStats();
 });
 
 WS.on('repair_started', () => {
@@ -1210,7 +1231,7 @@ WS.on('repair_started', () => {
 WS.on('repair_completed', async (msg) => {
     ActivityLog.add(`Catalog repair complete: ${msg.staleCleared} stale flags cleared, ${msg.hashes} hashes recounted`);
     await StatusBar.loadStats();
-    await refreshDetailPanel();
+    await Detail.refreshStats();
 });
 
 WS.on('repair_failed', () => {

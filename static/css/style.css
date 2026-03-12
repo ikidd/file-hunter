@@ -1590,6 +1590,13 @@ body::after {
     margin-top: 0.25rem;
 }
 
+.fs-loading {
+    padding: 1rem;
+    text-align: center;
+    color: var(--color-text-muted);
+    font-style: italic;
+}
+
 /* ── Toast notifications ── */
 
 #toast-container {

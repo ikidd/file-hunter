@@ -58,7 +58,6 @@ def get_public_ws_paths():
 
 _scan_trigger_fn = None
 _scan_cancel_fn = None
-_online_check_fn = None
 _content_proxy_fn = None
 _fetch_bytes_fn = None
 _agent_proxy_fn = None
@@ -88,19 +87,6 @@ def set_scan_cancel(fn):
 
 def get_scan_cancel():
     return _scan_cancel_fn
-
-
-def set_online_check(fn):
-    global _online_check_fn
-    _online_check_fn = fn
-
-
-def get_online_check():
-    if _online_check_fn:
-        return _online_check_fn
-    from file_hunter.services.online_check import agent_online_check
-
-    return agent_online_check
 
 
 def set_content_proxy(fn):
@@ -153,11 +139,6 @@ def get_agent_location_ids():
     from file_hunter.services.online_check import all_agent_location_ids
 
     return all_agent_location_ids()
-
-
-def is_agent_location(location_id: int) -> bool:
-    """Check if a location is agent-backed (content must be proxied, not local)."""
-    return location_id in get_agent_location_ids()
 
 
 def set_agent_label_prefixes(fn):

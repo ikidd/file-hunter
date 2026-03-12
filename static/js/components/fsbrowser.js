@@ -42,6 +42,9 @@ const FSBrowser = {
 
         this.overlay.classList.remove('hidden');
 
+        // Show loading state while fetching from agent
+        this.treeContainer.innerHTML = '<div class="fs-loading">Loading...</div>';
+
         // Load root entries
         await this._loadEntries(null);
         this._renderTree();
@@ -122,12 +125,17 @@ const FSBrowser = {
             if (entry.hasChildren) {
                 if (this._expandedPaths.has(entry.path)) {
                     this._expandedPaths.delete(entry.path);
+                    this._renderTree();
                 } else {
                     this._expandedPaths.add(entry.path);
+                    this._renderTree(); // show spinner immediately
                     await this._loadEntries(entry.path);
+                    this._renderTree(); // replace spinner with children
+                    return;
                 }
+            } else {
+                this._renderTree();
             }
-            this._renderTree();
         });
 
         // Double-click to confirm selection
@@ -141,8 +149,17 @@ const FSBrowser = {
 
         // Render children if expanded
         if (this._expandedPaths.has(entry.path)) {
-            const children = this._loadedChildren.get(entry.path) || [];
-            children.forEach(child => this._renderNode(child, depth + 1));
+            if (!this._loadedChildren.has(entry.path)) {
+                // Still loading — show inline spinner
+                const loading = document.createElement('div');
+                loading.className = 'fs-loading';
+                loading.style.paddingLeft = `${(depth + 1) * 1.25}rem`;
+                loading.textContent = 'Loading...';
+                this.treeContainer.appendChild(loading);
+            } else {
+                const children = this._loadedChildren.get(entry.path) || [];
+                children.forEach(child => this._renderNode(child, depth + 1));
+            }
         }
     },
 

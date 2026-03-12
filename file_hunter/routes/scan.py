@@ -9,6 +9,7 @@ from file_hunter.services.queue_manager import (
     cancel,
     cancel_by_location,
     get_queue_status,
+    get_queue_status_for_broadcast,
 )
 from file_hunter.services.hash_backfill import cancel_backfill_by_location
 
@@ -77,12 +78,28 @@ async def start_scan(request: Request):
         },
     )
 
+    # Broadcast scan_queued for activity log (queue state already broadcast by enqueue)
+    from file_hunter.ws.scan import broadcast
+
     label = f"{location_name} / {folder_name}" if folder_name else location_name
+    await broadcast(
+        {
+            "type": "scan_queued",
+            "entry": {
+                "queue_id": op_id,
+                "location_id": loc_id,
+                "name": label,
+            },
+            "queue": (await get_queue_status_for_broadcast()),
+        }
+    )
+
     return json_ok({"message": f"Scan queued for '{label}'", "queue_id": op_id})
 
 
 async def cancel_scan(request: Request):
     body = await request.json()
+    db = await get_db()
 
     # Cancel by queue/operation ID
     queue_id = body.get("queue_id")
@@ -103,35 +120,26 @@ async def cancel_scan(request: Request):
             return json_ok({"message": "Backfill cancellation requested."})
         return json_error("No backfill running for this location.", 400)
 
+    # Resolve location name for the dequeue broadcast
+    loc_rows = await db.execute_fetchall(
+        "SELECT name FROM locations WHERE id = ?", (loc_id,)
+    )
+    location_name = loc_rows[0]["name"] if loc_rows else ""
+
     cancelled = await cancel_by_location(loc_id)
     if cancelled:
+        from file_hunter.ws.scan import broadcast
+
+        await broadcast(
+            {
+                "type": "scan_dequeued",
+                "entry": {"location_id": loc_id, "name": location_name},
+                "queue": (await get_queue_status_for_broadcast()),
+            }
+        )
         return json_ok({"message": "Scan cancellation requested."})
     return json_error("No scan running for this location.", 400)
 
 
 async def get_scan_queue(request: Request):
-    status = await get_queue_status()
-    # Transform to match the frontend's expected format
-    running_ids = [
-        item["location_id"]
-        for item in status
-        if item.get("status") == "running" and item.get("location_id")
-    ]
-    pending = [
-        {
-            "queue_id": item["id"],
-            "location_id": item.get("location_id"),
-            "name": item.get("location_name", ""),
-            "folder_name": item.get("params", {}).get("folder_name"),
-            "queued_at": item.get("created_at", ""),
-        }
-        for item in status
-        if item.get("status") == "pending"
-    ]
-    return json_ok(
-        {
-            "running_location_ids": running_ids,
-            "running_location_id": running_ids[0] if running_ids else None,
-            "pending": pending,
-        }
-    )
+    return json_ok(await get_queue_status_for_broadcast())

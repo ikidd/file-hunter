@@ -39,10 +39,8 @@ async def list_files(
     folder_hidden_filter = "" if show_hidden else " AND fld.hidden = 0"
 
     # Build WHERE clause for files
-    location_id = None
     if folder_id.startswith("loc-"):
         loc_id = int(folder_id[4:])
-        location_id = loc_id
         folder_where = "f.location_id = ? AND f.folder_id IS NULL"
         folder_params = [loc_id]
         # Subfolders at root level (include rel_path + root_path for missing check)
@@ -63,8 +61,6 @@ async def list_files(
                WHERE fld.parent_id = ?{folder_hidden_filter} ORDER BY fld.name""",
             (fld_id,),
         )
-        if folders:
-            location_id = folders[0]["location_id"]
     else:
         return {
             "items": [],
@@ -131,51 +127,10 @@ async def list_files(
         params + [PAGE_SIZE, offset],
     )
 
-    # Determine if location is online and batch-check existence
+    # All locations are agent-backed — no local file existence checks
     missing_file_ids = set()
     missing_folder_ids = set()
-    loc_online = False
-    # All items share the same location — get root_path from either source
-    root_path = None
-    if files:
-        root_path = files[0]["root_path"]
-    elif folders:
-        root_path = folders[0]["root_path"]
-    if root_path and location_id:
-        loc_online = False  # online status handled by agent check
     unstale_set = set()
-    if loc_online:
-        all_paths = [f["full_path"] for f in files] + [
-            os.path.join(fld["root_path"], fld["rel_path"]) for fld in folders
-        ]
-        if all_paths:
-            exists = await asyncio.to_thread(
-                lambda ps: [os.path.exists(p) for p in ps], all_paths
-            )
-            n_files = len(files)
-            for i in range(n_files):
-                if files[i]["stale"] and exists[i]:
-                    unstale_set.add(files[i]["id"])
-                elif not files[i]["stale"] and not exists[i]:
-                    missing_file_ids.add(files[i]["id"])
-            missing_folder_ids = {
-                folders[i - n_files]["id"]
-                for i in range(n_files, len(all_paths))
-                if not exists[i]
-            }
-        # Batch-clear stale flag for files found on disk
-        if unstale_set:
-            from file_hunter.db import execute_write
-
-            async def _batch_clear_stale(conn, ids):
-                placeholders = ",".join("?" * len(ids))
-                await conn.execute(
-                    f"UPDATE files SET stale = 0 WHERE id IN ({placeholders})",
-                    list(ids),
-                )
-                await conn.commit()
-
-            await execute_write(_batch_clear_stale, unstale_set)
 
     folder_items = [
         {

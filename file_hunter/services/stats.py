@@ -12,7 +12,6 @@ at read time.
 import asyncio
 import json
 import logging
-import os
 
 from file_hunter.core import format_size
 from file_hunter.services.locations import check_location_online, get_disk_stats
@@ -361,16 +360,8 @@ async def get_folder_stats(db, folder_id: int):
         loc_online = await asyncio.to_thread(
             check_location_online, loc_id_num, root_path
         )
-        if loc_online:
-            from file_hunter.extensions import is_agent_location
-
-            if is_agent_location(loc_id_num):
-                folder_online = True  # agent online — assume folder exists
-            else:
-                folder_path = os.path.join(root_path, cached["relPath"])
-                folder_online = await asyncio.to_thread(os.path.isdir, folder_path)
-        else:
-            folder_online = False
+        # All locations are agent-backed — if agent is online, folder is online
+        folder_online = loc_online
         result = {k: v for k, v in cached.items() if not k.startswith("_")}
         result["locationOnline"] = loc_online
         result["online"] = folder_online
@@ -428,17 +419,8 @@ async def get_folder_stats(db, folder_id: int):
         {"nodeId": f"fld-{r['id']}", "name": r["name"]} for r in chain_rows
     )
 
-    # Compute folder online status
-    if loc_online:
-        from file_hunter.extensions import is_agent_location
-
-        if is_agent_location(fld["location_id"]):
-            folder_online = True  # agent online — assume folder exists
-        else:
-            folder_path = os.path.join(fld["location_root_path"], fld["rel_path"])
-            folder_online = await asyncio.to_thread(os.path.isdir, folder_path)
-    else:
-        folder_online = False
+    # All locations are agent-backed — if agent is online, folder is online
+    folder_online = loc_online
 
     # Cache everything except live-computed locationOnline
     # _root_path is a private field used to compute online status on cache hit

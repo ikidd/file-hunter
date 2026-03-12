@@ -1,21 +1,34 @@
-import asyncio
-import os
+"""Filesystem browsing — proxied through the local agent."""
+
+import urllib.parse
 
 from starlette.requests import Request
+
 from file_hunter.core import json_ok, json_error
-from file_hunter.services.browse import get_root_entries, get_children
+from file_hunter.db import get_db
 
 
 async def browse(request: Request):
     path = request.query_params.get("path", "").strip()
 
-    if not path:
-        entries = await asyncio.to_thread(get_root_entries)
-        return json_ok({"path": None, "entries": entries})
+    # Find the local agent
+    db = await get_db()
+    cursor = await db.execute("SELECT id FROM agents WHERE name = 'Local Agent'")
+    row = await cursor.fetchone()
+    if not row:
+        return json_error("Local agent not configured.", 503)
 
-    is_dir = await asyncio.to_thread(os.path.isdir, path)
-    if not is_dir:
-        return json_error(f"Path does not exist or is not a directory: {path}", 400)
+    from file_hunter.services.agent_ops import _resolve_agent, _get
 
-    entries = await asyncio.to_thread(get_children, path)
-    return json_ok({"path": path, "entries": entries})
+    resolved = _resolve_agent(row["id"])
+    if not resolved:
+        return json_error("Local agent is offline.", 503)
+
+    host, port, token = resolved
+    qs = f"?path={urllib.parse.quote(path, safe='')}" if path else ""
+    try:
+        data = await _get(host, port, token, f"/browse-system{qs}", timeout=10.0)
+    except Exception as e:
+        return json_error(f"Browse failed: {e}", 500)
+
+    return json_ok(data)

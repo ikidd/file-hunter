@@ -64,6 +64,116 @@ const Detail = {
         this.renderDashboard();
     },
 
+    updateFromScanProgress(msg) {
+        if (!this.el) return;
+        const locId = msg.locationId;
+
+        // Dashboard: update global counters
+        const gfc = this.el.querySelector('[data-stat="globalFileCount"]');
+        if (gfc && msg.globalFileCount !== undefined) {
+            gfc.textContent = msg.globalFileCount.toLocaleString();
+        }
+        const gts = this.el.querySelector('[data-stat="globalTotalSize"]');
+        if (gts && msg.globalTotalSize !== undefined) {
+            gts.textContent = formatSize(msg.globalTotalSize);
+        }
+        const gdup = this.el.querySelector('[data-stat="globalDuplicates"]');
+        if (gdup && msg.globalDuplicateCount !== undefined) {
+            gdup.textContent = msg.globalDuplicateCount.toLocaleString();
+        }
+        const gtb = this.el.querySelector('[data-stat="globalTypeBreakdown"]');
+        if (gtb && msg.globalTypeBreakdown) {
+            gtb.innerHTML = '<h3>Files by Type</h3>' + msg.globalTypeBreakdown.map(t =>
+                `<div class="detail-field">
+                    <span class="label">${t.type || 'other'}</span>
+                    <span class="value">${t.count.toLocaleString()}</span>
+                </div>`
+            ).join('');
+        }
+
+        // Location / folder: update if viewing the scanning location
+        const isViewingLocation = this._currentLocationNode &&
+            String(this._currentLocationNode.id).replace('loc-', '') === String(locId);
+        if (!isViewingLocation) return;
+
+        const fc = this.el.querySelector('[data-stat="fileCount"]');
+        if (fc && msg.fileCount !== undefined) {
+            fc.textContent = msg.fileCount.toLocaleString();
+        }
+        const ts = this.el.querySelector('[data-stat="totalSize"]');
+        if (ts && msg.totalSize !== undefined) {
+            ts.textContent = formatSize(msg.totalSize);
+        }
+        const dup = this.el.querySelector('[data-stat="duplicates"]');
+        if (dup && msg.duplicateCount !== undefined) {
+            dup.textContent = msg.duplicateCount.toLocaleString();
+        }
+        const tb = this.el.querySelector('[data-stat="typeBreakdown"]');
+        if (tb && msg.typeBreakdown) {
+            tb.innerHTML = '<h3>File Types</h3>' + msg.typeBreakdown.map(t =>
+                `<div class="detail-field">
+                    <span class="label">${t.type || 'other'}</span>
+                    <span class="value">${t.count.toLocaleString()}</span>
+                </div>`
+            ).join('');
+        }
+    },
+
+    async refreshStats() {
+        if (!this.el) return;
+
+        // Dashboard view — patch global counters from /api/stats
+        const gfc = this.el.querySelector('[data-stat="globalFileCount"]');
+        if (gfc) {
+            const res = await API.get('/api/stats');
+            if (res.ok) {
+                const s = res.data;
+                gfc.textContent = s.totalFiles.toLocaleString();
+                const gts = this.el.querySelector('[data-stat="globalTotalSize"]');
+                if (gts) gts.textContent = s.totalSizeFormatted;
+                const gdup = this.el.querySelector('[data-stat="globalDuplicates"]');
+                if (gdup) gdup.textContent = s.duplicateFiles.toLocaleString();
+                const gtb = this.el.querySelector('[data-stat="globalTypeBreakdown"]');
+                if (gtb && s.typeBreakdown) {
+                    gtb.innerHTML = '<h3>Files by Type</h3>' + s.typeBreakdown.map(t =>
+                        `<div class="detail-field">
+                            <span class="label">${t.type || 'other'}</span>
+                            <span class="value">${t.count.toLocaleString()}</span>
+                        </div>`
+                    ).join('');
+                }
+            }
+            return;
+        }
+
+        // Location view — patch location counters
+        if (!this._currentLocationNode) return;
+        const locId = String(this._currentLocationNode.id).replace('loc-', '');
+        const res = await API.get(`/api/locations/${locId}/stats`);
+        if (!res.ok) return;
+        const s = res.data;
+
+        const fc = this.el.querySelector('[data-stat="fileCount"]');
+        if (fc) fc.textContent = s.fileCount.toLocaleString();
+        const flc = this.el.querySelector('[data-stat="folderCount"]');
+        if (flc) flc.textContent = s.folderCount.toLocaleString();
+        const ts = this.el.querySelector('[data-stat="totalSize"]');
+        if (ts) ts.textContent = s.totalSizeFormatted;
+        const dup = this.el.querySelector('[data-stat="duplicates"]');
+        if (dup) dup.textContent = s.duplicateFiles.toLocaleString();
+        const ls = this.el.querySelector('[data-stat="lastScanned"]');
+        if (ls) ls.textContent = s.dateLastScanned ? _timeAgo(s.dateLastScanned) : 'Never';
+        const tb = this.el.querySelector('[data-stat="typeBreakdown"]');
+        if (tb && s.typeBreakdown) {
+            tb.innerHTML = '<h3>File Types</h3>' + s.typeBreakdown.map(t =>
+                `<div class="detail-field">
+                    <span class="label">${t.type || 'other'}</span>
+                    <span class="value">${t.count.toLocaleString()}</span>
+                </div>`
+            ).join('');
+        }
+    },
+
     _abortPrevious() {
         if (this._ac) this._ac.abort();
         this._ac = new AbortController();
@@ -593,7 +703,7 @@ const Detail = {
         this.el.innerHTML = `
             <div class="dashboard-stats">
                 <div class="stat-card">
-                    <div class="stat-value">${s.totalFiles.toLocaleString()}</div>
+                    <div class="stat-value" data-stat="globalFileCount">${s.totalFiles.toLocaleString()}</div>
                     <div class="stat-label">Files Cataloged</div>
                 </div>
                 <div class="stat-card">
@@ -601,15 +711,15 @@ const Detail = {
                     <div class="stat-label">Locations</div>
                 </div>
                 <div class="stat-card">
-                    <div class="stat-value">${s.duplicateFiles.toLocaleString()}</div>
+                    <div class="stat-value" data-stat="globalDuplicates">${s.duplicateFiles.toLocaleString()}</div>
                     <div class="stat-label">Duplicates Found</div>
                 </div>
                 <div class="stat-card">
-                    <div class="stat-value">${s.totalSizeFormatted}</div>
+                    <div class="stat-value" data-stat="globalTotalSize">${s.totalSizeFormatted}</div>
                     <div class="stat-label">Total Cataloged</div>
                 </div>
             </div>
-            ${typeHtml ? `<div class="detail-section"><h3>Files by Type</h3>${typeHtml}</div>` : ''}
+            ${typeHtml ? `<div class="detail-section" data-stat="globalTypeBreakdown"><h3>Files by Type</h3>${typeHtml}</div>` : ''}
             <div class="detail-section">
                 <h3>Recent Scans</h3>
                 ${scansHtml || '<div class="detail-field"><span class="value">No scans yet.</span></div>'}
@@ -1280,7 +1390,7 @@ const Detail = {
                 </div>
                 <div class="detail-field">
                     <span class="label">Last Scanned</span>
-                    <span class="value">${s.dateLastScanned ? _timeAgo(s.dateLastScanned) : 'Never'}</span>
+                    <span class="value" data-stat="lastScanned">${s.dateLastScanned ? _timeAgo(s.dateLastScanned) : 'Never'}</span>
                 </div>
             </div>
             ${s.online ? `<div class="detail-section">
@@ -1307,22 +1417,22 @@ const Detail = {
                 <h3>Contents</h3>
                 <div class="detail-field">
                     <span class="label">Files</span>
-                    <span class="value">${s.fileCount.toLocaleString()}</span>
+                    <span class="value" data-stat="fileCount">${s.fileCount.toLocaleString()}</span>
                 </div>
                 <div class="detail-field">
                     <span class="label">Folders</span>
-                    <span class="value">${s.folderCount.toLocaleString()}</span>
+                    <span class="value" data-stat="folderCount">${s.folderCount.toLocaleString()}</span>
                 </div>
                 <div class="detail-field">
                     <span class="label">Total Size</span>
-                    <span class="value">${s.totalSizeFormatted}</span>
+                    <span class="value" data-stat="totalSize">${s.totalSizeFormatted}</span>
                 </div>
                 <div class="detail-field">
                     <span class="label">Duplicates</span>
-                    <span class="value">${s.duplicateFiles.toLocaleString()}</span>
+                    <span class="value" data-stat="duplicates">${s.duplicateFiles.toLocaleString()}</span>
                 </div>
             </div>
-            ${typeHtml ? `<div class="detail-section"><h3>File Types</h3>${typeHtml}</div>` : ''}
+            ${typeHtml ? `<div class="detail-section" data-stat="typeBreakdown"><h3>File Types</h3>${typeHtml}</div>` : ''}
             <div class="detail-section">
                 <div class="detail-btn-group">
                     <span id="detail-slideshow-slot"></span>
@@ -1380,19 +1490,19 @@ const Detail = {
                 <h3>Contents</h3>
                 <div class="detail-field">
                     <span class="label">Files</span>
-                    <span class="value">${s.fileCount.toLocaleString()}</span>
+                    <span class="value" data-stat="fileCount">${s.fileCount.toLocaleString()}</span>
                 </div>
                 <div class="detail-field">
                     <span class="label">Subfolders</span>
-                    <span class="value">${s.subfolderCount.toLocaleString()}</span>
+                    <span class="value" data-stat="folderCount">${s.subfolderCount.toLocaleString()}</span>
                 </div>
                 <div class="detail-field">
                     <span class="label">Total Size</span>
-                    <span class="value">${s.totalSizeFormatted}</span>
+                    <span class="value" data-stat="totalSize">${s.totalSizeFormatted}</span>
                 </div>
                 <div class="detail-field">
                     <span class="label">Duplicates</span>
-                    <span class="value">${s.duplicateFiles.toLocaleString()}</span>
+                    <span class="value" data-stat="duplicates">${s.duplicateFiles.toLocaleString()}</span>
                 </div>
             </div>
             <div class="detail-section">

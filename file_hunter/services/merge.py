@@ -368,6 +368,9 @@ async def run_merge(db, source_id, source_info, destination_id, dest_info):
                         ),
                     )
 
+                    # Commit DB writes before filesystem network I/O
+                    await db.commit()
+
                     # Filesystem: write .moved stub at source
                     await fs.write_moved_stub(
                         src_path,
@@ -538,6 +541,9 @@ async def run_merge(db, source_id, source_info, destination_id, dest_info):
                             src_file["id"],
                         ),
                     )
+
+                    # Commit DB writes before filesystem network I/O
+                    await db.commit()
 
                     # Filesystem: write .moved stub at source
                     await fs.write_moved_stub(

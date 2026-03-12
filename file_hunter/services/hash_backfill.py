@@ -120,7 +120,12 @@ async def load_persisted_backfills() -> list[tuple[int, int, str, str | None]]:
         "SELECT agent_id, location_id, location_name, scan_prefix FROM pending_backfills"
     )
     return [
-        (r["agent_id"], r["location_id"], r["location_name"], r.get("scan_prefix"))
+        (
+            r["agent_id"],
+            r["location_id"],
+            r["location_name"],
+            dict(r).get("scan_prefix"),
+        )
         for r in rows
     ]
 
@@ -196,7 +201,7 @@ async def run_backfill(
                      SELECT 1 FROM files f2
                      WHERE f2.file_size = f.file_size
                        AND f2.hash_partial = f.hash_partial
-                       AND f2.location_id != f.location_id
+                       AND f2.id != f.id
                  )""",
             params,
         )
@@ -319,21 +324,19 @@ async def run_backfill(
         )
 
         # Cross-agent backfill: hash files on other connected agents
-        cross_agent_hashed = 0
         if not cancelled:
-            cross_agent_hashed = await _backfill_agents(
+            await _backfill_agents(
                 db, agent_id, location_id, location_name, affected_hashes
             )
 
         if affected_hashes:
-            from file_hunter.services.dup_counts import recalculate_dup_counts
+            from file_hunter.services.dup_counts import submit_hashes_for_recalc
 
-            await recalculate_dup_counts(
-                db, affected_hashes, source=f"backfill {location_name}"
+            submit_hashes_for_recalc(
+                affected_hashes,
+                source=f"backfill {location_name}",
+                location_ids={location_id},
             )
-
-        if agent_hashed > 0 or cross_agent_hashed > 0:
-            invalidate_stats_cache()
 
     except Exception as e:
         logger.error("Backfill error for %s: %s", location_name, e)

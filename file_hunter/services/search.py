@@ -1,7 +1,5 @@
 """Dynamic search query builder."""
 
-import asyncio
-import os
 import re
 
 PAGE_SIZE = 120
@@ -227,28 +225,8 @@ async def search_files(
             params + [PAGE_SIZE, offset],
         )
 
-        # Batch-check file existence for online LOCAL locations (skip agent locations)
-        from file_hunter.extensions import is_agent_location
-
-        online_roots = {}
-        for r in rows:
-            rp = r["root_path"]
-            if rp not in online_roots:
-                if is_agent_location(r["location_id"]):
-                    online_roots[rp] = False  # skip local disk checks for agent files
-                else:
-                    online_roots[rp] = await asyncio.to_thread(os.path.isdir, rp)
-
+        # All locations are agent-backed — no local file existence checks
         missing_set = set()
-        online_rows = [
-            r for r in rows if not r["stale"] and online_roots.get(r["root_path"])
-        ]
-        if online_rows:
-            paths = [r["full_path"] for r in online_rows]
-            exists = await asyncio.to_thread(
-                lambda ps: [os.path.isfile(p) for p in ps], paths
-            )
-            missing_set = {online_rows[i]["id"] for i, e in enumerate(exists) if not e}
 
         from file_hunter.services.dup_counts import batch_dup_counts
 
@@ -545,27 +523,8 @@ async def search_files_advanced(
             where_params + [PAGE_SIZE, offset],
         )
 
-        from file_hunter.extensions import is_agent_location
-
-        online_roots = {}
-        for r in rows:
-            rp = r["root_path"]
-            if rp not in online_roots:
-                if is_agent_location(r["location_id"]):
-                    online_roots[rp] = False
-                else:
-                    online_roots[rp] = await asyncio.to_thread(os.path.isdir, rp)
-
+        # All locations are agent-backed — no local file existence checks
         missing_set = set()
-        online_rows = [
-            r for r in rows if not r["stale"] and online_roots.get(r["root_path"])
-        ]
-        if online_rows:
-            paths = [r["full_path"] for r in online_rows]
-            exists = await asyncio.to_thread(
-                lambda ps: [os.path.isfile(p) for p in ps], paths
-            )
-            missing_set = {online_rows[i]["id"] for i, e in enumerate(exists) if not e}
 
         from file_hunter.services.dup_counts import batch_dup_counts
 

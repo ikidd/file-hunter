@@ -35,9 +35,15 @@ const StatusBar = {
         }
     },
 
-    updateStatsFromProgress() {
-        // Stats are only updated via loadStats() after scan completion.
-        // Scan progress is shown in the activity section, not the stats counter.
+    updateStatsFromProgress(msg) {
+        if (!this._stats) return;
+        if (msg.globalFileCount !== undefined) this._stats.totalFiles = msg.globalFileCount;
+        if (msg.globalTotalSize !== undefined) {
+            this._stats.totalSize = msg.globalTotalSize;
+            this._stats.totalSizeFormatted = formatSize(msg.globalTotalSize);
+        }
+        if (msg.globalDuplicateCount !== undefined) this._stats.duplicateFiles = msg.globalDuplicateCount;
+        this._renderStats();
     },
 
     _renderStats() {

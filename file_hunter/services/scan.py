@@ -7,11 +7,14 @@ or stale marking.
 """
 
 import asyncio
+import json
 import logging
 import os
 import time
 from collections import deque
 from datetime import datetime, timezone
+
+import httpx
 
 from file_hunter.db import open_connection, check_write_lock_requested
 from file_hunter.services.scanner import (
@@ -19,7 +22,7 @@ from file_hunter.services.scanner import (
     upsert_file,
     mark_stale_files,
 )
-from file_hunter.services.agent_ops import reconcile_directory
+from file_hunter.services.agent_ops import reconcile_directory, dispatch
 from file_hunter.services.stats import invalidate_stats_cache
 from file_hunter.ws.scan import broadcast
 
@@ -44,32 +47,55 @@ async def run_scan(op_id: int, agent_id: int, params: dict):
 
     db = await open_connection()
     try:
-        # Resolve location name for broadcasts
+        # Resolve location name and current counters for incremental updates
         loc_row = await db.execute_fetchall(
-            "SELECT name FROM locations WHERE id = ?", (location_id,)
+            "SELECT name, file_count, total_size, type_counts "
+            "FROM locations WHERE id = ?",
+            (location_id,),
         )
         location_name = loc_row[0]["name"] if loc_row else f"Location #{location_id}"
-
-        # Create scan record
-        now_iso = _now()
-        cursor = await db.execute(
-            "INSERT INTO scans (location_id, status, started_at) VALUES (?, 'running', ?)",
-            (location_id, now_iso),
+        running_file_count = (loc_row[0]["file_count"] or 0) if loc_row else 0
+        running_total_size = (loc_row[0]["total_size"] or 0) if loc_row else 0
+        running_type_counts = (
+            json.loads(loc_row[0]["type_counts"] or "{}") if loc_row else {}
         )
-        scan_id = cursor.lastrowid
-        await db.commit()
+        # Create or resume scan record
+        now_iso = _now()
+        saved_scan_id = params.get("scan_id")
+        if saved_scan_id and saved_traversal:
+            # Resuming an interrupted scan — reuse the same scan_id
+            scan_id = saved_scan_id
+            await db.execute(
+                "UPDATE scans SET status = 'running' WHERE id = ?",
+                (scan_id,),
+            )
+            await db.commit()
+            logger.info(
+                "Resuming scan #%d for location #%d (%s), %d dirs remaining",
+                scan_id,
+                location_id,
+                location_name,
+                len(saved_traversal),
+            )
+        else:
+            cursor = await db.execute(
+                "INSERT INTO scans (location_id, status, started_at) VALUES (?, 'running', ?)",
+                (location_id, now_iso),
+            )
+            scan_id = cursor.lastrowid
+            await db.commit()
 
         # Determine scan prefix for stale marking
         scan_prefix = None
         if scan_path != root_path:
             scan_prefix = os.path.relpath(scan_path, root_path)
 
-        # State
+        # State (restore counters on resume)
         folder_cache: dict[str, tuple] = {}
-        affected_hashes: set[str] = set()
-        files_found = 0
-        files_new = 0
+        files_found = params.get("files_found", 0) if saved_traversal else 0
+        files_new = params.get("files_new", 0) if saved_traversal else 0
         dirs_processed = 0
+        last_stats_update = time.monotonic()
 
         # BFS traversal queue
         dirs_to_visit: deque[str] = deque(
@@ -86,13 +112,26 @@ async def run_scan(op_id: int, agent_id: int, params: dict):
             }
         )
 
+        # Immediate progress so UI shows real numbers instead of "starting..."
+        await _broadcast_progress(
+            db,
+            location_id,
+            location_name,
+            files_found,
+            files_new,
+            0,
+            len(dirs_to_visit),
+        )
+
         while dirs_to_visit:
             current_dir = dirs_to_visit.popleft()
+            dir_affected_hashes: set[str] = set()
 
             # Get expected files for this directory from the catalog
             expected = await _get_expected_files(
                 db, location_id, current_dir, root_path
             )
+            expected_by_path = {e["rel_path"]: e for e in expected}
 
             # Call agent /reconcile
             result = await reconcile_directory(
@@ -138,7 +177,7 @@ async def run_scan(op_id: int, agent_id: int, params: dict):
                     )
                     old_hs = old_row[0]["hash_strong"]
                     if old_hs:
-                        affected_hashes.add(old_hs)
+                        dir_affected_hashes.add(old_hs)
 
                 # Resolve folder
                 folder_id = None
@@ -219,27 +258,115 @@ async def run_scan(op_id: int, agent_id: int, params: dict):
                         [location_id] + batch,
                     )
                     for hr in hash_rows:
-                        affected_hashes.add(hr["hash_strong"])
+                        dir_affected_hashes.add(hr["hash_strong"])
                     await db.execute(
                         f"UPDATE files SET stale = 1 "
                         f"WHERE location_id = ? AND rel_path IN ({ph})",
                         [location_id] + batch,
                     )
 
+            # --- Update location counters incrementally ---
+            delta_count = len(result.get("new", [])) - len(gone)
+            delta_size = 0
+            delta_types: dict[str, int] = {}
+
+            for f in result.get("new", []):
+                delta_size += f.get("file_size", 0)
+                ft = f.get("file_type_high", "") or ""
+                delta_types[ft] = delta_types.get(ft, 0) + 1
+
+            for rp in gone:
+                old = expected_by_path.get(rp, {})
+                delta_size -= old.get("file_size", 0)
+                ft = old.get("file_type_high", "") or ""
+                delta_types[ft] = delta_types.get(ft, 0) - 1
+
+            for f in result.get("changed", []):
+                old = expected_by_path.get(f["rel_path"], {})
+                delta_size += f.get("file_size", 0) - old.get("file_size", 0)
+                old_ft = old.get("file_type_high", "") or ""
+                new_ft = f.get("file_type_high", "") or ""
+                if old_ft != new_ft:
+                    delta_types[old_ft] = delta_types.get(old_ft, 0) - 1
+                    delta_types[new_ft] = delta_types.get(new_ft, 0) + 1
+
+            running_file_count = max(0, running_file_count + delta_count)
+            running_total_size = max(0, running_total_size + delta_size)
+            for ft, d in delta_types.items():
+                running_type_counts[ft] = running_type_counts.get(ft, 0) + d
+            running_type_counts = {
+                k: v for k, v in running_type_counts.items() if v > 0
+            }
+
+            # Commit catalog writes before inline backfill — releases the
+            # write lock so other scans and update_params aren't blocked
+            # during potentially slow agent HTTP calls
+            await db.commit()
+
+            # --- Inline backfill for this directory ---
+            dir_rel = os.path.relpath(current_dir, root_path)
+            if dir_rel == ".":
+                dir_rel = ""
+            current_folder_id = (
+                folder_cache[dir_rel][0]
+                if dir_rel and dir_rel in folder_cache
+                else None
+            )
+
+            new_hashes, bf_hashed, bf_errors = await _inline_backfill_dir(
+                db, location_id, current_folder_id
+            )
+            dir_affected_hashes.update(new_hashes)
+
+            # Update folder chain with file_count/total_size/type_counts deltas
+            # (dup_delta handled asynchronously by background dup recalc)
+            if dir_rel:
+                await _update_folder_chain(
+                    db,
+                    folder_cache,
+                    dir_rel,
+                    delta_count,
+                    delta_size,
+                    0,
+                    delta_types,
+                )
+
+            # Submit to coalesced dup recalc writer (single background
+            # task, single DB connection — no per-directory task spawning)
+            if dir_affected_hashes:
+                from file_hunter.services.dup_counts import (
+                    submit_hashes_for_recalc,
+                )
+
+                submit_hashes_for_recalc(
+                    dir_affected_hashes,
+                    source=f"scan {location_name}",
+                    location_ids={location_id},
+                )
+
+            await db.execute(
+                "UPDATE locations SET file_count = ?, total_size = ?, "
+                "type_counts = ? WHERE id = ?",
+                (
+                    running_file_count,
+                    running_total_size,
+                    json.dumps(running_type_counts),
+                    location_id,
+                ),
+            )
+
             await db.commit()
             dirs_processed += 1
 
-            # Broadcast progress after every directory
-            await broadcast(
-                {
-                    "type": "scan_progress",
-                    "locationId": location_id,
-                    "location": location_name,
-                    "filesFound": files_found,
-                    "filesNew": files_new,
-                    "dirsProcessed": dirs_processed,
-                    "dirsRemaining": len(dirs_to_visit),
-                }
+            # Broadcast progress with live counters so UI updates labels
+            await _broadcast_progress(
+                db,
+                location_id,
+                location_name,
+                files_found,
+                files_new,
+                dirs_processed,
+                len(dirs_to_visit),
             )
 
             # Persist traversal state for crash recovery
@@ -248,8 +375,16 @@ async def run_scan(op_id: int, agent_id: int, params: dict):
                 from file_hunter.services.queue_manager import update_params
 
                 params["traversal"] = list(dirs_to_visit)
+                params["scan_id"] = scan_id
+                params["files_found"] = files_found
+                params["files_new"] = files_new
                 await update_params(op_id, params)
                 last_state_save = now_mono
+
+            # Refresh stats cache so UI picks up counter changes
+            if now_mono - last_stats_update > 5.0:
+                invalidate_stats_cache()
+                last_stats_update = now_mono
 
             # Yield so DB reads (tree nav, file browsing) aren't blocked
             if check_write_lock_requested():
@@ -258,16 +393,16 @@ async def run_scan(op_id: int, agent_id: int, params: dict):
                 await asyncio.sleep(0)
 
         # --- Finalization ---
+        await broadcast(
+            {
+                "type": "scan_finalizing",
+                "locationId": location_id,
+                "location": location_name,
+            }
+        )
 
         # Mark files not seen in this scan as stale
         stale_count = await mark_stale_files(db, location_id, scan_id, scan_prefix)
-
-        # Flag new files for backfill
-        if files_new > 0:
-            await db.execute(
-                "UPDATE locations SET backfill_needed = 1 WHERE id = ?",
-                (location_id,),
-            )
 
         # Complete the scan record
         completed_iso = _now()
@@ -291,14 +426,22 @@ async def run_scan(op_id: int, agent_id: int, params: dict):
             stale_count,
         )
 
+        # Read current dup count from stored counter (updated by background tasks)
+        dup_row = await db.execute_fetchall(
+            "SELECT duplicate_count FROM locations WHERE id = ?", (location_id,)
+        )
+        final_dup_count = (dup_row[0]["duplicate_count"] or 0) if dup_row else 0
+
         await broadcast(
             {
                 "type": "scan_completed",
                 "locationId": location_id,
                 "location": location_name,
                 "filesFound": files_found,
+                "filesHashed": files_found,
                 "filesNew": files_new,
                 "staleFiles": stale_count,
+                "duplicatesFound": final_dup_count,
             }
         )
 
@@ -306,16 +449,12 @@ async def run_scan(op_id: int, agent_id: int, params: dict):
         from file_hunter.services.sizes import schedule_size_recalc
 
         schedule_size_recalc(location_id)
-
-        if affected_hashes:
-            from file_hunter.services.dup_counts import schedule_dup_recalc
-
-            schedule_dup_recalc(affected_hashes, location_name)
-
         invalidate_stats_cache()
 
-        # Launch cross-agent backfill if needed
-        await _maybe_launch_backfill(agent_id, location_id, location_name, scan_prefix)
+        # Launch cross-agent backfill (hash matching files on other agents)
+        asyncio.create_task(
+            _launch_cross_agent_backfill(agent_id, location_id, location_name)
+        )
 
     except asyncio.CancelledError:
         # Operation was cancelled via queue_manager
@@ -331,9 +470,46 @@ async def run_scan(op_id: int, agent_id: int, params: dict):
                 "type": "scan_cancelled",
                 "locationId": location_id,
                 "location": location_name,
+                "filesHashed": files_found,
+                "filesFound": files_found,
             }
         )
         logger.info("Scan cancelled: location #%d (%s)", location_id, location_name)
+        raise
+
+    except (ConnectionError, OSError, httpx.ConnectError) as e:
+        # Agent disconnected — scan will be re-queued by queue_manager.
+        # Save scan_id so the resumed operation reuses it.
+        from file_hunter.services.queue_manager import update_params
+
+        params["scan_id"] = scan_id
+        params["traversal"] = list(dirs_to_visit)
+        params["files_found"] = files_found
+        params["files_new"] = files_new
+        await update_params(op_id, params)
+
+        await db.execute(
+            "UPDATE scans SET status = 'interrupted' WHERE id = ?",
+            (scan_id,),
+        )
+        await db.commit()
+
+        logger.warning(
+            "Scan interrupted: location #%d (%s): %s — "
+            "scan_id=%d saved for resumption, %d dirs remaining",
+            location_id,
+            location_name,
+            e,
+            scan_id,
+            len(dirs_to_visit),
+        )
+        await broadcast(
+            {
+                "type": "scan_interrupted",
+                "locationId": location_id,
+                "location": location_name,
+            }
+        )
         raise
 
     except Exception as e:
@@ -374,8 +550,9 @@ async def _get_expected_files(
 ) -> list[dict]:
     """Query the catalog for non-stale files in a specific directory.
 
-    Returns list of {rel_path, file_size, modified_date} for the agent
-    to compare against disk.
+    Returns list of {rel_path, file_size, modified_date, file_type_high}
+    for the agent to compare against disk.  file_type_high is used by the
+    scan loop to compute incremental counter deltas for gone/changed files.
     """
     rel_dir = os.path.relpath(dir_path, root_path)
     if rel_dir == ".":
@@ -384,7 +561,7 @@ async def _get_expected_files(
     if rel_dir == "":
         # Root directory — files with no folder
         rows = await db.execute_fetchall(
-            "SELECT rel_path, file_size, modified_date "
+            "SELECT rel_path, file_size, modified_date, file_type_high "
             "FROM files WHERE location_id = ? AND stale = 0 AND folder_id IS NULL",
             (location_id,),
         )
@@ -398,7 +575,7 @@ async def _get_expected_files(
             return []
         folder_id = folder_row[0]["id"]
         rows = await db.execute_fetchall(
-            "SELECT rel_path, file_size, modified_date "
+            "SELECT rel_path, file_size, modified_date, file_type_high "
             "FROM files WHERE location_id = ? AND stale = 0 AND folder_id = ?",
             (location_id, folder_id),
         )
@@ -408,32 +585,235 @@ async def _get_expected_files(
             "rel_path": r["rel_path"],
             "file_size": r["file_size"],
             "modified_date": r["modified_date"],
+            "file_type_high": r["file_type_high"] or "",
         }
         for r in rows
     ]
 
 
-async def _maybe_launch_backfill(
-    agent_id: int, location_id: int, location_name: str, scan_prefix: str | None
-):
-    """Check if cross-agent backfill is needed and launch it."""
-    from file_hunter.db import get_db
+async def _inline_backfill_dir(db, location_id: int, folder_id: int | None):
+    """Hash backfill candidates in one directory.
 
-    db = await get_db()
-    row = await db.execute_fetchall(
-        "SELECT backfill_needed FROM locations WHERE id = ?", (location_id,)
-    )
-    if not row or not row[0]["backfill_needed"]:
+    Finds files with hash_partial but no hash_strong that have size+partial
+    matches elsewhere in the catalog. Returns (new_hashes, hashed, errors).
+    """
+    if folder_id is not None:
+        candidates = await db.execute_fetchall(
+            """SELECT f.id, f.full_path
+               FROM files f
+               WHERE f.folder_id = ?
+                 AND f.location_id = ?
+                 AND f.hash_strong IS NULL
+                 AND f.hash_partial IS NOT NULL
+                 AND f.file_size > 0
+                 AND f.stale = 0
+                 AND EXISTS (
+                     SELECT 1 FROM files f2
+                     WHERE f2.file_size = f.file_size
+                       AND f2.hash_partial = f.hash_partial
+                       AND f2.id != f.id
+                 )""",
+            (folder_id, location_id),
+        )
+    else:
+        candidates = await db.execute_fetchall(
+            """SELECT f.id, f.full_path
+               FROM files f
+               WHERE f.folder_id IS NULL
+                 AND f.location_id = ?
+                 AND f.hash_strong IS NULL
+                 AND f.hash_partial IS NOT NULL
+                 AND f.file_size > 0
+                 AND f.stale = 0
+                 AND EXISTS (
+                     SELECT 1 FROM files f2
+                     WHERE f2.file_size = f.file_size
+                       AND f2.hash_partial = f.hash_partial
+                       AND f2.id != f.id
+                 )""",
+            (location_id,),
+        )
+
+    if not candidates:
+        return set(), 0, 0
+
+    new_hashes: set[str] = set()
+    hashed = 0
+    errors = 0
+
+    for row in candidates:
+        try:
+            result = await dispatch("file_hash", location_id, path=row["full_path"])
+            await db.execute(
+                "UPDATE files SET hash_fast = ?, hash_strong = ? WHERE id = ?",
+                (result["hash_fast"], result["hash_strong"], row["id"]),
+            )
+            # Commit after each write — don't hold write lock across
+            # the next HTTP call when other scans need it
+            await db.commit()
+            new_hashes.add(result["hash_strong"])
+            hashed += 1
+        except Exception as e:
+            errors += 1
+            logger.warning(
+                "Inline backfill: hash failed for %s: %r", row["full_path"], e
+            )
+
+    return new_hashes, hashed, errors
+
+
+async def _update_folder_chain(
+    db, folder_cache, rel_dir, delta_count, delta_size, dup_delta, delta_types
+):
+    """Apply counter deltas to the current folder and all ancestors."""
+    if not rel_dir:
         return
 
-    from file_hunter.services.hash_backfill import run_backfill
+    # Build ancestor chain from path components
+    parts = rel_dir.replace("\\", "/").split("/")
+    folder_ids = []
+    for i in range(len(parts)):
+        ancestor_path = "/".join(parts[: i + 1])
+        entry = folder_cache.get(ancestor_path)
+        if entry:
+            folder_ids.append(entry[0])
 
-    logger.info(
-        "Launching post-scan backfill for location #%d (%s)",
-        location_id,
-        location_name,
+    if not folder_ids:
+        return
+
+    # Read current type_counts for all folders in chain
+    ph = ",".join("?" for _ in folder_ids)
+    rows = await db.execute_fetchall(
+        f"SELECT id, type_counts FROM folders WHERE id IN ({ph})",
+        folder_ids,
     )
-    asyncio.create_task(run_backfill(agent_id, location_id, location_name, scan_prefix))
+    tc_map = {r["id"]: json.loads(r["type_counts"] or "{}") for r in rows}
+
+    for fid in folder_ids:
+        current_tc = tc_map.get(fid, {})
+        for ft, d in delta_types.items():
+            current_tc[ft] = current_tc.get(ft, 0) + d
+        current_tc = {k: v for k, v in current_tc.items() if v > 0}
+
+        await db.execute(
+            "UPDATE folders SET "
+            "file_count = MAX(0, COALESCE(file_count, 0) + ?), "
+            "total_size = MAX(0, COALESCE(total_size, 0) + ?), "
+            "duplicate_count = MAX(0, COALESCE(duplicate_count, 0) + ?), "
+            "type_counts = ? "
+            "WHERE id = ?",
+            (delta_count, delta_size, dup_delta, json.dumps(current_tc), fid),
+        )
+
+
+async def _launch_cross_agent_backfill(
+    agent_id: int, location_id: int, location_name: str
+):
+    """Background: hash matching files on other agents after scan."""
+    from file_hunter.services.hash_backfill import _backfill_agents
+
+    db = await open_connection()
+    try:
+        affected_hashes: set[str] = set()
+        hashed = await _backfill_agents(
+            db, agent_id, location_id, location_name, affected_hashes
+        )
+        if affected_hashes:
+            from file_hunter.services.dup_counts import submit_hashes_for_recalc
+
+            submit_hashes_for_recalc(
+                affected_hashes,
+                source=f"cross-agent {location_name}",
+                location_ids={location_id},
+            )
+        if hashed > 0:
+            from file_hunter.services.sizes import schedule_size_recalc
+
+            loc_ids = {location_id}
+            if affected_hashes:
+                ah_list = list(affected_hashes)
+                ah_ph = ",".join("?" for _ in ah_list)
+                cross_rows = await db.execute_fetchall(
+                    f"SELECT DISTINCT location_id FROM files "
+                    f"WHERE hash_strong IN ({ah_ph}) AND location_id != ?",
+                    ah_list + [location_id],
+                )
+                for r in cross_rows:
+                    loc_ids.add(r["location_id"])
+            schedule_size_recalc(*loc_ids)
+            invalidate_stats_cache()
+    except Exception:
+        logger.error("Cross-agent backfill failed for %s", location_name, exc_info=True)
+    finally:
+        await db.close()
+
+
+async def _broadcast_progress(
+    db,
+    location_id: int,
+    location_name: str,
+    files_found: int,
+    files_new: int,
+    dirs_processed: int,
+    dirs_remaining: int,
+):
+    """Broadcast scan progress with live counters from the DB."""
+    loc_rows = await db.execute_fetchall(
+        "SELECT id, file_count, total_size, duplicate_count, type_counts "
+        "FROM locations",
+    )
+    global_file_count = 0
+    global_total_size = 0
+    global_dup_count = 0
+    loc_file_count = 0
+    loc_total_size = 0
+    loc_dup_count = 0
+    loc_tc = {}
+    global_types: dict[str, int] = {}
+    for row in loc_rows:
+        fc = row["file_count"] or 0
+        ts = row["total_size"] or 0
+        dc = row["duplicate_count"] or 0
+        global_file_count += fc
+        global_total_size += ts
+        global_dup_count += dc
+        tc = json.loads(row["type_counts"] or "{}")
+        for t, c in tc.items():
+            global_types[t] = global_types.get(t, 0) + c
+        if row["id"] == location_id:
+            loc_file_count = fc
+            loc_total_size = ts
+            loc_dup_count = dc
+            loc_tc = tc
+
+    type_breakdown = [
+        {"type": t, "count": c} for t, c in sorted(loc_tc.items(), key=lambda x: -x[1])
+    ]
+    global_type_breakdown = [
+        {"type": t, "count": c}
+        for t, c in sorted(global_types.items(), key=lambda x: -x[1])
+    ]
+
+    await broadcast(
+        {
+            "type": "scan_progress",
+            "locationId": location_id,
+            "location": location_name,
+            "filesFound": files_found,
+            "filesHashed": files_found,
+            "filesNew": files_new,
+            "dirsProcessed": dirs_processed,
+            "dirsRemaining": dirs_remaining,
+            "fileCount": loc_file_count,
+            "totalSize": loc_total_size,
+            "duplicateCount": loc_dup_count,
+            "globalFileCount": global_file_count,
+            "globalTotalSize": global_total_size,
+            "globalDuplicateCount": global_dup_count,
+            "typeBreakdown": type_breakdown,
+            "globalTypeBreakdown": global_type_breakdown,
+        }
+    )
 
 
 def _now() -> str:
