@@ -1278,6 +1278,12 @@ body::after {
     background: var(--color-bg);
     color: var(--color-text);
     font-size: var(--font-size-base);
+    width: 100%;
+}
+
+select.modal-input {
+    height: 2.1rem;
+    -webkit-appearance: menulist;
 }
 
 .modal-input::placeholder {
