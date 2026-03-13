@@ -393,70 +393,83 @@ async def agent_ws_endpoint(websocket: WebSocket):
 
     except WebSocketDisconnect:
         pass
+    except asyncio.CancelledError:
+        logger.info("Agent #%d WebSocket cancelled (shutdown)", agent_id)
     except Exception as e:
         logger.warning("Agent #%d WebSocket error: %s", agent_id, e)
     finally:
-        # Cancel any running hash backfill — capture state for re-queue
-        from file_hunter.services.hash_backfill import (
-            cancel_backfill,
-            get_active_backfill_info,
-            queue_pending_backfill,
-        )
-
-        interrupted_backfill = get_active_backfill_info(agent_id)
-        cancel_backfill(agent_id)
-
-        # Only clean up if this websocket is still the registered one
-        replaced = _agent_connections.get(agent_id) is not websocket
-
-        if replaced:
-            logger.info(
-                "Agent #%d old connection cleanup skipped — "
-                "new connection already registered",
-                agent_id,
+        try:
+            # Cancel any running hash backfill — capture state for re-queue
+            from file_hunter.services.hash_backfill import (
+                cancel_backfill,
+                get_active_backfill_info,
+                queue_pending_backfill,
             )
-        else:
-            from file_hunter.services.online_check import clear_location_path_status
 
-            clear_location_path_status(agent_id)
+            interrupted_backfill = get_active_backfill_info(agent_id)
+            cancel_backfill(agent_id)
 
+            # Only clean up if this websocket is still the registered one
+            replaced = _agent_connections.get(agent_id) is not websocket
+
+            if replaced:
+                logger.info(
+                    "Agent #%d old connection cleanup skipped — "
+                    "new connection already registered",
+                    agent_id,
+                )
+            else:
+                from file_hunter.services.online_check import clear_location_path_status
+
+                clear_location_path_status(agent_id)
+
+                _agent_connections.pop(agent_id, None)
+                _agent_tokens.pop(agent_id, None)
+                _agent_info.pop(agent_id, None)
+                _agent_location_ids.pop(agent_id, None)
+
+                now = datetime.now(timezone.utc).isoformat()
+
+                async def _set_offline(conn, aid, ts):
+                    await conn.execute(
+                        "UPDATE agents SET status = 'offline', date_last_seen = ? WHERE id = ?",
+                        (ts, aid),
+                    )
+                    await conn.commit()
+
+                await execute_write(_set_offline, agent_id, now)
+
+                await broadcast(
+                    {"type": "agent_status", "agentId": agent_id, "status": "offline"}
+                )
+                await broadcast(
+                    {
+                        "type": "location_changed",
+                        "action": "disconnected",
+                        "location": {"label": agent_name},
+                    }
+                )
+
+                logger.info("Agent #%d disconnected", agent_id)
+
+            # Re-queue interrupted backfill at head so it resumes first
+            if interrupted_backfill:
+                await queue_pending_backfill(
+                    agent_id, *interrupted_backfill, front=True
+                )
+                logger.info(
+                    "Queued interrupted backfill for location #%d (%s)",
+                    interrupted_backfill[0],
+                    interrupted_backfill[1],
+                )
+        except asyncio.CancelledError:
+            # Shutdown cancelled the cleanup — in-memory state already torn down,
+            # DB will be corrected on next startup (_recover_interrupted)
+            logger.info("Agent #%d cleanup skipped (shutdown)", agent_id)
             _agent_connections.pop(agent_id, None)
             _agent_tokens.pop(agent_id, None)
             _agent_info.pop(agent_id, None)
             _agent_location_ids.pop(agent_id, None)
-
-            now = datetime.now(timezone.utc).isoformat()
-
-            async def _set_offline(conn, aid, ts):
-                await conn.execute(
-                    "UPDATE agents SET status = 'offline', date_last_seen = ? WHERE id = ?",
-                    (ts, aid),
-                )
-                await conn.commit()
-
-            await execute_write(_set_offline, agent_id, now)
-
-            await broadcast(
-                {"type": "agent_status", "agentId": agent_id, "status": "offline"}
-            )
-            await broadcast(
-                {
-                    "type": "location_changed",
-                    "action": "disconnected",
-                    "location": {"label": agent_name},
-                }
-            )
-
-            logger.info("Agent #%d disconnected", agent_id)
-
-        # Re-queue interrupted backfill at head so it resumes first
-        if interrupted_backfill:
-            await queue_pending_backfill(agent_id, *interrupted_backfill, front=True)
-            logger.info(
-                "Queued interrupted backfill for location #%d (%s)",
-                interrupted_backfill[0],
-                interrupted_backfill[1],
-            )
 
 
 async def _authenticate_agent(token: str) -> tuple[int, str] | None:

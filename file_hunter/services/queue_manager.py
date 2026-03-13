@@ -201,7 +201,7 @@ async def stop():
         for task in done:
             try:
                 task.result()
-            except Exception:
+            except BaseException:
                 pass
         for task in pending:
             task.cancel()
@@ -210,7 +210,7 @@ async def stop():
             for task in done2:
                 try:
                     task.result()
-                except Exception:
+                except BaseException:
                     pass
 
     if _task and not _task.done():
