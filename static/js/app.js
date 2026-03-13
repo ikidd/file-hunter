@@ -975,9 +975,16 @@ WS.on('scan_started', (msg) => {
 });
 
 WS.on('scan_progress', (msg) => {
-    const skippedSuffix = msg.filesSkipped ? `, ${msg.filesSkipped.toLocaleString()} skipped` : '';
-    const matchesSuffix = msg.potentialMatches ? `, ${msg.potentialMatches.toLocaleString()} matches` : '';
-    StatusBar.renderActivity('scanning', `${msg.location} — ${msg.filesHashed.toLocaleString()} hashed${skippedSuffix}${matchesSuffix}`, msg.locationId);
+    let statusText;
+    if (msg.phase === 'tree_diff') {
+        const changedSuffix = msg.dirsChanged ? ` (${msg.dirsChanged.toLocaleString()} changed)` : '';
+        statusText = `${msg.location} — Comparing: ${msg.dirsProcessed.toLocaleString()} dirs checked, ${msg.filesFound.toLocaleString()} files${changedSuffix}`;
+    } else {
+        const skippedSuffix = msg.filesSkipped ? `, ${msg.filesSkipped.toLocaleString()} skipped` : '';
+        const matchesSuffix = msg.potentialMatches ? `, ${msg.potentialMatches.toLocaleString()} matches` : '';
+        statusText = `${msg.location} — ${msg.filesHashed.toLocaleString()} hashed${skippedSuffix}${matchesSuffix}`;
+    }
+    StatusBar.renderActivity('scanning', statusText, msg.locationId);
     StatusBar.updateStatsFromProgress(msg);
     Detail.updateFromScanProgress(msg);
     const skippedLog = msg.filesSkipped ? `, ${msg.filesSkipped.toLocaleString()} skipped` : '';
