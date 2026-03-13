@@ -770,7 +770,7 @@ async def _launch_cross_agent_backfill(
     try:
         affected_hashes: set[str] = set()
         hashed = await _backfill_agents(
-            read_db, agent_id, location_id, location_name, affected_hashes
+            agent_id, location_id, location_name, affected_hashes
         )
         if affected_hashes:
             from file_hunter.services.dup_counts import submit_hashes_for_recalc
