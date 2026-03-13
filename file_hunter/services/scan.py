@@ -134,8 +134,28 @@ async def run_scan(op_id: int, agent_id: int, params: dict):
     try:
         if can_tree_diff:
             try:
+                logger.info(
+                    "Tree diff: starting for location #%d (%s)",
+                    location_id,
+                    location_name,
+                )
                 tree_diff_dirs = await _tree_diff(
-                    agent_id, location_id, root_path, read_db
+                    agent_id,
+                    location_id,
+                    root_path,
+                    read_db,
+                    location_name=location_name,
+                    broadcast_fn=lambda dirs_done, files_seen, changed: broadcast(
+                        {
+                            "type": "scan_progress",
+                            "locationId": location_id,
+                            "location": location_name,
+                            "phase": "tree_diff",
+                            "dirsProcessed": dirs_done,
+                            "filesFound": files_seen,
+                            "dirsChanged": changed,
+                        }
+                    ),
                 )
                 if tree_diff_dirs is not None:
                     if not tree_diff_dirs:
@@ -184,14 +204,8 @@ async def run_scan(op_id: int, agent_id: int, params: dict):
                     "WHERE location_id = ? AND stale = 0",
                     (scan_id, now_iso, location_id),
                 )
-            # Refresh read snapshot so COUNT sees the just-written scan_id
-            await read_db.commit()
-            # Pre-count confirmed files for accurate progress/completion stats
-            count_row = await read_db.execute_fetchall(
-                "SELECT COUNT(*) as cnt FROM files WHERE location_id = ? AND stale = 0",
-                (location_id,),
-            )
-            files_found = count_row[0]["cnt"] if count_row else 0
+            # Use stored counter instead of COUNT(*) against files table
+            files_found = running_file_count
         while dirs_to_visit:
             # Checkpoint: block here while queue is paused (e.g. during import)
             from file_hunter.services.queue_manager import wait_if_paused
@@ -922,6 +936,8 @@ async def _tree_diff(
     location_id: int,
     root_path: str,
     read_db,
+    location_name: str = "",
+    broadcast_fn=None,
 ) -> set[str] | None:
     """Stream the agent tree and diff against catalog.
 
@@ -932,14 +948,33 @@ async def _tree_diff(
     all_dirs: list[str] = []
     current_rel_dir: str | None = None
     current_files: list[dict] = []
+    dirs_done = 0
+    files_seen = 0
+    last_broadcast = time.monotonic()
 
     async def _flush_dir():
         """Diff the buffered directory and record result."""
+        nonlocal dirs_done, last_broadcast
         if current_rel_dir is None:
             return
         catalog = await _get_catalog_dir(read_db, location_id, current_rel_dir)
         if _diff_directory(current_files, catalog):
             changed_dirs.add(current_rel_dir)
+        dirs_done += 1
+
+        # Log and broadcast periodically
+        now = time.monotonic()
+        if now - last_broadcast >= 2.0:
+            logger.info(
+                "Tree diff: %d dirs diffed, %d files seen, %d changed so far — %s",
+                dirs_done,
+                files_seen,
+                len(changed_dirs),
+                location_name,
+            )
+            if broadcast_fn:
+                await broadcast_fn(dirs_done, files_seen, len(changed_dirs))
+            last_broadcast = now
 
     got_records = False
     async for record in stream_tree(agent_id, root_path):
@@ -954,6 +989,7 @@ async def _tree_diff(
 
         elif rtype == "file":
             current_files.append(record)
+            files_seen += 1
 
         elif rtype == "end":
             await _flush_dir()
@@ -961,6 +997,14 @@ async def _tree_diff(
     if not got_records:
         # stream_tree returned without yielding — agent doesn't support /tree
         return None
+
+    logger.info(
+        "Tree diff complete: %d dirs, %d files, %d changed — %s",
+        dirs_done,
+        files_seen,
+        len(changed_dirs),
+        location_name,
+    )
 
     # Detect deleted directories: catalog dirs not in agent tree
     catalog_dirs_rows = await read_db.execute_fetchall(
