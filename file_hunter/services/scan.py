@@ -137,41 +137,161 @@ async def run_scan(op_id: int, agent_id: int, params: dict):
             )
             expected_by_path = {e["rel_path"]: e for e in expected}
 
-            # --- HTTP: call agent /reconcile ---
-            result = await reconcile_directory(
-                agent_id, current_dir, root_path, expected
-            )
-
-            # Enqueue subdirectories for BFS
-            for subdir in sorted(result.get("subdirs", [])):
-                dirs_to_visit.append(os.path.join(current_dir, subdir))
-
-            # --- Compute deltas (pure computation, no DB) ---
-            gone = result.get("gone", [])
-            delta_count = len(result.get("new", [])) - len(gone)
+            # --- PAGINATED RECONCILE ---
+            reconcile_cursor = 0  # first page (signals "paginate please")
+            is_first_page = True
+            gone = []
+            delta_count = 0
             delta_size = 0
             delta_types: dict[str, int] = {}
 
-            for f in result.get("new", []):
-                delta_size += f.get("file_size", 0)
-                ft = f.get("file_type_high", "") or ""
-                delta_types[ft] = delta_types.get(ft, 0) + 1
+            while True:
+                result = await reconcile_directory(
+                    agent_id,
+                    current_dir,
+                    root_path,
+                    expected,
+                    cursor=reconcile_cursor,
+                )
 
-            for rp in gone:
-                old = expected_by_path.get(rp, {})
-                delta_size -= old.get("file_size", 0)
-                ft = old.get("file_type_high", "") or ""
-                delta_types[ft] = delta_types.get(ft, 0) - 1
+                # First page: subdirs, unchanged, gone
+                if is_first_page:
+                    for subdir in sorted(result.get("subdirs", [])):
+                        dirs_to_visit.append(os.path.join(current_dir, subdir))
 
-            for f in result.get("changed", []):
-                old = expected_by_path.get(f["rel_path"], {})
-                delta_size += f.get("file_size", 0) - old.get("file_size", 0)
-                old_ft = old.get("file_type_high", "") or ""
-                new_ft = f.get("file_type_high", "") or ""
-                if old_ft != new_ft:
-                    delta_types[old_ft] = delta_types.get(old_ft, 0) - 1
-                    delta_types[new_ft] = delta_types.get(new_ft, 0) + 1
+                    # Unchanged — batched in 500s with yields
+                    unchanged = result.get("unchanged", [])
+                    if unchanged:
+                        for i in range(0, len(unchanged), 500):
+                            batch = unchanged[i : i + 500]
+                            ph = ",".join("?" for _ in batch)
+                            async with db_writer() as db:
+                                await db.execute(
+                                    f"UPDATE files SET date_last_seen = ?, scan_id = ? "
+                                    f"WHERE location_id = ? AND stale = 0 "
+                                    f"AND rel_path IN ({ph})",
+                                    [now_iso, scan_id, location_id] + batch,
+                                )
+                            await asyncio.sleep(0)
+                        files_found += len(unchanged)
 
+                    # Gone — compute deltas + batch mark stale
+                    gone = result.get("gone", [])
+                    delta_count -= len(gone)
+                    for rp in gone:
+                        old = expected_by_path.get(rp, {})
+                        delta_size -= old.get("file_size", 0)
+                        ft = old.get("file_type_high", "") or ""
+                        delta_types[ft] = delta_types.get(ft, 0) - 1
+
+                    if gone:
+                        for i in range(0, len(gone), 500):
+                            batch = gone[i : i + 500]
+                            ph = ",".join("?" for _ in batch)
+                            async with db_writer() as db:
+                                hash_rows = await db.execute_fetchall(
+                                    f"SELECT DISTINCT hash_strong FROM files "
+                                    f"WHERE location_id = ? AND rel_path IN ({ph}) "
+                                    f"AND hash_strong IS NOT NULL",
+                                    [location_id] + batch,
+                                )
+                                for hr in hash_rows:
+                                    dir_affected_hashes.add(hr["hash_strong"])
+                                await db.execute(
+                                    f"UPDATE files SET stale = 1 "
+                                    f"WHERE location_id = ? AND rel_path IN ({ph})",
+                                    [location_id] + batch,
+                                )
+                            await asyncio.sleep(0)
+
+                # --- Compute deltas for this page's new + changed ---
+                page_new = result.get("new", [])
+                page_changed = result.get("changed", [])
+
+                delta_count += len(page_new)
+                for f in page_new:
+                    delta_size += f.get("file_size", 0)
+                    ft = f.get("file_type_high", "") or ""
+                    delta_types[ft] = delta_types.get(ft, 0) + 1
+
+                for f in page_changed:
+                    old = expected_by_path.get(f["rel_path"], {})
+                    delta_size += f.get("file_size", 0) - old.get("file_size", 0)
+                    old_ft = old.get("file_type_high", "") or ""
+                    new_ft = f.get("file_type_high", "") or ""
+                    if old_ft != new_ft:
+                        delta_types[old_ft] = delta_types.get(old_ft, 0) - 1
+                        delta_types[new_ft] = delta_types.get(new_ft, 0) + 1
+
+                # --- BATCHED WRITES for new + changed (WRITE_BATCH_SIZE = 500) ---
+                all_items = [("changed", f) for f in page_changed] + [
+                    ("new", f) for f in page_new
+                ]
+                for i in range(0, len(all_items), 500):
+                    batch = all_items[i : i + 500]
+                    async with db_writer() as db:
+                        for kind, f in batch:
+                            rel_path = f["rel_path"]
+                            rel_dir = f.get("rel_dir", "")
+
+                            if kind == "changed":
+                                old_row = await db.execute_fetchall(
+                                    "SELECT file_size, hash_strong FROM files "
+                                    "WHERE location_id = ? AND rel_path = ?",
+                                    (location_id, rel_path),
+                                )
+                                size_changed = old_row and old_row[0][
+                                    "file_size"
+                                ] != f.get("file_size")
+                                if size_changed:
+                                    await db.execute(
+                                        "UPDATE files SET hash_fast = NULL, hash_strong = NULL "
+                                        "WHERE location_id = ? AND rel_path = ?",
+                                        (location_id, rel_path),
+                                    )
+                                    old_hs = old_row[0]["hash_strong"]
+                                    if old_hs:
+                                        dir_affected_hashes.add(old_hs)
+
+                            folder_id = None
+                            dup_exclude = 0
+                            if rel_dir:
+                                folder_id, dup_exclude = await ensure_folder_hierarchy(
+                                    db, location_id, rel_dir, folder_cache
+                                )
+
+                            await upsert_file(
+                                db,
+                                location_id=location_id,
+                                scan_id=scan_id,
+                                filename=f.get("filename", ""),
+                                full_path=f.get("full_path", ""),
+                                rel_path=rel_path,
+                                folder_id=folder_id,
+                                file_size=f.get("file_size", 0),
+                                created_date=f.get("created_date", ""),
+                                modified_date=f.get("modified_date", ""),
+                                file_type_high=f.get("file_type_high", ""),
+                                file_type_low=f.get("file_type_low", ""),
+                                hash_partial=f.get("hash_partial"),
+                                hash_fast=None,
+                                hash_strong=None,
+                                now_iso=now_iso,
+                                hidden=f.get("hidden", 0),
+                                dup_exclude=dup_exclude,
+                            )
+                            files_found += 1
+                            if kind == "new":
+                                files_new += 1
+                    await asyncio.sleep(0)  # yield between write batches
+
+                # Check for more pages
+                reconcile_cursor = result.get("cursor")
+                is_first_page = False
+                if reconcile_cursor is None:
+                    break
+
+            # --- After all pages: apply running counters ---
             running_file_count = max(0, running_file_count + delta_count)
             running_total_size = max(0, running_total_size + delta_size)
             for ft, d in delta_types.items():
@@ -180,140 +300,17 @@ async def run_scan(op_id: int, agent_id: int, params: dict):
                 k: v for k, v in running_type_counts.items() if v > 0
             }
 
-            # --- WRITE PHASE 1: catalog updates + backfill candidate query ---
+            # --- BACKFILL CANDIDATE QUERY ---
+            dir_rel = os.path.relpath(current_dir, root_path)
+            if dir_rel == ".":
+                dir_rel = ""
+            current_folder_id = (
+                folder_cache[dir_rel][0]
+                if dir_rel and dir_rel in folder_cache
+                else None
+            )
             async with db_writer() as db:
-                # Process unchanged files
-                unchanged = result.get("unchanged", [])
-                if unchanged:
-                    for i in range(0, len(unchanged), 500):
-                        batch = unchanged[i : i + 500]
-                        ph = ",".join("?" for _ in batch)
-                        await db.execute(
-                            f"UPDATE files SET date_last_seen = ?, scan_id = ? "
-                            f"WHERE location_id = ? AND stale = 0 "
-                            f"AND rel_path IN ({ph})",
-                            [now_iso, scan_id, location_id] + batch,
-                        )
-                    files_found += len(unchanged)
-
-                # Process changed files
-                for f in result.get("changed", []):
-                    rel_path = f["rel_path"]
-                    rel_dir = f.get("rel_dir", "")
-
-                    old_row = await db.execute_fetchall(
-                        "SELECT file_size, hash_strong FROM files "
-                        "WHERE location_id = ? AND rel_path = ?",
-                        (location_id, rel_path),
-                    )
-                    size_changed = old_row and old_row[0]["file_size"] != f.get(
-                        "file_size"
-                    )
-                    if size_changed:
-                        await db.execute(
-                            "UPDATE files SET hash_fast = NULL, hash_strong = NULL "
-                            "WHERE location_id = ? AND rel_path = ?",
-                            (location_id, rel_path),
-                        )
-                        old_hs = old_row[0]["hash_strong"]
-                        if old_hs:
-                            dir_affected_hashes.add(old_hs)
-
-                    folder_id = None
-                    dup_exclude = 0
-                    if rel_dir:
-                        folder_id, dup_exclude = await ensure_folder_hierarchy(
-                            db, location_id, rel_dir, folder_cache
-                        )
-
-                    await upsert_file(
-                        db,
-                        location_id=location_id,
-                        scan_id=scan_id,
-                        filename=f.get("filename", ""),
-                        full_path=f.get("full_path", ""),
-                        rel_path=rel_path,
-                        folder_id=folder_id,
-                        file_size=f.get("file_size", 0),
-                        created_date=f.get("created_date", ""),
-                        modified_date=f.get("modified_date", ""),
-                        file_type_high=f.get("file_type_high", ""),
-                        file_type_low=f.get("file_type_low", ""),
-                        hash_partial=f.get("hash_partial"),
-                        hash_fast=None,
-                        hash_strong=None,
-                        now_iso=now_iso,
-                        hidden=f.get("hidden", 0),
-                        dup_exclude=dup_exclude,
-                    )
-                    files_found += 1
-
-                # Process new files
-                for f in result.get("new", []):
-                    rel_path = f["rel_path"]
-                    rel_dir = f.get("rel_dir", "")
-
-                    folder_id = None
-                    dup_exclude = 0
-                    if rel_dir:
-                        folder_id, dup_exclude = await ensure_folder_hierarchy(
-                            db, location_id, rel_dir, folder_cache
-                        )
-
-                    await upsert_file(
-                        db,
-                        location_id=location_id,
-                        scan_id=scan_id,
-                        filename=f.get("filename", ""),
-                        full_path=f.get("full_path", ""),
-                        rel_path=rel_path,
-                        folder_id=folder_id,
-                        file_size=f.get("file_size", 0),
-                        created_date=f.get("created_date", ""),
-                        modified_date=f.get("modified_date", ""),
-                        file_type_high=f.get("file_type_high", ""),
-                        file_type_low=f.get("file_type_low", ""),
-                        hash_partial=f.get("hash_partial"),
-                        hash_fast=None,
-                        hash_strong=None,
-                        now_iso=now_iso,
-                        hidden=f.get("hidden", 0),
-                        dup_exclude=dup_exclude,
-                    )
-                    files_found += 1
-                    files_new += 1
-
-                # Process gone files
-                if gone:
-                    for i in range(0, len(gone), 500):
-                        batch = gone[i : i + 500]
-                        ph = ",".join("?" for _ in batch)
-                        hash_rows = await db.execute_fetchall(
-                            f"SELECT DISTINCT hash_strong FROM files "
-                            f"WHERE location_id = ? AND rel_path IN ({ph}) "
-                            f"AND hash_strong IS NOT NULL",
-                            [location_id] + batch,
-                        )
-                        for hr in hash_rows:
-                            dir_affected_hashes.add(hr["hash_strong"])
-                        await db.execute(
-                            f"UPDATE files SET stale = 1 "
-                            f"WHERE location_id = ? AND rel_path IN ({ph})",
-                            [location_id] + batch,
-                        )
-
-                # Commit catalog writes so backfill candidate query sees them
-                await db.commit()
-
-                # Query backfill candidates (same connection, sees our writes)
-                dir_rel = os.path.relpath(current_dir, root_path)
-                if dir_rel == ".":
-                    dir_rel = ""
-                current_folder_id = (
-                    folder_cache[dir_rel][0]
-                    if dir_rel and dir_rel in folder_cache
-                    else None
-                )
+                await db.commit()  # ensure reads see all prior writes
                 backfill_candidates = await _query_backfill_candidates(
                     db, location_id, current_folder_id
                 )
