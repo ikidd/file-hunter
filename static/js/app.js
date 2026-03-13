@@ -1098,6 +1098,11 @@ WS.on('scan_dequeued', (msg) => {
 
 WS.on('scan_queue_updated', (msg) => {
     syncQueuedLocations(msg.queue);
+    // If nothing is running, go idle (e.g. remaining queued items are on offline agents)
+    const hasRunning = msg.queue && msg.queue.running_location_ids && msg.queue.running_location_ids.length > 0;
+    if (!hasRunning) {
+        StatusBar.renderActivity('idle');
+    }
 });
 
 WS.on('scan_queue_skipped', (msg) => {
