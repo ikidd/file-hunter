@@ -235,6 +235,7 @@ const ImportCatalog = {
         const textEl = document.getElementById('import-progress-text');
         let lastImported = 0;
         let lastTime = Date.now();
+        let lastRate = 0;
 
         this._pollTimer = setInterval(async () => {
             const res = await API.get('/api/import-catalog/progress');
@@ -247,10 +248,11 @@ const ImportCatalog = {
 
             fillEl.style.width = pct + '%';
 
-            // Rate calculation
+            // Rate calculation — keep last non-zero rate to avoid flicker
             const now = Date.now();
             const dt = (now - lastTime) / 1000;
             const rate = dt > 0 ? Math.round((p.files_imported - lastImported) / dt) : 0;
+            if (rate > 0) lastRate = rate;
             lastImported = p.files_imported;
             lastTime = now;
 
@@ -266,7 +268,7 @@ const ImportCatalog = {
                 } else {
                     textEl.textContent =
                         `${p.files_imported.toLocaleString()} / ${p.files_total.toLocaleString()} files` +
-                        (rate > 0 ? ` (${rate.toLocaleString()}/sec)` : '');
+                        (lastRate > 0 ? ` (${lastRate.toLocaleString()}/sec)` : '');
                 }
             } else if (p.status === 'complete') {
                 clearInterval(this._pollTimer);
