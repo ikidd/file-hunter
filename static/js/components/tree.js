@@ -26,6 +26,7 @@ const Tree = {
     _queuedLocations: new Map(),  // node id -> queue_id
     _backfillingLocations: new Set(),
     _deletingLocations: new Set(),
+    _paused: false,
 
     init(onSelect, onDeselect) {
         this.el = document.getElementById('tree-content');
@@ -558,6 +559,12 @@ const Tree = {
                 db.className = 'tree-badge deleting';
                 db.textContent = 'deleting';
                 item.appendChild(db);
+            }
+            if (this._paused && !this._scanningLocations.has(node.id) && !this._deletingLocations.has(node.id)) {
+                const pb = document.createElement('span');
+                pb.className = 'tree-badge queued';
+                pb.textContent = 'paused';
+                item.appendChild(pb);
             }
         }
 

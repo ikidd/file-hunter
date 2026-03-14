@@ -1111,6 +1111,18 @@ WS.on('scan_queue_skipped', (msg) => {
     Toast.info(`Scan skipped: ${msg.entry.name} — ${msg.reason}`);
 });
 
+WS.on('queue_paused', (msg) => {
+    Tree._paused = true;
+    Tree.render();
+    ActivityLog.add(`Operations paused: importing <b>${msg.location}</b>`);
+});
+
+WS.on('queue_resumed', () => {
+    Tree._paused = false;
+    Tree.render();
+    ActivityLog.add('Operations resumed');
+});
+
 WS.on('backfill_started', (msg) => {
     const detail = msg.totalFiles
         ? `${msg.location} — backfilling hashes (0/${msg.totalFiles.toLocaleString()})`

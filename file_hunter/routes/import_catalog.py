@@ -144,6 +144,7 @@ async def _run_and_notify(
     try:
         _progress["status"] = "pausing"
         await pause()
+        await broadcast({"type": "queue_paused", "reason": "import", "location": location_name})
         await run_import(catalog_path, location_id, root_path)
 
         # Queue backfill so imported files get full hashes for dup detection
@@ -158,6 +159,7 @@ async def _run_and_notify(
         _progress["error"] = str(e)
     finally:
         resume()
+        await broadcast({"type": "queue_resumed"})
 
     invalidate_stats_cache()
     await broadcast({"type": "location_changed"})
