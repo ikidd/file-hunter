@@ -8,6 +8,7 @@ const ImportCatalog = {
     _agents: [],
     _locations: [],
     _pollTimer: null,
+    _busy: false,
 
     init() {
         this.overlayEl = document.getElementById('import-catalog-modal');
@@ -35,12 +36,12 @@ const ImportCatalog = {
         // Step 3: done
         document.getElementById('import-done-close').addEventListener('click', () => this.close());
 
-        // Close on overlay click / escape
+        // Close on overlay click / escape — blocked while uploading or importing
         this.overlayEl.addEventListener('click', (e) => {
-            if (e.target === this.overlayEl) this.close();
+            if (e.target === this.overlayEl && !this._busy) this.close();
         });
         document.addEventListener('keydown', (e) => {
-            if (e.key === 'Escape' && !this.overlayEl.classList.contains('hidden')) {
+            if (e.key === 'Escape' && !this.overlayEl.classList.contains('hidden') && !this._busy) {
                 this.close();
             }
         });
@@ -58,6 +59,7 @@ const ImportCatalog = {
         document.getElementById('import-run-btn').disabled = false;
         document.getElementById('import-config-error').classList.add('hidden');
         this._fileInput.value = '';
+        this._busy = false;
         this.overlayEl.classList.remove('hidden');
     },
 
@@ -87,6 +89,7 @@ const ImportCatalog = {
     async _doUpload() {
         const errEl = document.getElementById('import-upload-error');
         errEl.classList.add('hidden');
+        this._busy = true;
 
         const btn = document.getElementById('import-upload-btn');
         btn.disabled = true;
@@ -119,6 +122,7 @@ const ImportCatalog = {
         });
 
         btn.textContent = 'Upload';
+        this._busy = false;
 
         if (!data.ok) {
             errEl.textContent = data.error || 'Upload failed';
@@ -209,6 +213,7 @@ const ImportCatalog = {
     async _doImport() {
         const errEl = document.getElementById('import-config-error');
         errEl.classList.add('hidden');
+        this._busy = true;
 
         const locVal = document.getElementById('import-location').value;
         const agentId = parseInt(document.getElementById('import-agent').value);
@@ -238,6 +243,7 @@ const ImportCatalog = {
             errEl.textContent = res.error || 'Import failed to start';
             errEl.classList.remove('hidden');
             btn.disabled = false;
+            this._busy = false;
             return;
         }
 
@@ -298,6 +304,7 @@ const ImportCatalog = {
     },
 
     _showDone(p) {
+        this._busy = false;
         const el = document.getElementById('import-done-text');
         if (p.status === 'error') {
             el.innerHTML = `<span style="color:var(--color-status-error)">Import failed: ${p.error}</span>`;
