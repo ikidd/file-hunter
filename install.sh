@@ -28,17 +28,52 @@ URL="https://github.com/${REPO}/releases/download/${TAG}/${ARCHIVE}"
 info "Downloading File Hunter ${VERSION}..."
 curl -fSL "$URL" -o "/tmp/${ARCHIVE}" || error "Download failed."
 
+# ── Install location ─────────────────────────────────────────────────
+
+printf '  Install location [./filehunter]: '
+read -r INSTALL_DIR </dev/tty
+INSTALL_DIR="${INSTALL_DIR:-./filehunter}"
+
 # ── Extract ──────────────────────────────────────────────────────────
 
-info "Extracting to filehunter-${VERSION}/..."
-tar xzf "/tmp/${ARCHIVE}"
+TMPDIR=$(mktemp -d)
+tar xzf "/tmp/${ARCHIVE}" -C "$TMPDIR"
 rm -f "/tmp/${ARCHIVE}"
+
+EXTRACTED="$TMPDIR/filehunter-${VERSION}"
+if [ ! -d "$EXTRACTED" ]; then
+    rm -rf "$TMPDIR"
+    error "Unexpected archive structure."
+fi
+
+if [ -d "$INSTALL_DIR" ]; then
+    # Existing install — update in place, preserving user data
+    info "Updating existing installation at ${INSTALL_DIR}..."
+    for dir in file_hunter file_hunter_core file_hunter_agent static; do
+        rm -rf "${INSTALL_DIR:?}/$dir"
+    done
+    for item in "$EXTRACTED"/*; do
+        name=$(basename "$item")
+        case "$name" in
+            data|config.json|venv) continue ;;
+        esac
+        cp -R "$item" "$INSTALL_DIR/"
+    done
+    chmod +x "$INSTALL_DIR/filehunter"
+    ACTION="updated"
+else
+    # Fresh install
+    mv "$EXTRACTED" "$INSTALL_DIR"
+    ACTION="installed"
+fi
+
+rm -rf "$TMPDIR"
 
 # ── Done ─────────────────────────────────────────────────────────────
 
 echo ""
-info "File Hunter ${VERSION} installed."
+info "File Hunter ${VERSION} ${ACTION}."
 echo ""
-echo "  cd filehunter-${VERSION}"
+echo "  cd ${INSTALL_DIR}"
 echo "  ./filehunter"
 echo ""
