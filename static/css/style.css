@@ -2516,6 +2516,10 @@ select.modal-input {
     background: var(--color-primary);
 }
 
+.preview-modal-mark.mark-tag {
+    background: var(--color-status-warning);
+}
+
 .preview-modal-triage {
     font-size: var(--font-size-sm);
     color: var(--color-text-muted);

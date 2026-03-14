@@ -20,9 +20,18 @@ const SlideshowTriage = {
     _conCancel: null,
     _conSubmit: null,
 
+    // Tag dialog elements
+    _tagOverlay: null,
+    _tagText: null,
+    _tagList: null,
+    _tagInput: null,
+    _tagCancel: null,
+    _tagSubmit: null,
+
     // State
     _deleteItems: [],
     _consolidateItems: [],
+    _tagItems: [],
     _treeData: null,
     _expandedNodes: new Set(),
     _selectedDest: null,
@@ -57,25 +66,50 @@ const SlideshowTriage = {
         });
         this._conSubmit.addEventListener('click', () => this._doConsolidate());
 
-        // Escape key for both dialogs
+        // Tag dialog
+        this._tagOverlay = document.getElementById('slideshow-tag-modal');
+        this._tagText = document.getElementById('slideshow-tag-text');
+        this._tagList = document.getElementById('slideshow-tag-list');
+        this._tagInput = document.getElementById('slideshow-tag-input');
+        this._tagCancel = document.getElementById('slideshow-tag-cancel');
+        this._tagSubmit = document.getElementById('slideshow-tag-submit');
+
+        this._tagCancel.addEventListener('click', () => this._closeTag());
+        this._tagOverlay.addEventListener('click', (e) => {
+            if (e.target === this._tagOverlay) this._closeTag();
+        });
+        this._tagSubmit.addEventListener('click', () => this._doTag());
+
+        // Escape key for all dialogs
         document.addEventListener('keydown', (e) => {
             if (e.key !== 'Escape') return;
             if (!this._delOverlay.classList.contains('hidden')) {
                 this._closeDelete();
             } else if (!this._conOverlay.classList.contains('hidden')) {
                 this._closeConsolidate();
+            } else if (!this._tagOverlay.classList.contains('hidden')) {
+                this._closeTag();
             }
         });
     },
 
-    show(deleteItems, consolidateItems) {
+    show(deleteItems, consolidateItems, tagItems) {
         this._deleteItems = deleteItems || [];
         this._consolidateItems = consolidateItems || [];
+        this._tagItems = tagItems || [];
 
+        this._showNext();
+    },
+
+    _showNext() {
         if (this._deleteItems.length > 0) {
             this._showDeleteDialog();
         } else if (this._consolidateItems.length > 0) {
             this._showConsolidateDialog();
+        } else if (this._tagItems.length > 0) {
+            this._showTagDialog();
+        } else {
+            this._finish();
         }
     },
 
@@ -112,11 +146,8 @@ const SlideshowTriage = {
 
     _closeDelete() {
         this._delOverlay.classList.add('hidden');
-        if (this._consolidateItems.length > 0) {
-            this._showConsolidateDialog();
-        } else {
-            this._finish();
-        }
+        this._deleteItems = [];
+        this._showNext();
     },
 
     _doDelete() {
@@ -129,11 +160,8 @@ const SlideshowTriage = {
         Toast.info(`Deleting ${n} image${n !== 1 ? 's' : ''}...`);
 
         this._delOverlay.classList.add('hidden');
-        if (this._consolidateItems.length > 0) {
-            this._showConsolidateDialog();
-        } else {
-            this._finish();
-        }
+        this._deleteItems = [];
+        this._showNext();
     },
 
     // ── Consolidate dialog ──
@@ -158,7 +186,8 @@ const SlideshowTriage = {
 
     _closeConsolidate() {
         this._conOverlay.classList.add('hidden');
-        this._finish();
+        this._consolidateItems = [];
+        this._showNext();
     },
 
     _doConsolidate() {
@@ -175,12 +204,47 @@ const SlideshowTriage = {
         Toast.info(`Consolidating ${n} image${n !== 1 ? 's' : ''}...`);
 
         this._conOverlay.classList.add('hidden');
-        this._finish();
+        this._consolidateItems = [];
+        this._showNext();
+    },
+
+    // ── Tag dialog ──
+
+    _showTagDialog() {
+        const n = this._tagItems.length;
+        this._tagText.textContent = `Tag ${n} image${n !== 1 ? 's' : ''}.`;
+        this._renderCappedList(this._tagList, this._tagItems);
+        this._tagInput.value = '';
+        this._tagSubmit.textContent = 'Tag';
+        this._tagSubmit.disabled = false;
+        this._tagOverlay.classList.remove('hidden');
+        this._tagInput.focus();
+    },
+
+    _closeTag() {
+        this._tagOverlay.classList.add('hidden');
+        this._tagItems = [];
+        this._showNext();
+    },
+
+    _doTag() {
+        const tag = this._tagInput.value.trim();
+        if (!tag) return;
+        const fileIds = this._tagItems.map(item => item.id);
+        const n = fileIds.length;
+
+        API.post('/api/batch/tag', { file_ids: fileIds, add_tags: [tag] });
+        Toast.info(`Tagging ${n} image${n !== 1 ? 's' : ''} with "${tag}"`);
+
+        this._tagOverlay.classList.add('hidden');
+        this._tagItems = [];
+        this._showNext();
     },
 
     _finish() {
         this._deleteItems = [];
         this._consolidateItems = [];
+        this._tagItems = [];
     },
 
     // ── Tree picker (same pattern as consolidate.js) ──

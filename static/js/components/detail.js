@@ -50,6 +50,7 @@ const Detail = {
     _slideshowNavGen: 0,
     _slideshowDeleteSet: new Set(),
     _slideshowConsolidateSet: new Set(),
+    _slideshowTagSet: new Set(),
     slideshowTriage: null,
     onNavigateToFile: null,
     onNavigateToFolder: null,
@@ -230,8 +231,9 @@ const Detail = {
                 if (e.key === 'ArrowLeft') { this._stopAutoplay(); this._slideshowNav(-1); }
                 else if (e.key === 'ArrowRight') { this._stopAutoplay(); this._slideshowNav(1); }
                 else if (e.key === ' ') { e.preventDefault(); this._toggleAutoplay(); }
-                else if (e.key === 'x') { this._slideshowToggleMark('delete'); }
-                else if (e.key === 'm') { this._slideshowToggleMark('consolidate'); }
+                else if (e.key === 'd') { this._slideshowToggleMark('delete'); }
+                else if (e.key === 'c') { this._slideshowToggleMark('consolidate'); }
+                else if (e.key === 't') { this._slideshowToggleMark('tag'); }
             }
         });
     },
@@ -317,6 +319,10 @@ const Detail = {
             id,
             name: (cache[id] && cache[id].name) || `File ${id}`,
         }));
+        const tagItems = [...this._slideshowTagSet].map(id => ({
+            id,
+            name: (cache[id] && cache[id].name) || `File ${id}`,
+        }));
 
         m.overlay.classList.add('hidden');
         m.downloadBtn.classList.add('hidden');
@@ -336,6 +342,7 @@ const Detail = {
         this._slideshowNavGen = 0;
         this._slideshowDeleteSet = new Set();
         this._slideshowConsolidateSet = new Set();
+        this._slideshowTagSet = new Set();
         // Reset slideshow button in detail panel
         const ssBtn = document.getElementById('detail-slideshow');
         if (ssBtn) { ssBtn.textContent = 'Slideshow'; ssBtn.disabled = false; }
@@ -344,8 +351,8 @@ const Detail = {
         m.content.innerHTML = '';
 
         // Show triage dialogs if any images were marked
-        if ((deleteItems.length > 0 || consolidateItems.length > 0) && this.slideshowTriage) {
-            this.slideshowTriage.show(deleteItems, consolidateItems);
+        if ((deleteItems.length > 0 || consolidateItems.length > 0 || tagItems.length > 0) && this.slideshowTriage) {
+            this.slideshowTriage.show(deleteItems, consolidateItems, tagItems);
         }
     },
 
@@ -360,6 +367,7 @@ const Detail = {
         this._slideshowNavGen = 0;
         this._slideshowDeleteSet = new Set();
         this._slideshowConsolidateSet = new Set();
+        this._slideshowTagSet = new Set();
 
         // Fetch all IDs in one call — no per-window queries during navigation
         const p = params;
@@ -591,20 +599,17 @@ const Detail = {
     _slideshowToggleMark(kind) {
         const fileId = this._slideshowCurrentFileId();
         if (!fileId) return;
-        if (kind === 'delete') {
-            this._slideshowConsolidateSet.delete(fileId);
-            if (this._slideshowDeleteSet.has(fileId)) {
-                this._slideshowDeleteSet.delete(fileId);
-            } else {
-                this._slideshowDeleteSet.add(fileId);
-            }
+        const setMap = {
+            delete: this._slideshowDeleteSet,
+            consolidate: this._slideshowConsolidateSet,
+            tag: this._slideshowTagSet,
+        };
+        const s = setMap[kind];
+        if (!s) return;
+        if (s.has(fileId)) {
+            s.delete(fileId);
         } else {
-            this._slideshowDeleteSet.delete(fileId);
-            if (this._slideshowConsolidateSet.has(fileId)) {
-                this._slideshowConsolidateSet.delete(fileId);
-            } else {
-                this._slideshowConsolidateSet.add(fileId);
-            }
+            s.add(fileId);
         }
         this._slideshowUpdateMark();
     },
@@ -615,15 +620,19 @@ const Detail = {
         const badge = m.markBadge;
         const triageEl = m.triageCounter;
 
-        // Badge on current image
-        badge.classList.remove('mark-delete', 'mark-consolidate');
-        if (fileId && this._slideshowDeleteSet.has(fileId)) {
-            badge.textContent = 'Delete';
-            badge.classList.add('mark-delete');
-            badge.classList.remove('hidden');
-        } else if (fileId && this._slideshowConsolidateSet.has(fileId)) {
-            badge.textContent = 'Consolidate';
-            badge.classList.add('mark-consolidate');
+        // Badge on current image — show all active marks
+        badge.classList.remove('mark-delete', 'mark-consolidate', 'mark-tag');
+        const marks = [];
+        if (fileId && this._slideshowDeleteSet.has(fileId)) marks.push('D');
+        if (fileId && this._slideshowConsolidateSet.has(fileId)) marks.push('C');
+        if (fileId && this._slideshowTagSet.has(fileId)) marks.push('T');
+
+        if (marks.length > 0) {
+            badge.textContent = marks.join(' ');
+            // Colour by highest priority mark
+            if (marks.includes('D')) badge.classList.add('mark-delete');
+            else if (marks.includes('C')) badge.classList.add('mark-consolidate');
+            else badge.classList.add('mark-tag');
             badge.classList.remove('hidden');
         } else {
             badge.classList.add('hidden');
@@ -632,12 +641,14 @@ const Detail = {
         // Triage counter in header
         const dc = this._slideshowDeleteSet.size;
         const cc = this._slideshowConsolidateSet.size;
-        if (dc === 0 && cc === 0) {
+        const tc = this._slideshowTagSet.size;
+        if (dc === 0 && cc === 0 && tc === 0) {
             triageEl.classList.add('hidden');
         } else {
             const parts = [];
             if (dc > 0) parts.push(`${dc} to delete`);
             if (cc > 0) parts.push(`${cc} to consolidate`);
+            if (tc > 0) parts.push(`${tc} to tag`);
             triageEl.textContent = parts.join(', ');
             triageEl.classList.remove('hidden');
         }
