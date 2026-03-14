@@ -59,7 +59,7 @@ async def delete_file_and_duplicates(db, file_id: int) -> dict:
     """Delete a file and all its duplicates (same hash_strong) from disk and catalog."""
     # Look up the file's hash
     row = await db.execute_fetchall(
-        """SELECT f.id, f.filename, f.hash_strong
+        """SELECT f.id, f.filename, f.hash_strong, f.hash_fast
            FROM files f WHERE f.id = ?""",
         (file_id,),
     )
@@ -68,18 +68,21 @@ async def delete_file_and_duplicates(db, file_id: int) -> dict:
 
     filename = row[0]["filename"]
     hash_strong = row[0]["hash_strong"]
+    hash_fast = row[0]["hash_fast"]
+    effective_hash = hash_strong or hash_fast
+    hash_col = "hash_strong" if hash_strong else "hash_fast"
 
-    if not hash_strong:
-        # No strong hash — fall back to single-file delete
+    if not effective_hash:
+        # No hash at all — fall back to single-file delete
         return await delete_file(db, file_id)
 
-    # Find all files with the same hash_strong
+    # Find all files with the same effective hash
     all_rows = await db.execute_fetchall(
-        """SELECT f.id, f.full_path, f.location_id, l.root_path
+        f"""SELECT f.id, f.full_path, f.location_id, l.root_path
            FROM files f
            JOIN locations l ON l.id = f.location_id
-           WHERE f.hash_strong = ? AND f.hidden = 0""",
-        (hash_strong,),
+           WHERE f.{hash_col} = ? AND f.hidden = 0""",
+        (effective_hash,),
     )
 
     deleted_count = 0
@@ -112,9 +115,14 @@ async def delete_file_and_duplicates(db, file_id: int) -> dict:
 
     affected_loc_ids = {rec["location_id"] for rec in all_rows}
     schedule_size_recalc(*affected_loc_ids)
-    submit_hashes_for_recalc(
-        strong_hashes={hash_strong}, source=f"delete {filename} + duplicates"
-    )
+    if hash_strong:
+        submit_hashes_for_recalc(
+            strong_hashes={hash_strong}, source=f"delete {filename} + duplicates"
+        )
+    elif hash_fast:
+        submit_hashes_for_recalc(
+            fast_hashes={hash_fast}, source=f"delete {filename} + duplicates"
+        )
 
     return {
         "filename": filename,

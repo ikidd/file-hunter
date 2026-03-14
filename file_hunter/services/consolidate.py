@@ -11,8 +11,8 @@ from file_hunter.ws.scan import broadcast
 _active_consolidations: set[str] = set()
 
 
-def is_consolidation_running(hash_strong: str) -> bool:
-    return hash_strong in _active_consolidations
+def is_consolidation_running(hash_value: str) -> bool:
+    return hash_value in _active_consolidations
 
 
 async def run_consolidation(file_id: int, mode: str, dest_folder_id: str | None):
@@ -24,6 +24,7 @@ async def run_consolidation(file_id: int, mode: str, dest_folder_id: str | None)
     Reads via get_db(), writes via db_writer(). No owned connection.
     """
     hash_strong = None
+    effective_hash = None
     filename = None
     stubs_written = 0
     stubs_queued = 0
@@ -51,9 +52,12 @@ async def run_consolidation(file_id: int, mode: str, dest_folder_id: str | None)
         selected = dict(rows[0])
         filename = selected["filename"]
         hash_strong = selected["hash_strong"]
+        hash_fast = selected["hash_fast"]
+        effective_hash = hash_strong or hash_fast
+        hash_col = "hash_strong" if hash_strong else "hash_fast"
         selected_loc_id = selected["location_id"]
 
-        if not hash_strong:
+        if not effective_hash:
             await broadcast(
                 {
                     "type": "consolidate_error",
@@ -65,7 +69,7 @@ async def run_consolidation(file_id: int, mode: str, dest_folder_id: str | None)
             return
 
         # Guard concurrent consolidation
-        if hash_strong in _active_consolidations:
+        if effective_hash in _active_consolidations:
             await broadcast(
                 {
                     "type": "consolidate_error",
@@ -75,7 +79,7 @@ async def run_consolidation(file_id: int, mode: str, dest_folder_id: str | None)
                 }
             )
             return
-        _active_consolidations.add(hash_strong)
+        _active_consolidations.add(effective_hash)
 
         await broadcast(
             {
@@ -85,9 +89,9 @@ async def run_consolidation(file_id: int, mode: str, dest_folder_id: str | None)
             }
         )
 
-        # Find ALL copies by hash_strong (including the selected file)
+        # Find ALL copies by effective hash (including the selected file)
         all_copies = await db.execute_fetchall(
-            """SELECT f.id, f.filename, f.full_path, f.rel_path,
+            f"""SELECT f.id, f.filename, f.full_path, f.rel_path,
                       f.location_id, f.folder_id,
                       f.file_type_high, f.file_type_low, f.file_size,
                       f.hash_fast, f.hash_strong, f.description, f.tags,
@@ -95,8 +99,8 @@ async def run_consolidation(file_id: int, mode: str, dest_folder_id: str | None)
                       l.name as location_name, l.root_path
                FROM files f
                JOIN locations l ON l.id = f.location_id
-               WHERE f.hash_strong = ? AND f.hidden = 0""",
-            (hash_strong,),
+               WHERE f.{hash_col} = ? AND f.hidden = 0""",
+            (effective_hash,),
         )
         all_copies = [dict(r) for r in all_copies]
 
@@ -405,8 +409,18 @@ async def run_consolidation(file_id: int, mode: str, dest_folder_id: str | None)
 
         from file_hunter.services.dup_counts import recalculate_dup_counts
 
+        recalc_strong = set()
+        recalc_fast = set()
+        # Canonical now has hash_strong (computed on demand during verification)
+        if selected.get("hash_strong"):
+            recalc_strong.add(selected["hash_strong"])
+        # If copies were found by hash_fast, that group changed too
+        if hash_col == "hash_fast":
+            recalc_fast.add(effective_hash)
         await recalculate_dup_counts(
-            strong_hashes={hash_strong}, source=f"consolidate {filename}"
+            strong_hashes=recalc_strong or None,
+            fast_hashes=recalc_fast or None,
+            source=f"consolidate {filename}",
         )
 
     except Exception as exc:
@@ -422,8 +436,8 @@ async def run_consolidation(file_id: int, mode: str, dest_folder_id: str | None)
         )
 
     finally:
-        if hash_strong:
-            _active_consolidations.discard(hash_strong)
+        if effective_hash:
+            _active_consolidations.discard(effective_hash)
 
 
 async def run_batch_consolidation(

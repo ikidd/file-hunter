@@ -32,17 +32,18 @@ async def consolidate(request: Request):
 
     # Verify file exists and has a hash
     rows = await db.execute_fetchall(
-        "SELECT id, filename, hash_strong FROM files WHERE id = ?", (file_id,)
+        "SELECT id, filename, hash_strong, hash_fast FROM files WHERE id = ?",
+        (file_id,),
     )
     if not rows:
         return json_error("File not found.", 404)
 
-    hash_strong = rows[0]["hash_strong"]
-    if not hash_strong:
+    effective_hash = rows[0]["hash_strong"] or rows[0]["hash_fast"]
+    if not effective_hash:
         return json_error("File has no hash — scan it first.", 400)
 
     # Guard concurrent consolidation
-    if is_consolidation_running(hash_strong):
+    if is_consolidation_running(effective_hash):
         return json_error("Consolidation already in progress for this file.", 409)
 
     # For copy_to, verify destination is online
