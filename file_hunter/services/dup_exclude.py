@@ -9,7 +9,7 @@ from file_hunter.ws.scan import broadcast
 
 log = logging.getLogger(__name__)
 
-FILE_UPDATE_BATCH = 500
+FLAG_UPDATE_BATCH = 5000
 
 
 async def restore_pending():
@@ -71,15 +71,17 @@ async def toggle_dup_exclude(folder_id: int, exclude: bool):
     broadcast dup_exclude_started, so this function handles descendant
     folders, files, and dup_count recalc.
 
-    Reads via get_db(), writes via db_writer().
+    Heavy reads via open_connection(). Writes via db_writer() in large batches.
     """
+    from file_hunter.db import open_connection
+
     flag = 1 if exclude else 0
     direction = "exclude" if exclude else "include"
 
     try:
         db = await get_db()
 
-        # Get folder name for logging
+        # Get folder name for logging (fast indexed lookup on shared reader)
         folder_row = await db.execute_fetchall(
             "SELECT name FROM folders WHERE id = ?", (folder_id,)
         )
@@ -88,7 +90,7 @@ async def toggle_dup_exclude(folder_id: int, exclude: bool):
             return
         folder_name = folder_row[0]["name"]
 
-        # Recursive CTE: folder + all descendants
+        # Recursive CTE on folders table (small — ~100K rows max, not files)
         desc_rows = await db.execute_fetchall(
             """WITH RECURSIVE descendants(id) AS (
                    SELECT ?
@@ -109,12 +111,24 @@ async def toggle_dup_exclude(folder_id: int, exclude: bool):
             )
         invalidate_stats_cache()
 
-        # Count affected files
-        count_row = await db.execute_fetchall(
-            f"SELECT COUNT(*) as cnt FROM files WHERE folder_id IN ({placeholders}) AND stale = 0",
-            folder_ids,
-        )
-        file_count = count_row[0]["cnt"] if count_row else 0
+        # Fetch file IDs on a dedicated connection (could be millions)
+        conn = await open_connection()
+        try:
+            count_row = await conn.execute_fetchall(
+                f"SELECT COUNT(*) as cnt FROM files "
+                f"WHERE folder_id IN ({placeholders}) AND stale = 0",
+                folder_ids,
+            )
+            file_count = count_row[0]["cnt"] if count_row else 0
+
+            file_id_rows = await conn.execute_fetchall(
+                f"SELECT id FROM files WHERE folder_id IN ({placeholders}) AND stale = 0",
+                folder_ids,
+            )
+        finally:
+            await conn.close()
+
+        all_file_ids = [r["id"] for r in file_id_rows]
 
         log.info(
             "dup_exclude %s: folder '%s' (%d folders, %d files)",
@@ -127,14 +141,9 @@ async def toggle_dup_exclude(folder_id: int, exclude: bool):
         # --- Phase 1: Batch-update files dup_exclude flag ---
         updated = 0
         last_pct_step = -1
-        file_id_rows = await db.execute_fetchall(
-            f"SELECT id FROM files WHERE folder_id IN ({placeholders}) AND stale = 0",
-            folder_ids,
-        )
-        all_file_ids = [r["id"] for r in file_id_rows]
 
-        for i in range(0, len(all_file_ids), FILE_UPDATE_BATCH):
-            batch = all_file_ids[i : i + FILE_UPDATE_BATCH]
+        for i in range(0, len(all_file_ids), FLAG_UPDATE_BATCH):
+            batch = all_file_ids[i : i + FLAG_UPDATE_BATCH]
             batch_ph = ",".join("?" for _ in batch)
             async with db_writer() as wdb:
                 await wdb.execute(
@@ -150,51 +159,68 @@ async def toggle_dup_exclude(folder_id: int, exclude: bool):
                     last_pct_step = step
                     await broadcast({"type": "dup_exclude_progress", "pct": step * 5})
 
-            await asyncio.sleep(0.05)
+            if updated % 50000 < FLAG_UPDATE_BATCH:
+                log.info(
+                    "dup_exclude %s: phase 1 — %d / %d files flagged",
+                    direction,
+                    updated,
+                    file_count,
+                )
 
-        # Bulk-set dup_count=0 on all files in affected folders (always correct
-        # for excluded files, and clears stale counts for included files that
-        # will be recalculated below)
-        async with db_writer() as wdb:
-            await wdb.execute(
-                f"UPDATE files SET dup_count = 0 WHERE folder_id IN ({placeholders})",
-                folder_ids,
-            )
+            await asyncio.sleep(0)
+
+        # Bulk-set dup_count=0 on all files in affected folders
+        for i in range(0, len(all_file_ids), FLAG_UPDATE_BATCH):
+            batch = all_file_ids[i : i + FLAG_UPDATE_BATCH]
+            batch_ph = ",".join("?" for _ in batch)
+            async with db_writer() as wdb:
+                await wdb.execute(
+                    f"UPDATE files SET dup_count = 0 WHERE id IN ({batch_ph})",
+                    batch,
+                )
+            await asyncio.sleep(0)
+
         invalidate_stats_cache()
 
-        # --- Phase 2: Recalculate dup_counts for shared hashes only ---
-        # Only hashes that have files BOTH inside and outside the affected
-        # folders need recalculation. Hashes unique to the affected folders
-        # are already correct (dup_count=0 from the bulk set above).
-        shared_strong_rows = await db.execute_fetchall(
-            f"""SELECT DISTINCT f.hash_strong FROM files f
-                WHERE f.folder_id IN ({placeholders})
-                  AND f.hash_strong IS NOT NULL AND f.hash_strong != ''
-                  AND EXISTS (
-                      SELECT 1 FROM files f2
-                      WHERE f2.hash_strong = f.hash_strong
-                        AND f2.folder_id NOT IN ({placeholders})
-                        AND f2.stale = 0 AND f2.hidden = 0 AND f2.dup_exclude = 0
-                  )""",
-            folder_ids + folder_ids,
-        )
-        shared_strong = {r["hash_strong"] for r in shared_strong_rows}
+        # --- Phase 2: Recalculate dup_counts for shared hashes ---
+        # Find hashes that have files BOTH inside and outside the affected
+        # folders. Hashes unique to the affected folders are already correct
+        # (dup_count=0 from the bulk set above).
+        # Use dedicated connection for these heavy queries.
+        conn = await open_connection()
+        try:
+            shared_strong_rows = await conn.execute_fetchall(
+                f"""SELECT DISTINCT f.hash_strong FROM files f
+                    WHERE f.folder_id IN ({placeholders})
+                      AND f.hash_strong IS NOT NULL AND f.hash_strong != ''
+                      AND EXISTS (
+                          SELECT 1 FROM files f2
+                          WHERE f2.hash_strong = f.hash_strong
+                            AND f2.folder_id NOT IN ({placeholders})
+                            AND f2.stale = 0 AND f2.hidden = 0 AND f2.dup_exclude = 0
+                      )""",
+                folder_ids + folder_ids,
+            )
+            shared_strong = {r["hash_strong"] for r in shared_strong_rows}
 
-        shared_fast_rows = await db.execute_fetchall(
-            f"""SELECT DISTINCT f.hash_fast FROM files f
-                WHERE f.folder_id IN ({placeholders})
-                  AND f.hash_fast IS NOT NULL AND f.hash_fast != ''
-                  AND f.hash_strong IS NULL
-                  AND EXISTS (
-                      SELECT 1 FROM files f2
-                      WHERE f2.hash_fast = f.hash_fast
-                        AND f2.folder_id NOT IN ({placeholders})
-                        AND f2.stale = 0 AND f2.hidden = 0 AND f2.dup_exclude = 0
-                  )""",
-            folder_ids + folder_ids,
-        )
-        shared_fast = {r["hash_fast"] for r in shared_fast_rows}
+            shared_fast_rows = await conn.execute_fetchall(
+                f"""SELECT DISTINCT f.hash_fast FROM files f
+                    WHERE f.folder_id IN ({placeholders})
+                      AND f.hash_fast IS NOT NULL AND f.hash_fast != ''
+                      AND f.hash_strong IS NULL
+                      AND EXISTS (
+                          SELECT 1 FROM files f2
+                          WHERE f2.hash_fast = f.hash_fast
+                            AND f2.folder_id NOT IN ({placeholders})
+                            AND f2.stale = 0 AND f2.hidden = 0 AND f2.dup_exclude = 0
+                      )""",
+                folder_ids + folder_ids,
+            )
+            shared_fast = {r["hash_fast"] for r in shared_fast_rows}
+        finally:
+            await conn.close()
 
+        shared_total = len(shared_strong) + len(shared_fast)
         log.info(
             "dup_exclude %s: %d strong + %d fast shared hashes to recalculate",
             direction,
@@ -202,29 +228,54 @@ async def toggle_dup_exclude(folder_id: int, exclude: bool):
             len(shared_fast),
         )
 
-        from file_hunter.services.dup_counts import _batched_recalc
-
-        last_hash_step = -1
-
-        async def _on_progress(processed, total):
-            nonlocal last_hash_step
-            if total > 0:
-                step = (processed * 50 // total) // 5
-                if step > last_hash_step:
-                    last_hash_step = step
-                    await broadcast(
-                        {"type": "dup_exclude_progress", "pct": 50 + step * 5}
-                    )
-
         recalculated = 0
-        if shared_strong:
-            recalculated += await _batched_recalc(
-                shared_strong, hash_column="hash_strong", on_progress=_on_progress
+        if shared_total > 0:
+            from file_hunter.services.dup_counts import (
+                _batched_recalc,
+                full_dup_recount,
             )
-        if shared_fast:
-            recalculated += await _batched_recalc(
-                shared_fast, hash_column="hash_fast", on_progress=_on_progress
-            )
+
+            if shared_total > 10000:
+                # Large set — use full_dup_recount for performance
+                last_hash_step = -1
+
+                async def _on_dup_progress(total_processed):
+                    nonlocal last_hash_step
+                    if shared_total > 0:
+                        step = (total_processed * 50 // shared_total) // 5
+                        if step > last_hash_step:
+                            last_hash_step = step
+                            await broadcast(
+                                {"type": "dup_exclude_progress", "pct": 50 + step * 5}
+                            )
+
+                recalculated = await full_dup_recount(on_progress=_on_dup_progress)
+            else:
+                # Small set — incremental recalc is fine
+                last_hash_step = -1
+
+                async def _on_progress(processed, total):
+                    nonlocal last_hash_step
+                    if total > 0:
+                        step = (processed * 50 // total) // 5
+                        if step > last_hash_step:
+                            last_hash_step = step
+                            await broadcast(
+                                {"type": "dup_exclude_progress", "pct": 50 + step * 5}
+                            )
+
+                if shared_strong:
+                    recalculated += await _batched_recalc(
+                        shared_strong,
+                        hash_column="hash_strong",
+                        on_progress=_on_progress,
+                    )
+                if shared_fast:
+                    recalculated += await _batched_recalc(
+                        shared_fast,
+                        hash_column="hash_fast",
+                        on_progress=_on_progress,
+                    )
 
         invalidate_stats_cache()
 
@@ -249,5 +300,9 @@ async def toggle_dup_exclude(folder_id: int, exclude: bool):
             }
         )
 
+    except asyncio.CancelledError:
+        log.info(
+            "dup_exclude %s cancelled (shutdown) for folder %d", direction, folder_id
+        )
     except Exception:
         log.exception("toggle_dup_exclude failed for folder %d", folder_id)
