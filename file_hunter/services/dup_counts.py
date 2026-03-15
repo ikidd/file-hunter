@@ -106,6 +106,14 @@ async def _batched_recalc(
         if on_progress:
             await on_progress(processed, total)
 
+        if processed % 10000 < effective_batch or processed == total:
+            log.info(
+                "_batched_recalc: %s — %d / %d hashes",
+                hash_column,
+                processed,
+                total,
+            )
+
         await asyncio.sleep(0.05)
 
     return processed
