@@ -1286,9 +1286,10 @@ const Detail = {
 
     _wireShowAllDups(detail) {
         const btn = document.getElementById('detail-show-all-dups');
-        if (btn && detail.hashStrong && this.onShowDuplicates) {
+        const effectiveHash = detail.hashStrong || detail.hashFast;
+        if (btn && effectiveHash && this.onShowDuplicates) {
             btn.addEventListener('click', () => {
-                this.onShowDuplicates(detail.hashStrong);
+                this.onShowDuplicates(effectiveHash);
             });
         }
     },

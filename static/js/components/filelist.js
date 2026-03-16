@@ -523,7 +523,7 @@ const FileList = {
         this._renderContent();
     },
 
-    async showDuplicateGroup(hashStrong) {
+    async showDuplicateGroup(hash) {
         this.currentFolder = null;
         this.currentBreadcrumb = null;
         this._clearSelection();
@@ -533,7 +533,7 @@ const FileList = {
         this.sortDir = 1;
         this.currentPage = 0;
         this._searchMode = true;
-        this._searchParams = { hash: hashStrong };
+        this._searchParams = { hash };
         this._dupGroupMode = true;
 
         await this._fetchSearch();
@@ -739,7 +739,7 @@ const FileList = {
             if (dupEl) {
                 dupEl.addEventListener('click', (e) => {
                     e.stopPropagation();
-                    this.showDuplicateGroup(file.hashStrong);
+                    this.showDuplicateGroup(file.hashStrong || file.hashFast);
                 });
             }
 
@@ -840,7 +840,7 @@ const FileList = {
                     span.textContent = text;
                     span.addEventListener('click', (e) => {
                         e.stopPropagation();
-                        this.showDuplicateGroup(item.hashStrong);
+                        this.showDuplicateGroup(item.hashStrong || item.hashFast);
                     });
                     nameCell.appendChild(span);
                 }
