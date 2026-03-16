@@ -92,8 +92,13 @@ async def restore_pending():
 
 
 async def _resume_post_processing(location_id: int, location_name: str):
-    """Run just the dup recount + size rebuild for an interrupted fast scan."""
-    from file_hunter.services.dup_counts import full_dup_recount
+    """Run dup recount + size rebuild for an interrupted fast scan.
+
+    Uses GROUP BY HAVING COUNT > 1 to find duplicate hashes, then updates
+    only those files. Same optimized approach as the inline fast scan, but
+    without the temp table (which was lost on restart).
+    """
+    from file_hunter.db import open_connection
     from file_hunter.services.sizes import recalculate_location_sizes
 
     _progress.update(
@@ -111,17 +116,56 @@ async def _resume_post_processing(location_id: int, location_name: str):
     try:
         log.info("Fast scan resume: recounting duplicates for location %d", location_id)
 
-        async def _on_dup_total(total):
-            _progress["files_to_hash"] = total
+        conn = await open_connection()
+        try:
+            # Find hashes on this location that have duplicates anywhere
+            hash_rows = await conn.execute_fetchall(
+                "SELECT DISTINCT COALESCE(hash_strong, hash_fast) as effective_hash "
+                "FROM files WHERE location_id = ? "
+                "AND COALESCE(hash_strong, hash_fast) IS NOT NULL",
+                (location_id,),
+            )
+            location_hashes = {r["effective_hash"] for r in hash_rows}
+        finally:
+            await conn.close()
 
-        async def _on_dup_progress(processed):
-            _progress["files_hashed"] = processed
+        # For each location hash, check global count
+        from file_hunter.db import db_writer
+        from file_hunter.services.dup_counts import SQL_VAR_LIMIT
 
-        await full_dup_recount(
-            location_id=location_id,
-            on_progress=_on_dup_progress,
-            on_total=_on_dup_total,
-        )
+        dup_hashes: list[tuple[str, int]] = []  # (hash, dup_count)
+        hash_list = list(location_hashes)
+        _progress["files_to_hash"] = len(hash_list)
+
+        conn = await open_connection()
+        try:
+            for i in range(0, len(hash_list), SQL_VAR_LIMIT):
+                chunk = hash_list[i : i + SQL_VAR_LIMIT]
+                ph = ",".join("?" for _ in chunk)
+                rows = await conn.execute_fetchall(
+                    f"SELECT COALESCE(hash_strong, hash_fast) as h, COUNT(*) as cnt "
+                    f"FROM files WHERE COALESCE(hash_strong, hash_fast) IN ({ph}) "
+                    f"AND stale = 0 AND hidden = 0 AND dup_exclude = 0 "
+                    f"GROUP BY h HAVING COUNT(*) > 1",
+                    chunk,
+                )
+                for r in rows:
+                    dup_hashes.append((r["h"], r["cnt"] - 1))
+                _progress["files_hashed"] = min(i + SQL_VAR_LIMIT, len(hash_list))
+        finally:
+            await conn.close()
+
+        log.info("Fast scan resume: %d duplicate hashes to update", len(dup_hashes))
+
+        # Update dup_count for duplicate files only
+        for h, dc in dup_hashes:
+            async with db_writer() as wdb:
+                await wdb.execute(
+                    "UPDATE files SET dup_count = ? "
+                    "WHERE COALESCE(hash_strong, hash_fast) = ? "
+                    "AND stale = 0 AND hidden = 0 AND dup_exclude = 0",
+                    (dc, h),
+                )
 
         _progress["phase"] = "rebuilding"
         log.info("Fast scan resume: rebuilding sizes for location %d", location_id)
@@ -129,8 +173,6 @@ async def _resume_post_processing(location_id: int, location_name: str):
         invalidate_stats_cache()
 
         # Record scan and clear pending marker
-        from file_hunter.db import db_writer
-
         now = datetime.now(timezone.utc).isoformat(timespec="seconds")
         async with db_writer() as wdb:
             await wdb.execute(
@@ -179,7 +221,7 @@ async def run_fast_scan(location_id: int, root_path: str, location_name: str):
 
     Runs the synchronous walk/hash in a thread. Updates _progress for polling.
     """
-    from file_hunter.services.dup_counts import full_dup_recount, stop_writer
+    from file_hunter.services.dup_counts import stop_writer
     from file_hunter.services.queue_manager import pause, resume
     from file_hunter.services.sizes import recalculate_location_sizes
 
@@ -219,23 +261,8 @@ async def run_fast_scan(location_id: int, root_path: str, location_name: str):
         if _progress["status"] == "error":
             return
 
-        # Dup recount for this location
-        _progress["phase"] = "recounting"
-        _progress["files_to_hash"] = 0
-        _progress["files_hashed"] = 0
-        log.info("Fast scan: recounting duplicates for location %d", location_id)
-
-        async def _on_dup_total(total):
-            _progress["files_to_hash"] = total
-
-        async def _on_dup_progress(processed):
-            _progress["files_hashed"] = processed
-
-        await full_dup_recount(
-            location_id=location_id,
-            on_progress=_on_dup_progress,
-            on_total=_on_dup_total,
-        )
+        # Dup counting is done inline during pass 2+3 in the sync thread.
+        # Just rebuild location sizes.
 
         # Rebuild location sizes
         _progress["phase"] = "rebuilding"
@@ -484,9 +511,16 @@ def _sync_walk_and_hash(location_id: int, root_path: str, location_name: str):
             elapsed,
         )
 
-        # --- Pass 2: Hash in inode order ---
+        # --- Pass 2: Hash in inode order + inline dup tracking ---
         _progress["phase"] = "hashing"
         log.info("Fast scan pass 2: hashing (inode-sorted)")
+
+        # Create temp table for duplicate hashes (only hashes with COUNT > 1)
+        conn.execute(
+            "CREATE TEMP TABLE IF NOT EXISTS _dup_hashes (  hash TEXT PRIMARY KEY)"
+        )
+        conn.execute("DELETE FROM _dup_hashes")
+        conn.commit()
 
         # Join temp table with files to get (file_id, rel_path) in inode order
         to_hash = conn.execute(
@@ -502,7 +536,6 @@ def _sync_walk_and_hash(location_id: int, root_path: str, location_name: str):
         log.info("Fast scan pass 2: %d files to hash", total_to_hash)
 
         hashed = 0
-        hash_batch: list[tuple] = []
         t1 = time.monotonic()
         last_log = t1
 
@@ -515,17 +548,26 @@ def _sync_walk_and_hash(location_id: int, root_path: str, location_name: str):
             except OSError:
                 continue
 
-            hash_batch.append((h, file_id))
+            # Write hash immediately so the dup check sees it
+            conn.execute("UPDATE files SET hash_fast = ? WHERE id = ?", (h, file_id))
             hashed += 1
             _progress["files_hashed"] = hashed
 
-            if len(hash_batch) >= BATCH_SIZE:
-                conn.executemany(
-                    "UPDATE files SET hash_fast = ? WHERE id = ?",
-                    hash_batch,
+            # Inline dup check — single indexed lookup via expression index
+            cnt = conn.execute(
+                "SELECT COUNT(*) FROM files "
+                "WHERE COALESCE(hash_strong, hash_fast) = ? "
+                "AND stale = 0 AND hidden = 0 AND dup_exclude = 0",
+                (h,),
+            ).fetchone()[0]
+            if cnt > 1:
+                conn.execute(
+                    "INSERT OR IGNORE INTO _dup_hashes (hash) VALUES (?)", (h,)
                 )
+
+            # Commit periodically
+            if hashed % BATCH_SIZE == 0:
                 conn.commit()
-                hash_batch.clear()
 
             now_t = time.monotonic()
             if now_t - last_log >= 5:
@@ -538,14 +580,9 @@ def _sync_walk_and_hash(location_id: int, root_path: str, location_name: str):
                 )
                 last_log = now_t
 
-        if hash_batch:
-            conn.executemany(
-                "UPDATE files SET hash_fast = ? WHERE id = ?",
-                hash_batch,
-            )
-            conn.commit()
+        conn.commit()
 
-        # Clean up temp table
+        # Clean up inode temp table
         conn.execute("DROP TABLE IF EXISTS _fast_scan_inodes")
         conn.commit()
 
@@ -555,6 +592,50 @@ def _sync_walk_and_hash(location_id: int, root_path: str, location_name: str):
             hashed,
             elapsed2,
         )
+
+        # --- Pass 3: Process duplicate hashes ---
+        _progress["phase"] = "recounting"
+        _progress["files_to_hash"] = 0
+        _progress["files_hashed"] = 0
+
+        dup_count = conn.execute("SELECT COUNT(*) FROM _dup_hashes").fetchone()[0]
+        _progress["files_to_hash"] = dup_count
+        log.info("Fast scan pass 3: %d duplicate hashes to process", dup_count)
+
+        dup_rows = conn.execute("SELECT hash FROM _dup_hashes").fetchall()
+        processed = 0
+        for row in dup_rows:
+            h = row["hash"]
+            cnt = conn.execute(
+                "SELECT COUNT(*) FROM files "
+                "WHERE COALESCE(hash_strong, hash_fast) = ? "
+                "AND stale = 0 AND hidden = 0 AND dup_exclude = 0",
+                (h,),
+            ).fetchone()[0]
+            dc = cnt - 1 if cnt > 1 else 0
+            conn.execute(
+                "UPDATE files SET dup_count = ? "
+                "WHERE COALESCE(hash_strong, hash_fast) = ? "
+                "AND stale = 0 AND hidden = 0 AND dup_exclude = 0",
+                (dc, h),
+            )
+            processed += 1
+            _progress["files_hashed"] = processed
+            if processed % 1000 == 0:
+                conn.commit()
+                log.info(
+                    "Fast scan dup update: %d / %d hashes",
+                    processed,
+                    dup_count,
+                )
+
+        conn.commit()
+
+        # Clean up dup temp table
+        conn.execute("DROP TABLE IF EXISTS _dup_hashes")
+        conn.commit()
+
+        log.info("Fast scan pass 3 complete: %d duplicate hashes processed", processed)
 
     except Exception as e:
         log.exception("Fast scan sync phase failed")
