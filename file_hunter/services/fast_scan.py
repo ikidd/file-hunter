@@ -49,6 +49,108 @@ def is_running() -> bool:
     return _progress["status"] not in ("idle", "complete", "error")
 
 
+async def restore_pending():
+    """Resume interrupted fast scan post-processing on startup.
+
+    If the walk/hash completed but dup recount or size rebuild was
+    interrupted, re-runs just the post-processing (recount + sizes).
+    The file data is already committed — only counts need fixing.
+    """
+    from file_hunter.db import db_writer, get_db
+    from file_hunter.services.settings import get_setting
+
+    db = await get_db()
+    pending = await get_setting(db, "fast_scan_pending")
+    if not pending:
+        return
+
+    try:
+        location_id = int(pending)
+    except (ValueError, TypeError):
+        log.warning("Invalid fast_scan_pending value: %s, clearing", pending)
+        async with db_writer() as wdb:
+            await wdb.execute("DELETE FROM settings WHERE key = 'fast_scan_pending'")
+        return
+
+    row = await db.execute_fetchall(
+        "SELECT name, root_path FROM locations WHERE id = ?", (location_id,)
+    )
+    if not row:
+        log.warning("fast_scan_pending location %d not found, clearing", location_id)
+        async with db_writer() as wdb:
+            await wdb.execute("DELETE FROM settings WHERE key = 'fast_scan_pending'")
+        return
+
+    location_name = row[0]["name"]
+    log.info(
+        "Resuming interrupted fast scan post-processing for '%s' (location %d)",
+        location_name,
+        location_id,
+    )
+
+    asyncio.create_task(_resume_post_processing(location_id, location_name))
+
+
+async def _resume_post_processing(location_id: int, location_name: str):
+    """Run just the dup recount + size rebuild for an interrupted fast scan."""
+    from file_hunter.services.dup_counts import full_dup_recount
+    from file_hunter.services.sizes import recalculate_location_sizes
+
+    _progress.update(
+        status="running",
+        location=location_name,
+        phase="recounting",
+        files_found=0,
+        folders_found=0,
+        bytes_found=0,
+        files_to_hash=0,
+        files_hashed=0,
+        error=None,
+    )
+
+    try:
+        log.info("Fast scan resume: recounting duplicates for location %d", location_id)
+
+        async def _on_dup_total(total):
+            _progress["files_to_hash"] = total
+
+        async def _on_dup_progress(processed):
+            _progress["files_hashed"] = processed
+
+        await full_dup_recount(
+            location_id=location_id,
+            on_progress=_on_dup_progress,
+            on_total=_on_dup_total,
+        )
+
+        _progress["phase"] = "rebuilding"
+        log.info("Fast scan resume: rebuilding sizes for location %d", location_id)
+        await recalculate_location_sizes(location_id)
+        invalidate_stats_cache()
+
+        # Record scan and clear pending marker
+        from file_hunter.db import db_writer
+
+        now = datetime.now(timezone.utc).isoformat(timespec="seconds")
+        async with db_writer() as wdb:
+            await wdb.execute(
+                "UPDATE locations SET date_last_scanned = ? WHERE id = ?",
+                (now, location_id),
+            )
+            await wdb.execute("DELETE FROM settings WHERE key = 'fast_scan_pending'")
+
+        _progress["status"] = "complete"
+        _progress["phase"] = None
+        log.info("Fast scan resume complete for location '%s'", location_name)
+
+    except Exception as e:
+        log.exception("Fast scan resume failed for location %d", location_id)
+        _progress.update(status="error", error=str(e))
+
+    invalidate_stats_cache()
+    await broadcast({"type": "stats_changed"})
+
+
 def _get_db_path() -> Path:
     """Resolve the database path (same logic as db.py)."""
     from file_hunter.config import load_config
@@ -102,6 +204,13 @@ async def run_fast_scan(location_id: int, root_path: str, location_name: str):
 
         _progress["status"] = "running"
 
+        # Save pending marker so post-processing resumes if interrupted
+        from file_hunter.db import db_writer
+        from file_hunter.services.settings import set_setting
+
+        async with db_writer() as wdb:
+            await set_setting(wdb, "fast_scan_pending", str(location_id))
+
         # Run the synchronous walk + hash in a thread
         await asyncio.to_thread(
             _sync_walk_and_hash, location_id, root_path, location_name
@@ -134,9 +243,7 @@ async def run_fast_scan(location_id: int, root_path: str, location_name: str):
         await recalculate_location_sizes(location_id)
         invalidate_stats_cache()
 
-        # Record scan
-        from file_hunter.db import db_writer
-
+        # Record scan and clear pending marker
         now = datetime.now(timezone.utc).isoformat(timespec="seconds")
         async with db_writer() as wdb:
             await wdb.execute(
@@ -154,6 +261,7 @@ async def run_fast_scan(location_id: int, root_path: str, location_name: str):
                     _progress["files_hashed"],
                 ),
             )
+            await wdb.execute("DELETE FROM settings WHERE key = 'fast_scan_pending'")
 
         _progress["status"] = "complete"
         _progress["phase"] = None

@@ -179,6 +179,10 @@ async def on_startup():
 
     await restore_dup_exclude()
 
+    from file_hunter.services.fast_scan import restore_pending as restore_fast_scan
+
+    await restore_fast_scan()
+
     # Mark interrupted scans as error (agent will rescan on reconnect)
     interrupted = await db.execute_fetchall(
         "SELECT id FROM scans WHERE status IN ('running', 'interrupted', 'finalizing')"
