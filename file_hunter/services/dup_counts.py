@@ -119,7 +119,8 @@ async def _batched_recalc(
     return processed
 
 
-FULL_RECOUNT_WRITE_BATCH = 5000
+SQL_VAR_LIMIT = 500
+FULL_RECOUNT_WRITE_BATCH = SQL_VAR_LIMIT
 
 
 async def full_dup_recount(
@@ -165,14 +166,25 @@ async def full_dup_recount(
                 )
                 target_hashes = [r[hash_column] for r in hash_rows]
                 if target_hashes:
-                    # Count globally for these hashes
-                    ph = ",".join("?" for _ in target_hashes)
-                    rows = await conn.execute_fetchall(
-                        f"SELECT {hash_column}, COUNT(*) as cnt FROM files "
-                        f"WHERE {hash_column} IN ({ph}) "
-                        f"AND stale = 0 AND hidden = 0 AND dup_exclude = 0 "
-                        f"GROUP BY {hash_column}",
-                        target_hashes,
+                    # Count globally for these hashes — batched to stay under SQL variable limit
+                    rows = []
+                    for bi in range(0, len(target_hashes), SQL_VAR_LIMIT):
+                        chunk = target_hashes[bi : bi + SQL_VAR_LIMIT]
+                        ph = ",".join("?" for _ in chunk)
+                        chunk_rows = await conn.execute_fetchall(
+                            f"SELECT {hash_column}, COUNT(*) as cnt FROM files "
+                            f"WHERE {hash_column} IN ({ph}) "
+                            f"AND stale = 0 AND hidden = 0 AND dup_exclude = 0 "
+                            f"GROUP BY {hash_column}",
+                            chunk,
+                        )
+                        rows.extend(chunk_rows)
+                    log.info(
+                        "full_dup_recount (%s): counted %d %s hashes in %d batches",
+                        scope_label,
+                        len(target_hashes),
+                        hash_column,
+                        (len(target_hashes) + SQL_VAR_LIMIT - 1) // SQL_VAR_LIMIT,
                     )
                 else:
                     rows = []
