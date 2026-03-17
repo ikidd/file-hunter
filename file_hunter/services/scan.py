@@ -1126,7 +1126,7 @@ def _now() -> str:
 
 
 STREAM_BATCH_SIZE = 5000
-HASH_BATCH_SIZE = 50
+HASH_BATCH_SIZE = 2000
 
 
 async def _run_first_scan_streamed(
@@ -1337,11 +1337,16 @@ async def _run_first_scan_streamed(
     # Find candidate groups: get this location's (hash_partial, file_size) pairs,
     # then check which have matches elsewhere in the catalog
     read_db = await get_db()
+    await read_db.commit()  # refresh snapshot to see hash_partial writes
+    logger.info(
+        "Streamed first scan: querying distinct (hash_partial, file_size) pairs"
+    )
     local_pairs = await read_db.execute_fetchall(
         "SELECT DISTINCT hash_partial, file_size FROM files "
         "WHERE location_id = ? AND hash_partial IS NOT NULL AND file_size > 0 AND stale = 0",
         (location_id,),
     )
+    logger.info("Streamed first scan: %d distinct pairs found", len(local_pairs))
 
     # Batch-check which pairs have duplicates globally
     dup_groups = []

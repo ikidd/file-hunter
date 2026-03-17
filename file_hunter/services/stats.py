@@ -56,17 +56,15 @@ async def _refresh_all():
     Folder entries are cleared but not repopulated — they are lazily
     re-fetched on next access.
     """
-    from file_hunter.db import open_connection
+    from file_hunter.db import get_db
 
     _cache.clear()
 
     try:
-        conn = await open_connection()
-        try:
-            await _refresh_dashboard(conn)
-            await _refresh_all_locations(conn)
-        finally:
-            await conn.close()
+        conn = await get_db()
+        await conn.commit()  # refresh read snapshot
+        await _refresh_dashboard(conn)
+        await _refresh_all_locations(conn)
 
         # Notify connected browsers that cached stats have been updated
         from file_hunter.ws.scan import broadcast
