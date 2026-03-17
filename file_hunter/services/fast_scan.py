@@ -220,10 +220,125 @@ async def run_fast_scan(location_id: int, root_path: str, location_name: str):
         if _progress["status"] == "error":
             return
 
-        # Dup counting is done inline during pass 2+3 in the sync thread.
-        # Just rebuild location sizes.
+        # --- Pass 3: Candidate detection + full hash (async side) ---
+        _progress["phase"] = "finding_candidates"
+        log.info("Fast scan pass 3: finding candidates for location %d", location_id)
 
-        # Rebuild location sizes
+        await broadcast(
+            {
+                "type": "scan_progress",
+                "locationId": location_id,
+                "location": location_name,
+                "phase": "finding_candidates",
+                "filesFound": _progress["files_found"],
+                "filesHashed": 0,
+            }
+        )
+
+        from file_hunter.db import open_connection
+        from file_hunter_core.hasher import hash_fast_only_sync
+
+        conn = await open_connection()
+        try:
+            # Step 1: get this location's distinct (hash_partial, file_size) pairs
+            local_pairs = await conn.execute_fetchall(
+                "SELECT DISTINCT hash_partial, file_size FROM files "
+                "WHERE location_id = ? AND hash_partial IS NOT NULL "
+                "AND file_size > 0 AND stale = 0",
+                (location_id,),
+            )
+            log.info(
+                "Fast scan pass 3: %d distinct (hash_partial, file_size) pairs",
+                len(local_pairs),
+            )
+
+            # Step 2: batch-check which pairs have duplicates globally
+            dup_groups = []
+            for i in range(0, len(local_pairs), SQL_VAR_LIMIT):
+                chunk = local_pairs[i : i + SQL_VAR_LIMIT]
+                conditions = " OR ".join(
+                    "(hash_partial = ? AND file_size = ?)" for _ in chunk
+                )
+                params = []
+                for g in chunk:
+                    params.extend([g["hash_partial"], g["file_size"]])
+                rows = await conn.execute_fetchall(
+                    f"SELECT hash_partial, file_size FROM files "
+                    f"WHERE ({conditions}) AND stale = 0 "
+                    f"GROUP BY hash_partial, file_size HAVING COUNT(*) > 1",
+                    params,
+                )
+                dup_groups.extend(rows)
+
+            # Step 3: fetch files in those groups that need hash_fast
+            candidates = []
+            for i in range(0, len(dup_groups), SQL_VAR_LIMIT):
+                chunk = dup_groups[i : i + SQL_VAR_LIMIT]
+                conditions = " OR ".join(
+                    "(hash_partial = ? AND file_size = ?)" for _ in chunk
+                )
+                params = []
+                for g in chunk:
+                    params.extend([g["hash_partial"], g["file_size"]])
+                rows = await conn.execute_fetchall(
+                    f"SELECT id, full_path FROM files "
+                    f"WHERE ({conditions}) AND hash_fast IS NULL AND stale = 0",
+                    params,
+                )
+                candidates.extend(rows)
+        finally:
+            await conn.close()
+
+        total_candidates = len(candidates)
+        _progress["phase"] = "confirming"
+        _progress["files_to_hash"] = total_candidates
+        _progress["files_hashed"] = 0
+        log.info("Fast scan pass 3: %d candidates to full-hash", total_candidates)
+
+        # Step 4: compute hash_fast for candidates (local filesystem, threaded)
+        confirmed = 0
+        new_fast_hashes: set[str] = set()
+        for row in candidates:
+            file_id = row["id"]
+            full_path = row["full_path"]
+            try:
+                h_fast = await asyncio.to_thread(hash_fast_only_sync, full_path)
+            except OSError:
+                continue
+
+            async with db_writer() as wdb:
+                await wdb.execute(
+                    "UPDATE files SET hash_fast = ? WHERE id = ?", (h_fast, file_id)
+                )
+            new_fast_hashes.add(h_fast)
+            confirmed += 1
+            _progress["files_hashed"] = confirmed
+
+        log.info("Fast scan pass 3 complete: %d candidates full-hashed", confirmed)
+
+        # --- Pass 4: Dup recount ---
+        if new_fast_hashes:
+            _progress["phase"] = "recounting"
+            _progress["files_to_hash"] = 0
+            _progress["files_hashed"] = 0
+            log.info("Fast scan pass 4: recounting duplicates")
+
+            await broadcast(
+                {
+                    "type": "scan_progress",
+                    "locationId": location_id,
+                    "location": location_name,
+                    "phase": "recounting",
+                    "filesFound": _progress["files_found"],
+                    "filesHashed": 0,
+                }
+            )
+
+            from file_hunter.services.dup_counts import optimized_dup_recount
+
+            await optimized_dup_recount(location_id=location_id)
+
+        # --- Pass 5: Rebuild location sizes ---
         _progress["phase"] = "rebuilding"
         log.info("Fast scan: rebuilding sizes for location %d", location_id)
         await recalculate_location_sizes(location_id)
@@ -285,7 +400,7 @@ def _sync_walk_and_hash(location_id: int, root_path: str, location_name: str):
     Updates _progress dict for polling by async HTTP handlers.
     """
     from file_hunter_core.classify import classify_file
-    from file_hunter_core.hasher import hash_fast_only_sync, hash_file_partial_sync
+    from file_hunter_core.hasher import hash_file_partial_sync
 
     conn = _open_sync_connection()
     try:
@@ -528,152 +643,9 @@ def _sync_walk_and_hash(location_id: int, root_path: str, location_name: str):
             elapsed2,
         )
 
-        # --- Pass 3: Candidate detection + full hash ---
-        _progress["phase"] = "confirming"
-        _progress["files_to_hash"] = 0
-        _progress["files_hashed"] = 0
-
-        log.info("Fast scan pass 3: finding candidates (file_size + hash_partial)")
-
-        # Step 1: get this location's (hash_partial, file_size) pairs
-        local_pairs = conn.execute(
-            "SELECT DISTINCT hash_partial, file_size FROM files "
-            "WHERE location_id = ? AND hash_partial IS NOT NULL "
-            "AND file_size > 0 AND stale = 0",
-            (location_id,),
-        ).fetchall()
-
-        # Step 2: batch-check which pairs have duplicates globally
-        dup_groups = []
-        for i in range(0, len(local_pairs), SQL_VAR_LIMIT):
-            chunk = local_pairs[i : i + SQL_VAR_LIMIT]
-            conditions = " OR ".join(
-                "(hash_partial = ? AND file_size = ?)" for _ in chunk
-            )
-            params = []
-            for g in chunk:
-                params.extend([g["hash_partial"], g["file_size"]])
-            rows = conn.execute(
-                f"SELECT hash_partial, file_size FROM files "
-                f"WHERE ({conditions}) AND stale = 0 "
-                f"GROUP BY hash_partial, file_size HAVING COUNT(*) > 1",
-                params,
-            ).fetchall()
-            dup_groups.extend(rows)
-
-        # Step 3: fetch files in those groups that need hash_fast
-        candidates = []
-        for i in range(0, len(dup_groups), SQL_VAR_LIMIT):
-            chunk = dup_groups[i : i + SQL_VAR_LIMIT]
-            conditions = " OR ".join(
-                "(hash_partial = ? AND file_size = ?)" for _ in chunk
-            )
-            params = []
-            for g in chunk:
-                params.extend([g["hash_partial"], g["file_size"]])
-            rows = conn.execute(
-                f"SELECT id, full_path FROM files "
-                f"WHERE ({conditions}) "
-                f"AND hash_fast IS NULL AND stale = 0",
-                params,
-            ).fetchall()
-            candidates.extend(rows)
-
-        total_candidates = len(candidates)
-        _progress["files_to_hash"] = total_candidates
-        log.info("Fast scan pass 3: %d candidates to full-hash", total_candidates)
-
-        confirmed = 0
-        t2 = time.monotonic()
-        last_log = t2
-
-        for row in candidates:
-            file_id = row["id"]
-            full_path = row["full_path"]
-            try:
-                h_fast = hash_fast_only_sync(full_path)
-            except OSError:
-                continue
-
-            conn.execute(
-                "UPDATE files SET hash_fast = ? WHERE id = ?", (h_fast, file_id)
-            )
-            confirmed += 1
-            _progress["files_hashed"] = confirmed
-
-            if confirmed % BATCH_SIZE == 0:
-                conn.commit()
-
-            now_t = time.monotonic()
-            if now_t - last_log >= 5:
-                rate = confirmed / (now_t - t2) if (now_t - t2) > 0 else 0
-                log.info(
-                    "Fast scan full hash: %d / %d (%.0f files/sec)",
-                    confirmed,
-                    total_candidates,
-                    rate,
-                )
-                last_log = now_t
-
-        conn.commit()
-
-        elapsed3 = time.monotonic() - t2
-        log.info(
-            "Fast scan pass 3 complete: %d candidates full-hashed in %.1fs",
-            confirmed,
-            elapsed3,
-        )
-
-        # --- Pass 4: Count duplicates by hash_fast ---
-        _progress["phase"] = "recounting"
-        _progress["files_to_hash"] = 0
-        _progress["files_hashed"] = 0
-
-        # Get distinct hash_fast values that have duplicates
-        dup_rows = conn.execute(
-            "SELECT hash_fast, COUNT(*) as cnt FROM files "
-            "WHERE hash_fast IS NOT NULL AND stale = 0 AND dup_exclude = 0 "
-            "AND location_id = ? "
-            "GROUP BY hash_fast HAVING COUNT(*) > 1",
-            (location_id,),
-        ).fetchall()
-
-        # Also check cross-location dups for these hash_fast values
-        local_hashes = [r["hash_fast"] for r in dup_rows]
-        all_dup_hashes: list[tuple[str, int]] = []
-
-        # Recount globally for each local hash_fast
-        for i in range(0, len(local_hashes), SQL_VAR_LIMIT):
-            chunk = local_hashes[i : i + SQL_VAR_LIMIT]
-            ph = ",".join("?" for _ in chunk)
-            global_rows = conn.execute(
-                f"SELECT hash_fast, COUNT(*) as cnt FROM files "
-                f"WHERE hash_fast IN ({ph}) "
-                f"AND stale = 0 AND dup_exclude = 0 "
-                f"GROUP BY hash_fast HAVING COUNT(*) > 1",
-                chunk,
-            ).fetchall()
-            for r in global_rows:
-                all_dup_hashes.append((r["hash_fast"], r["cnt"] - 1))
-
-        total_dups = len(all_dup_hashes)
-        _progress["files_to_hash"] = total_dups
-        log.info("Fast scan pass 4: %d duplicate hash groups to update", total_dups)
-
-        processed = 0
-        for h_fast, dc in all_dup_hashes:
-            conn.execute(
-                "UPDATE files SET dup_count = ? "
-                "WHERE hash_fast = ? AND stale = 0 AND dup_exclude = 0",
-                (dc, h_fast),
-            )
-            processed += 1
-            _progress["files_hashed"] = processed
-            if processed % 1000 == 0:
-                conn.commit()
-
-        conn.commit()
-        log.info("Fast scan pass 4 complete: %d hash groups updated", processed)
+        # Passes 3+4 (candidate detection, full hashing, dup counting) run
+        # on the async side after this thread returns — avoids WAL contention
+        # between sync and async connections on spinning disk.
 
     except Exception as e:
         log.exception("Fast scan sync phase failed")
