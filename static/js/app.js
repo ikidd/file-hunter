@@ -1659,6 +1659,14 @@ WS.on('agent_status', async (msg) => {
     await StatusBar.loadStats();
 });
 
+WS.on('agent_capabilities', (msg) => {
+    const caps = msg.capabilities && msg.capabilities.length > 0
+        ? msg.capabilities.join(', ')
+        : 'none';
+    const name = msg.agentName || msg.hostname || `Agent #${msg.agentId}`;
+    ActivityLog.add(`${name} capabilities: ${caps}`);
+});
+
 WS.connect();
 
 // Load pro extension if active

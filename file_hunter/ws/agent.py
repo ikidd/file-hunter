@@ -27,6 +27,13 @@ _agent_info: dict[int, dict] = {}  # agent_id -> {hostname, httpPort, httpHost, 
 # agent_id -> set of location_ids (for online check lookups)
 _agent_location_ids: dict[int, set[int]] = {}
 
+# agent_id -> set of capability strings (e.g. "tsv_tree")
+_agent_capabilities: dict[int, set[str]] = {}
+
+
+def get_agent_capabilities(agent_id: int) -> set[str]:
+    return _agent_capabilities.get(agent_id, set())
+
 
 def get_agent_connection(agent_id: int) -> WebSocket | None:
     return _agent_connections.get(agent_id)
@@ -289,6 +296,8 @@ async def agent_ws_endpoint(websocket: WebSocket):
 
     _agent_connections[agent_id] = websocket
     _agent_tokens[agent_id] = token
+    capabilities = set(msg.get("capabilities", []))
+    _agent_capabilities[agent_id] = capabilities
     _agent_info[agent_id] = {
         "hostname": hostname,
         "httpPort": http_port,
@@ -343,11 +352,24 @@ async def agent_ws_endpoint(websocket: WebSocket):
         }
     )
 
+    cap_label = ", ".join(sorted(capabilities)) if capabilities else "none"
     logger.info(
-        "Agent #%d (%s) connected with %d locations",
+        "Agent #%d (%s) connected with %d locations — capabilities: %s",
         agent_id,
         hostname,
         len(agent_locations),
+        cap_label,
+    )
+
+    # Broadcast capabilities to UI for activity panel
+    await broadcast(
+        {
+            "type": "agent_capabilities",
+            "agentId": agent_id,
+            "agentName": agent_name,
+            "hostname": hostname,
+            "capabilities": sorted(capabilities),
+        }
     )
 
     # Resume interrupted backfill if one was pending for this agent

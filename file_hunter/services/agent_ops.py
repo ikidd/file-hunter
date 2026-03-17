@@ -405,24 +405,54 @@ async def rename_agent_location(agent_id: int, root_path: str, new_name: str):
     )
 
 
+def _parse_tsv_line(line: str) -> dict | None:
+    """Parse a TSV tree line into a dict matching the JSON format."""
+    parts = line.split("\t")
+    if not parts:
+        return None
+    t = parts[0]
+    if t == "F" and len(parts) >= 4:
+        return {
+            "type": "file",
+            "rel_path": parts[1],
+            "size": int(parts[2]),
+            "mtime": parts[3],
+        }
+    if t == "D" and len(parts) >= 2:
+        return {"type": "dir", "rel_dir": parts[1]}
+    if t == "E" and len(parts) >= 3:
+        return {"type": "end", "dirs": int(parts[1]), "files": int(parts[2])}
+    return None
+
+
 async def stream_tree(agent_id: int, root_path: str, prefix: str | None = None):
-    """Stream the full metadata tree from an agent as parsed JSON objects.
+    """Stream the full metadata tree from an agent as parsed dicts.
 
     Yields dicts: {"type":"dir",...}, {"type":"file",...}, {"type":"end",...}
     Returns None (instead of yielding) if the agent doesn't support /tree (404).
     Raises ConnectionError if the agent is offline.
+
+    Uses TSV format if the agent advertises the tsv_tree capability.
+    Falls back to JSON for older agents.
     """
     import json as _json
+
+    from file_hunter.ws.agent import get_agent_capabilities
 
     resolved = _resolve_agent(agent_id)
     if not resolved:
         raise ConnectionError(f"Agent {agent_id} is offline")
     host, port, token = resolved
 
+    capabilities = get_agent_capabilities(agent_id)
+    use_tsv = "tsv_tree" in capabilities
+
     url = f"http://{host}:{port}/tree"
     body = {"path": root_path}
     if prefix:
         body["prefix"] = prefix
+    if use_tsv:
+        body["format"] = "tsv"
 
     timeout = httpx.Timeout(1800.0, connect=10.0)
     async with httpx.AsyncClient(timeout=timeout) as client:
@@ -445,7 +475,13 @@ async def stream_tree(agent_id: int, root_path: str, prefix: str | None = None):
                 )
             async for line in resp.aiter_lines():
                 line = line.strip()
-                if line:
+                if not line:
+                    continue
+                if use_tsv:
+                    parsed = _parse_tsv_line(line)
+                    if parsed:
+                        yield parsed
+                else:
                     yield _json.loads(line)
 
 
