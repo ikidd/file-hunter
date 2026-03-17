@@ -1482,6 +1482,10 @@ const Detail = {
                     <span class="label">Duplicates</span>
                     <span class="value" data-stat="duplicates">${s.duplicateFiles.toLocaleString()}</span>
                 </div>
+                <div class="detail-field">
+                    <span class="label">Hidden</span>
+                    <span class="value" data-stat="hiddenFiles">${(s.hiddenFiles || 0).toLocaleString()}</span>
+                </div>
             </div>
             ${typeHtml ? `<div class="detail-section" data-stat="typeBreakdown"><h3>File Types</h3>${typeHtml}</div>` : ''}
             <div class="detail-section">
@@ -1554,6 +1558,10 @@ const Detail = {
                 <div class="detail-field">
                     <span class="label">Duplicates</span>
                     <span class="value" data-stat="duplicates">${s.duplicateFiles.toLocaleString()}</span>
+                </div>
+                <div class="detail-field">
+                    <span class="label">Hidden</span>
+                    <span class="value" data-stat="hiddenFiles">${(s.hiddenFiles || 0).toLocaleString()}</span>
                 </div>
             </div>
             <div class="detail-section">

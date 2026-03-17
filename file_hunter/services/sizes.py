@@ -45,10 +45,10 @@ def _merge_type_counts(a: dict, b: dict) -> dict:
 
 
 async def recalculate_location_sizes(location_id: int):
-    """Recompute all four stored counters for every folder in a location,
+    """Recompute all stored counters for every folder in a location,
     then update the location totals.
 
-    Counters: file_count, total_size, duplicate_count, type_counts (JSON).
+    Counters: file_count, total_size, duplicate_count, hidden_count, type_counts (JSON).
 
     Strategy:
     1. Direct values per folder via indexed GROUP BY on files (read via get_db()).
@@ -96,7 +96,23 @@ async def recalculate_location_sizes(location_id: int):
         else:
             direct_dup[fid] = r["cnt"] or 0
 
-    # 1c. Direct type counts per folder
+    # 1c. Direct hidden counts per folder
+    hidden_rows = await db.execute_fetchall(
+        "SELECT folder_id, COUNT(*) AS cnt "
+        "FROM files WHERE location_id = ? AND stale = 0 AND hidden = 1 "
+        "GROUP BY folder_id",
+        (location_id,),
+    )
+    direct_hidden: dict[int, int] = {}
+    root_hidden_count = 0
+    for r in hidden_rows:
+        fid = r["folder_id"]
+        if fid is None:
+            root_hidden_count = r["cnt"] or 0
+        else:
+            direct_hidden[fid] = r["cnt"] or 0
+
+    # 1d. Direct type counts per folder
     type_rows = await db.execute_fetchall(
         "SELECT folder_id, file_type_high, COUNT(*) AS cnt "
         "FROM files WHERE location_id = ? AND stale = 0 "
@@ -129,22 +145,26 @@ async def recalculate_location_sizes(location_id: int):
     cum_size: dict[int, int] = {}
     cum_count: dict[int, int] = {}
     cum_dup: dict[int, int] = {}
+    cum_hidden: dict[int, int] = {}
     cum_types: dict[int, dict[str, int]] = {}
 
     def accumulate(fid):
         size = direct_size.get(fid, 0)
         count = direct_count.get(fid, 0)
         dup = direct_dup.get(fid, 0)
+        hidden = direct_hidden.get(fid, 0)
         types = dict(direct_types.get(fid, {}))
         for child_id in children_of.get(fid, []):
             accumulate(child_id)
             size += cum_size[child_id]
             count += cum_count[child_id]
             dup += cum_dup[child_id]
+            hidden += cum_hidden[child_id]
             types = _merge_type_counts(types, cum_types[child_id])
         cum_size[fid] = size
         cum_count[fid] = count
         cum_dup[fid] = dup
+        cum_hidden[fid] = hidden
         cum_types[fid] = types
 
     for root_id in children_of.get(None, []):
@@ -160,6 +180,9 @@ async def recalculate_location_sizes(location_id: int):
     loc_dup_count = root_dup_count + sum(
         direct_dup.get(fid, 0) for fid in all_folder_ids
     )
+    loc_hidden_count = root_hidden_count + sum(
+        direct_hidden.get(fid, 0) for fid in all_folder_ids
+    )
     loc_type_counts = dict(root_type_counts)
     for fid in all_folder_ids:
         for ftype, cnt in direct_types.get(fid, {}).items():
@@ -168,12 +191,13 @@ async def recalculate_location_sizes(location_id: int):
     async with db_writer() as wdb:
         await wdb.executemany(
             "UPDATE folders SET total_size = ?, file_count = ?, "
-            "duplicate_count = ?, type_counts = ? WHERE id = ?",
+            "duplicate_count = ?, hidden_count = ?, type_counts = ? WHERE id = ?",
             [
                 (
                     cum_size.get(fid, 0),
                     cum_count.get(fid, 0),
                     cum_dup.get(fid, 0),
+                    cum_hidden.get(fid, 0),
                     json.dumps(cum_types.get(fid, {})),
                     fid,
                 )
@@ -183,11 +207,12 @@ async def recalculate_location_sizes(location_id: int):
 
         await wdb.execute(
             "UPDATE locations SET total_size = ?, file_count = ?, "
-            "duplicate_count = ?, type_counts = ? WHERE id = ?",
+            "duplicate_count = ?, hidden_count = ?, type_counts = ? WHERE id = ?",
             (
                 loc_total_size,
                 loc_total_count,
                 loc_dup_count,
+                loc_hidden_count,
                 json.dumps(loc_type_counts),
                 location_id,
             ),

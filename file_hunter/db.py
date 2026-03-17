@@ -193,6 +193,8 @@ _MIGRATIONS = [
     "ALTER TABLE folders ADD COLUMN type_counts TEXT NOT NULL DEFAULT '{}'",
     "ALTER TABLE files ADD COLUMN pending_op TEXT",
     "CREATE INDEX IF NOT EXISTS idx_files_effective_hash ON files(COALESCE(hash_strong, hash_fast))",
+    "ALTER TABLE folders ADD COLUMN hidden_count INTEGER NOT NULL DEFAULT 0",
+    "ALTER TABLE locations ADD COLUMN hidden_count INTEGER NOT NULL DEFAULT 0",
 ]
 
 _OPERATION_QUEUE_SCHEMA = """

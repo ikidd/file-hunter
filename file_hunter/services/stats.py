@@ -329,7 +329,7 @@ async def get_location_stats(db, location_id: int):
     # Cache miss — all four counters stored on locations table, so this is fast.
     loc_row = await db.execute_fetchall(
         "SELECT id, name, root_path, date_added, date_last_scanned, "
-        "total_size, file_count, duplicate_count, type_counts, "
+        "total_size, file_count, duplicate_count, hidden_count, type_counts, "
         "scan_schedule_enabled, scan_schedule_days, scan_schedule_time, "
         "scan_schedule_last_run FROM locations WHERE id = ?",
         (location_id,),
@@ -367,6 +367,7 @@ async def get_location_stats(db, location_id: int):
         "totalSize": loc["total_size"] or 0,
         "totalSizeFormatted": format_size(loc["total_size"] or 0),
         "duplicateFiles": loc["duplicate_count"] or 0,
+        "hiddenFiles": loc["hidden_count"] or 0,
         "typeBreakdown": type_breakdown,
         "scheduleEnabled": bool(loc["scan_schedule_enabled"]),
         "scheduleDays": schedule_days,
@@ -416,7 +417,8 @@ async def get_folder_stats(db, folder_id: int):
     # Folder metadata — includes stored counters (duplicate_count is cumulative)
     folder_row = await db.execute_fetchall(
         """SELECT f.id, f.name, f.rel_path, f.location_id,
-                  f.total_size, f.file_count, f.duplicate_count, f.dup_exclude,
+                  f.total_size, f.file_count, f.duplicate_count, f.hidden_count,
+                  f.dup_exclude,
                   l.name as location_name, l.root_path as location_root_path
            FROM folders f JOIN locations l ON l.id = f.location_id
            WHERE f.id = ?""",
@@ -479,6 +481,7 @@ async def get_folder_stats(db, folder_id: int):
         "totalSize": fld["total_size"] or 0,
         "totalSizeFormatted": format_size(fld["total_size"] or 0),
         "duplicateFiles": dup_count,
+        "hiddenFiles": fld["hidden_count"] or 0,
         "subfolderCount": subfolder_count,
         "dupExcluded": bool(fld["dup_exclude"]),
         "breadcrumb": breadcrumb,
