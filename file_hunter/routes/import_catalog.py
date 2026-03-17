@@ -181,6 +181,115 @@ async def _run_and_notify(
             location_id,
         )
         if _progress["status"] == "complete":
+            # --- Candidate detection + hash_fast ---
+            from file_hunter.db import get_db
+            from file_hunter.services.agent_ops import hash_fast_batch
+
+            _progress["status"] = "candidates"
+            log.info(
+                "Import post-processing: finding candidates for location %d",
+                location_id,
+            )
+
+            db = await get_db()
+            await db.commit()  # refresh read snapshot
+
+            # Step 1: get distinct (hash_partial, file_size) for this location
+            local_pairs = await db.execute_fetchall(
+                "SELECT DISTINCT hash_partial, file_size FROM files "
+                "WHERE location_id = ? AND hash_partial IS NOT NULL "
+                "AND file_size > 0 AND stale = 0",
+                (location_id,),
+            )
+            log.info(
+                "Import: %d distinct (hash_partial, file_size) pairs for location %d",
+                len(local_pairs),
+                location_id,
+            )
+
+            # Step 2: batch-check which pairs have duplicates globally
+            SQL_VAR_LIMIT = 500
+            dup_groups = []
+            for i in range(0, len(local_pairs), SQL_VAR_LIMIT):
+                chunk = local_pairs[i : i + SQL_VAR_LIMIT]
+                conditions = " OR ".join(
+                    "(hash_partial = ? AND file_size = ?)" for _ in chunk
+                )
+                params = []
+                for g in chunk:
+                    params.extend([g["hash_partial"], g["file_size"]])
+                rows = await db.execute_fetchall(
+                    f"SELECT hash_partial, file_size FROM files "
+                    f"WHERE ({conditions}) AND stale = 0 "
+                    f"GROUP BY hash_partial, file_size HAVING COUNT(*) > 1",
+                    params,
+                )
+                dup_groups.extend(rows)
+
+            # Step 3: fetch files that need hash_fast
+            candidates = []
+            for i in range(0, len(dup_groups), SQL_VAR_LIMIT):
+                chunk = dup_groups[i : i + SQL_VAR_LIMIT]
+                conditions = " OR ".join(
+                    "(hash_partial = ? AND file_size = ?)" for _ in chunk
+                )
+                params = []
+                for g in chunk:
+                    params.extend([g["hash_partial"], g["file_size"]])
+                rows = await db.execute_fetchall(
+                    f"SELECT id, full_path FROM files "
+                    f"WHERE ({conditions}) AND hash_fast IS NULL AND stale = 0",
+                    params,
+                )
+                candidates.extend(rows)
+
+            log.info(
+                "Import: %d candidates to full-hash for location %d",
+                len(candidates),
+                location_id,
+            )
+
+            # Step 4: batch hash_fast via agent
+            HASH_BATCH = 50
+            hashed = 0
+            if candidates and agent_id:
+                _progress["status"] = "hashing"
+                _progress["dup_hashes_total"] = len(candidates)
+                _progress["dup_hashes_done"] = 0
+
+                for i in range(0, len(candidates), HASH_BATCH):
+                    batch = candidates[i : i + HASH_BATCH]
+                    paths = [r["full_path"] for r in batch]
+                    try:
+                        result = await hash_fast_batch(agent_id, paths)
+                    except (ConnectionError, OSError):
+                        log.warning("Agent offline during import hash_fast — stopping")
+                        break
+
+                    hash_map = {
+                        r["path"]: r["hash_fast"] for r in result.get("results", [])
+                    }
+                    if hash_map:
+                        from file_hunter.db import db_writer
+
+                        async with db_writer() as wdb:
+                            for r in batch:
+                                h = hash_map.get(r["full_path"])
+                                if h:
+                                    await wdb.execute(
+                                        "UPDATE files SET hash_fast = ? WHERE id = ?",
+                                        (h, r["id"]),
+                                    )
+                        hashed += len(hash_map)
+                        _progress["dup_hashes_done"] = hashed
+
+                log.info(
+                    "Import: %d files full-hashed for location %d",
+                    hashed,
+                    location_id,
+                )
+
+            # --- Dup recount ---
             from file_hunter.services.dup_counts import optimized_dup_recount
 
             _progress["status"] = "dup_recount"
