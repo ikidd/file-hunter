@@ -1678,11 +1678,11 @@ WS.on('settings_changed', async (msg) => {
     }
     // Reload tree and file list when showHiddenFiles changes
     await Tree.reload();
-    const selectedNode = Tree.data?.find(n => n.id === Tree.selected)
-        || Tree.data?.flatMap(n => n.children || []).find(n => n.id === Tree.selected);
     if (selectedNode) {
-        await FileList.showFolder(selectedNode.id);
+        selectedNode = Tree._findNode(selectedNode.id);
+        if (selectedNode) await FileList.showFolder(selectedNode.id);
     }
+    await refreshDetailPanel();
 });
 
 WS.on('agent_status', async (msg) => {
