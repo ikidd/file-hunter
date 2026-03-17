@@ -535,18 +535,36 @@ def _sync_walk_and_hash(location_id: int, root_path: str, location_name: str):
 
         log.info("Fast scan pass 3: finding candidates (file_size + hash_partial)")
 
-        # Step 1: find (hash_partial, file_size) groups with COUNT > 1
-        dup_groups = conn.execute(
-            "SELECT hash_partial, file_size FROM files "
-            "WHERE hash_partial IS NOT NULL AND file_size > 0 AND stale = 0 "
-            "GROUP BY hash_partial, file_size HAVING COUNT(*) > 1"
+        # Step 1: get this location's (hash_partial, file_size) pairs
+        local_pairs = conn.execute(
+            "SELECT DISTINCT hash_partial, file_size FROM files "
+            "WHERE location_id = ? AND hash_partial IS NOT NULL "
+            "AND file_size > 0 AND stale = 0",
+            (location_id,),
         ).fetchall()
 
-        # Step 2: fetch files in those groups that need hash_fast
+        # Step 2: batch-check which pairs have duplicates globally
+        dup_groups = []
+        for i in range(0, len(local_pairs), SQL_VAR_LIMIT):
+            chunk = local_pairs[i : i + SQL_VAR_LIMIT]
+            conditions = " OR ".join(
+                "(hash_partial = ? AND file_size = ?)" for _ in chunk
+            )
+            params = []
+            for g in chunk:
+                params.extend([g["hash_partial"], g["file_size"]])
+            rows = conn.execute(
+                f"SELECT hash_partial, file_size FROM files "
+                f"WHERE ({conditions}) AND stale = 0 "
+                f"GROUP BY hash_partial, file_size HAVING COUNT(*) > 1",
+                params,
+            ).fetchall()
+            dup_groups.extend(rows)
+
+        # Step 3: fetch files in those groups that need hash_fast
         candidates = []
         for i in range(0, len(dup_groups), SQL_VAR_LIMIT):
             chunk = dup_groups[i : i + SQL_VAR_LIMIT]
-            # Build WHERE (hash_partial = ? AND file_size = ?) OR ...
             conditions = " OR ".join(
                 "(hash_partial = ? AND file_size = ?)" for _ in chunk
             )

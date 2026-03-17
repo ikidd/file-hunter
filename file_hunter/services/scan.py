@@ -1268,13 +1268,30 @@ async def _run_first_scan_streamed(
         }
     )
 
-    # Find candidate groups (same hash_partial + file_size with COUNT > 1)
+    # Find candidate groups: get this location's (hash_partial, file_size) pairs,
+    # then check which have matches elsewhere in the catalog
     read_db = await get_db()
-    dup_groups = await read_db.execute_fetchall(
-        "SELECT hash_partial, file_size FROM files "
-        "WHERE hash_partial IS NOT NULL AND file_size > 0 AND stale = 0 "
-        "GROUP BY hash_partial, file_size HAVING COUNT(*) > 1"
+    local_pairs = await read_db.execute_fetchall(
+        "SELECT DISTINCT hash_partial, file_size FROM files "
+        "WHERE location_id = ? AND hash_partial IS NOT NULL AND file_size > 0 AND stale = 0",
+        (location_id,),
     )
+
+    # Batch-check which pairs have duplicates globally
+    dup_groups = []
+    for i in range(0, len(local_pairs), 500):
+        chunk = local_pairs[i : i + 500]
+        conditions = " OR ".join("(hash_partial = ? AND file_size = ?)" for _ in chunk)
+        params = []
+        for g in chunk:
+            params.extend([g["hash_partial"], g["file_size"]])
+        rows = await read_db.execute_fetchall(
+            f"SELECT hash_partial, file_size, COUNT(*) as cnt FROM files "
+            f"WHERE ({conditions}) AND stale = 0 "
+            f"GROUP BY hash_partial, file_size HAVING COUNT(*) > 1",
+            params,
+        )
+        dup_groups.extend(rows)
 
     # Fetch files in those groups that need hash_fast
     candidates = []
@@ -1361,14 +1378,16 @@ async def _run_first_scan_streamed(
         await optimized_dup_recount(location_id=location_id)
 
     # --- Phase 5: Finalize ---
-    await broadcast({
-        "type": "scan_progress",
-        "locationId": location_id,
-        "location": location_name,
-        "phase": "rebuilding",
-        "filesFound": files_found,
-        "filesHashed": 0,
-    })
+    await broadcast(
+        {
+            "type": "scan_progress",
+            "locationId": location_id,
+            "location": location_name,
+            "phase": "rebuilding",
+            "filesFound": files_found,
+            "filesHashed": 0,
+        }
+    )
     await recalculate_location_sizes(location_id)
     invalidate_stats_cache()
 
