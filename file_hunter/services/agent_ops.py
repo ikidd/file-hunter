@@ -412,12 +412,15 @@ def _parse_tsv_line(line: str) -> dict | None:
         return None
     t = parts[0]
     if t == "F" and len(parts) >= 4:
-        return {
+        rec = {
             "type": "file",
             "rel_path": parts[1],
             "size": int(parts[2]),
             "mtime": parts[3],
         }
+        if len(parts) >= 5:
+            rec["ctime"] = parts[4]
+        return rec
     if t == "D" and len(parts) >= 2:
         return {"type": "dir", "rel_dir": parts[1]}
     if t == "E" and len(parts) >= 3:

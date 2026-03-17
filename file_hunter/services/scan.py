@@ -25,7 +25,7 @@ from file_hunter.services.scanner import (
     upsert_file,
     mark_stale_files,
 )
-from file_hunter.services.agent_ops import reconcile_directory, dispatch, stream_tree
+from file_hunter.services.agent_ops import reconcile_directory, stream_tree
 from file_hunter.services.stats import invalidate_stats_cache
 from file_hunter.ws.scan import broadcast
 
@@ -126,6 +126,32 @@ async def run_scan(op_id: int, agent_id: int, params: dict):
         0,
         len(dirs_to_visit),
     )
+
+    # --- First scan streamed path: skip per-directory reconcile ---
+    from file_hunter.ws.agent import get_agent_capabilities
+
+    agent_caps = get_agent_capabilities(agent_id)
+    can_stream_first = (
+        is_first_scan
+        and not saved_traversal
+        and not scan_prefix
+        and "stream_first_scan" in agent_caps
+    )
+
+    if can_stream_first:
+        try:
+            await _run_first_scan_streamed(
+                agent_id, location_id, location_name, root_path, scan_id, now_iso
+            )
+            return
+        except (ConnectionError, OSError, httpx.ConnectError):
+            raise
+        except Exception:
+            logger.warning(
+                "Streamed first scan failed for %s — falling back to BFS",
+                location_name,
+                exc_info=True,
+            )
 
     # --- Tree-diff fast path: skip unchanged directories ---
     tree_diff_dirs: set[str] | None = None
@@ -406,27 +432,32 @@ async def run_scan(op_id: int, agent_id: int, params: dict):
                     db, location_id, current_folder_id
                 )
 
-            # --- INLINE BACKFILL: per-candidate HTTP + write (lock released) ---
+            # --- INLINE BACKFILL: batch hash_fast for candidates ---
             new_hashes: set[str] = set()
-            for row in backfill_candidates:
+            if backfill_candidates:
+                from file_hunter.services.agent_ops import hash_fast_batch
+
+                paths = [r["full_path"] for r in backfill_candidates]
+                id_by_path = {r["full_path"]: r["id"] for r in backfill_candidates}
                 try:
-                    hash_result = await dispatch(
-                        "file_hash", location_id, path=row["full_path"]
-                    )
-                    async with db_writer() as db:
-                        await db.execute(
-                            "UPDATE files SET hash_fast = ? WHERE id = ?",
-                            (hash_result["hash_fast"], row["id"]),
-                        )
-                    new_hashes.add(hash_result["hash_fast"])
+                    result = await hash_fast_batch(agent_id, paths)
+                    hash_map = {
+                        r["path"]: r["hash_fast"] for r in result.get("results", [])
+                    }
+                    if hash_map:
+                        async with db_writer() as db:
+                            for path, h in hash_map.items():
+                                fid = id_by_path.get(path)
+                                if fid:
+                                    await db.execute(
+                                        "UPDATE files SET hash_fast = ? WHERE id = ?",
+                                        (h, fid),
+                                    )
+                                    new_hashes.add(h)
                 except (ConnectionError, OSError):
-                    break
+                    logger.warning("Agent offline during backfill batch")
                 except Exception as e:
-                    logger.debug(
-                        "Inline backfill: hash failed for %s: %r",
-                        row["full_path"],
-                        e,
-                    )
+                    logger.debug("Batch backfill failed: %r", e)
             dir_affected_fast.update(new_hashes)
 
             # Submit to coalesced dup recalc writer
@@ -1026,3 +1057,346 @@ async def _tree_diff(
 
 def _now() -> str:
     return datetime.now(timezone.utc).isoformat(timespec="seconds")
+
+
+STREAM_BATCH_SIZE = 5000
+HASH_BATCH_SIZE = 50
+
+
+async def _run_first_scan_streamed(
+    agent_id: int,
+    location_id: int,
+    location_name: str,
+    root_path: str,
+    scan_id: int,
+    now_iso: str,
+):
+    """Stream-based first scan: tree walk → bulk insert → hash_partial → candidates → dups.
+
+    Uses the agent's /tree endpoint for metadata, bulk-inserts via db_writer,
+    then batch-computes hash_partial and hash_fast for candidates.
+    """
+    from file_hunter_core.classify import classify_file
+    from file_hunter.services.agent_ops import (
+        hash_fast_batch,
+        hash_partial_batch,
+        stream_tree,
+    )
+    from file_hunter.services.dup_counts import submit_hashes_for_recalc
+    from file_hunter.services.sizes import recalculate_location_sizes
+
+    logger.info(
+        "Streamed first scan starting for location #%d (%s)", location_id, location_name
+    )
+
+    # --- Phase 1: Stream metadata, bulk insert ---
+    folder_cache: dict[str, int] = {}  # rel_dir -> folder_id
+    file_batch: list[tuple] = []
+    files_found = 0
+    folders_found = 0
+    last_broadcast = time.monotonic()
+
+    async for record in stream_tree(agent_id, root_path):
+        rtype = record.get("type")
+
+        if rtype == "dir":
+            rel_dir = record["rel_dir"]
+            if rel_dir:
+                async with db_writer() as db:
+                    folder_id, _ = await ensure_folder_hierarchy(
+                        db, location_id, rel_dir, folder_cache
+                    )
+                folders_found += 1
+
+        elif rtype == "file":
+            rel_path = record["rel_path"]
+            size = record["size"]
+            mtime = record["mtime"]
+            ctime = record.get("ctime", mtime)
+
+            filename = os.path.basename(rel_path)
+            rel_dir = os.path.dirname(rel_path)
+            full_path = os.path.join(root_path, rel_path)
+            type_high, type_low = classify_file(filename)
+            hidden = (
+                1
+                if (
+                    filename.startswith(".")
+                    or any(p.startswith(".") for p in rel_dir.split(os.sep) if p)
+                )
+                else 0
+            )
+
+            # Resolve folder_id from cache
+            folder_id = folder_cache.get(rel_dir, (None,))[0] if rel_dir else None
+
+            file_batch.append(
+                (
+                    filename,
+                    full_path,
+                    rel_path,
+                    location_id,
+                    folder_id,
+                    type_high,
+                    type_low,
+                    size,
+                    "",  # description
+                    "",  # tags
+                    ctime,  # created_date
+                    mtime,  # modified_date
+                    now_iso,  # date_cataloged
+                    now_iso,  # date_last_seen
+                    hidden,
+                    0,  # stale
+                    scan_id,
+                )
+            )
+            files_found += 1
+
+            if len(file_batch) >= STREAM_BATCH_SIZE:
+                await _bulk_insert_files(file_batch)
+                file_batch.clear()
+
+            # Broadcast progress
+            now_t = time.monotonic()
+            if now_t - last_broadcast >= 2.0:
+                await broadcast(
+                    {
+                        "type": "scan_progress",
+                        "locationId": location_id,
+                        "location": location_name,
+                        "phase": "streaming",
+                        "filesFound": files_found,
+                        "foldersFound": folders_found,
+                    }
+                )
+                last_broadcast = now_t
+
+        elif rtype == "end":
+            break
+
+    # Flush remaining
+    if file_batch:
+        await _bulk_insert_files(file_batch)
+
+    logger.info(
+        "Streamed first scan phase 1 complete: %d files, %d folders for %s",
+        files_found,
+        folders_found,
+        location_name,
+    )
+
+    await broadcast(
+        {
+            "type": "scan_progress",
+            "locationId": location_id,
+            "location": location_name,
+            "phase": "hashing_partial",
+            "filesFound": files_found,
+            "filesHashed": 0,
+        }
+    )
+
+    # --- Phase 2: Batch hash_partial ---
+    read_db = await get_db()
+    unhashed = await read_db.execute_fetchall(
+        "SELECT id, full_path FROM files "
+        "WHERE location_id = ? AND hash_partial IS NULL AND file_size > 0 AND stale = 0",
+        (location_id,),
+    )
+
+    total_to_hash = len(unhashed)
+    hashed = 0
+    logger.info(
+        "Streamed first scan phase 2: %d files to partial-hash for %s",
+        total_to_hash,
+        location_name,
+    )
+
+    for i in range(0, total_to_hash, HASH_BATCH_SIZE):
+        batch = unhashed[i : i + HASH_BATCH_SIZE]
+        paths = [r["full_path"] for r in batch]
+        try:
+            result = await hash_partial_batch(agent_id, paths)
+        except (ConnectionError, OSError):
+            logger.warning("Agent offline during hash_partial batch — stopping")
+            break
+
+        # Build path → hash map
+        hash_map = {r["path"]: r["hash_partial"] for r in result.get("results", [])}
+
+        if hash_map:
+            async with db_writer() as db:
+                for r in batch:
+                    h = hash_map.get(r["full_path"])
+                    if h:
+                        await db.execute(
+                            "UPDATE files SET hash_partial = ? WHERE id = ?",
+                            (h, r["id"]),
+                        )
+            hashed += len(hash_map)
+
+        now_t = time.monotonic()
+        if now_t - last_broadcast >= 2.0:
+            await broadcast(
+                {
+                    "type": "scan_progress",
+                    "locationId": location_id,
+                    "location": location_name,
+                    "phase": "hashing_partial",
+                    "filesFound": files_found,
+                    "filesHashed": hashed,
+                    "filesToHash": total_to_hash,
+                }
+            )
+            last_broadcast = now_t
+
+    logger.info(
+        "Streamed first scan phase 2 complete: %d partial hashes for %s",
+        hashed,
+        location_name,
+    )
+
+    # --- Phase 3: Candidate detection + hash_fast ---
+    await broadcast(
+        {
+            "type": "scan_progress",
+            "locationId": location_id,
+            "location": location_name,
+            "phase": "confirming",
+            "filesFound": files_found,
+            "filesHashed": 0,
+        }
+    )
+
+    # Find candidate groups (same hash_partial + file_size with COUNT > 1)
+    read_db = await get_db()
+    dup_groups = await read_db.execute_fetchall(
+        "SELECT hash_partial, file_size FROM files "
+        "WHERE hash_partial IS NOT NULL AND file_size > 0 AND stale = 0 "
+        "GROUP BY hash_partial, file_size HAVING COUNT(*) > 1"
+    )
+
+    # Fetch files in those groups that need hash_fast
+    candidates = []
+    for i in range(0, len(dup_groups), 500):
+        chunk = dup_groups[i : i + 500]
+        conditions = " OR ".join("(hash_partial = ? AND file_size = ?)" for _ in chunk)
+        params = []
+        for g in chunk:
+            params.extend([g["hash_partial"], g["file_size"]])
+        rows = await read_db.execute_fetchall(
+            f"SELECT id, full_path FROM files "
+            f"WHERE ({conditions}) AND hash_fast IS NULL AND stale = 0",
+            params,
+        )
+        candidates.extend(rows)
+
+    total_candidates = len(candidates)
+    confirmed = 0
+    logger.info(
+        "Streamed first scan phase 3: %d candidates to full-hash for %s",
+        total_candidates,
+        location_name,
+    )
+
+    new_fast_hashes: set[str] = set()
+    for i in range(0, total_candidates, HASH_BATCH_SIZE):
+        batch = candidates[i : i + HASH_BATCH_SIZE]
+        paths = [r["full_path"] for r in batch]
+        try:
+            result = await hash_fast_batch(agent_id, paths)
+        except (ConnectionError, OSError):
+            logger.warning("Agent offline during hash_fast batch — stopping")
+            break
+
+        hash_map = {r["path"]: r["hash_fast"] for r in result.get("results", [])}
+
+        if hash_map:
+            async with db_writer() as db:
+                for r in batch:
+                    h = hash_map.get(r["full_path"])
+                    if h:
+                        await db.execute(
+                            "UPDATE files SET hash_fast = ? WHERE id = ?",
+                            (h, r["id"]),
+                        )
+                        new_fast_hashes.add(h)
+            confirmed += len(hash_map)
+
+        now_t = time.monotonic()
+        if now_t - last_broadcast >= 2.0:
+            await broadcast(
+                {
+                    "type": "scan_progress",
+                    "locationId": location_id,
+                    "location": location_name,
+                    "phase": "confirming",
+                    "filesFound": files_found,
+                    "filesHashed": confirmed,
+                    "filesToHash": total_candidates,
+                }
+            )
+            last_broadcast = now_t
+
+    logger.info(
+        "Streamed first scan phase 3 complete: %d confirmed for %s",
+        confirmed,
+        location_name,
+    )
+
+    # Submit new hash_fast values for dup recalc
+    if new_fast_hashes:
+        submit_hashes_for_recalc(
+            fast_hashes=new_fast_hashes,
+            source=f"first_scan {location_name}",
+            location_ids={location_id},
+        )
+
+    # --- Phase 4: Finalize ---
+    await recalculate_location_sizes(location_id)
+    invalidate_stats_cache()
+
+    async with db_writer() as db:
+        await db.execute(
+            "UPDATE scans SET status = 'completed', completed_at = ?, "
+            "files_found = ?, files_hashed = ? WHERE id = ?",
+            (now_iso, files_found, confirmed, scan_id),
+        )
+        await db.execute(
+            "UPDATE locations SET date_last_scanned = ? WHERE id = ?",
+            (now_iso, location_id),
+        )
+
+    await broadcast(
+        {
+            "type": "scan_completed",
+            "locationId": location_id,
+            "location": location_name,
+            "filesFound": files_found,
+            "filesHashed": confirmed,
+            "duplicatesFound": len(new_fast_hashes),
+        }
+    )
+
+    logger.info(
+        "Streamed first scan complete: %s — %d files, %d hashed, %d dup groups",
+        location_name,
+        files_found,
+        confirmed,
+        len(new_fast_hashes),
+    )
+
+
+async def _bulk_insert_files(batch: list[tuple]):
+    """Bulk insert files via executemany through db_writer."""
+    async with db_writer() as db:
+        await db.executemany(
+            "INSERT INTO files "
+            "(filename, full_path, rel_path, location_id, folder_id, "
+            "file_type_high, file_type_low, file_size, "
+            "description, tags, created_date, modified_date, "
+            "date_cataloged, date_last_seen, hidden, stale, scan_id) "
+            "VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)",
+            batch,
+        )
