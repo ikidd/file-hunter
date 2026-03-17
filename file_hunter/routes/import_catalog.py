@@ -250,7 +250,10 @@ async def _run_and_notify(
             )
 
             # Step 4: batch hash_fast via agent
-            HASH_BATCH = 50
+            from file_hunter.services.settings import is_turbo_mode
+
+            turbo = await is_turbo_mode(db)
+            HASH_BATCH = 10000 if turbo else 2000
             hashed = 0
             if candidates and agent_id:
                 _progress["status"] = "hashing"

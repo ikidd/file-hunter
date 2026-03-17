@@ -1141,6 +1141,17 @@ def _now() -> str:
 
 STREAM_BATCH_SIZE = 5000
 HASH_BATCH_SIZE = 2000
+HASH_BATCH_SIZE_TURBO = 10000
+
+
+async def _get_hash_batch_size() -> int:
+    """Return hash batch size based on turbo mode setting."""
+    from file_hunter.services.settings import is_turbo_mode
+
+    db = await get_db()
+    if await is_turbo_mode(db):
+        return HASH_BATCH_SIZE_TURBO
+    return HASH_BATCH_SIZE
 
 
 async def _run_first_scan_streamed(
@@ -1277,6 +1288,7 @@ async def _run_first_scan_streamed(
     )
 
     # --- Phase 2: Batch hash_partial ---
+    hash_batch_size = await _get_hash_batch_size()
     read_db = await get_db()
     unhashed = await read_db.execute_fetchall(
         "SELECT id, full_path FROM files "
@@ -1292,8 +1304,8 @@ async def _run_first_scan_streamed(
         location_name,
     )
 
-    for i in range(0, total_to_hash, HASH_BATCH_SIZE):
-        batch = unhashed[i : i + HASH_BATCH_SIZE]
+    for i in range(0, total_to_hash, hash_batch_size):
+        batch = unhashed[i : i + hash_batch_size]
         paths = [r["full_path"] for r in batch]
         try:
             result = await hash_partial_batch(agent_id, paths)
@@ -1419,8 +1431,8 @@ async def _run_first_scan_streamed(
     )
 
     new_fast_hashes: set[str] = set()
-    for i in range(0, total_candidates, HASH_BATCH_SIZE):
-        batch = candidates[i : i + HASH_BATCH_SIZE]
+    for i in range(0, total_candidates, hash_batch_size):
+        batch = candidates[i : i + hash_batch_size]
         paths = [r["full_path"] for r in batch]
         try:
             result = await hash_fast_batch(agent_id, paths)
