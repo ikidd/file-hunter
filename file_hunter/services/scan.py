@@ -1197,6 +1197,7 @@ async def _run_first_scan_streamed(
             )
 
     # --- Phase 1: Stream metadata, bulk insert ---
+    _debug_log.debug("PHASE1_START: streaming metadata for %s", location_name)
     folder_cache: dict[str, int] = {}  # rel_dir -> folder_id
     file_batch: list[tuple] = []
     files_found = 0
@@ -1292,6 +1293,9 @@ async def _run_first_scan_streamed(
         folders_found,
         location_name,
     )
+    _debug_log.debug(
+        "PHASE1_COMPLETE: %d files, %d folders", files_found, folders_found
+    )
 
     await broadcast(
         {
@@ -1305,7 +1309,9 @@ async def _run_first_scan_streamed(
     )
 
     # --- Phase 2: Batch hash_partial ---
+    _debug_log.debug("PHASE2_START: batch hash_partial")
     hash_batch_size = await _get_hash_batch_size()
+    _debug_log.debug("PHASE2: hash_batch_size=%d", hash_batch_size)
     read_db = await get_db()
     unhashed = await read_db.execute_fetchall(
         "SELECT id, full_path FROM files "
@@ -1478,13 +1484,31 @@ async def _run_first_scan_streamed(
     )
 
     new_fast_hashes: set[str] = set()
+    total_confirm_batches = (
+        (total_candidates + hash_batch_size - 1) // hash_batch_size
+        if total_candidates
+        else 0
+    )
+    _debug_log.debug(
+        "PHASE3_CONFIRM: %d candidates in %d batches (batch_size=%d)",
+        total_candidates,
+        total_confirm_batches,
+        hash_batch_size,
+    )
+    confirm_batch_num = 0
+    t_confirm = time.monotonic()
     for i in range(0, total_candidates, hash_batch_size):
+        confirm_batch_num += 1
+        t_cb = time.monotonic()
         batch = candidates[i : i + hash_batch_size]
         paths = [r["full_path"] for r in batch]
         try:
             result = await hash_fast_batch(agent_id, paths)
         except (ConnectionError, OSError):
             logger.warning("Agent offline during hash_fast batch — stopping")
+            _debug_log.debug(
+                "PHASE3_CONFIRM: agent offline at batch %d", confirm_batch_num
+            )
             break
 
         hash_map = {r["path"]: r["hash_fast"] for r in result.get("results", [])}
@@ -1501,6 +1525,15 @@ async def _run_first_scan_streamed(
                         new_fast_hashes.add(h)
             confirmed += len(hash_map)
 
+        _debug_log.debug(
+            "PHASE3_CONFIRM: batch %d/%d done in %.1fs (%d confirmed, %d unique hashes)",
+            confirm_batch_num,
+            total_confirm_batches,
+            time.monotonic() - t_cb,
+            confirmed,
+            len(new_fast_hashes),
+        )
+
         now_t = time.monotonic()
         if now_t - last_broadcast >= 2.0:
             await broadcast(
@@ -1516,14 +1549,19 @@ async def _run_first_scan_streamed(
             )
             last_broadcast = now_t
 
-    logger.info(
-        "Streamed first scan phase 3 complete: %d confirmed for %s",
+    _debug_log.debug(
+        "PHASE3_COMPLETE: %d confirmed, %d unique hashes in %.1fs",
         confirmed,
-        location_name,
+        len(new_fast_hashes),
+        time.monotonic() - t_confirm,
     )
 
     # --- Phase 4: Dup recount (synchronous, must complete before size rebuild) ---
     if new_fast_hashes:
+        _debug_log.debug(
+            "PHASE4_START: recounting %d unique hashes", len(new_fast_hashes)
+        )
+        t_recount = time.monotonic()
         await broadcast(
             {
                 "type": "scan_progress",
@@ -1537,8 +1575,13 @@ async def _run_first_scan_streamed(
         from file_hunter.services.dup_counts import optimized_dup_recount
 
         await optimized_dup_recount(location_id=location_id)
+        _debug_log.debug(
+            "PHASE4_COMPLETE: recount done in %.1fs", time.monotonic() - t_recount
+        )
 
     # --- Phase 5: Finalize ---
+    _debug_log.debug("PHASE5_START: rebuilding sizes")
+    t_rebuild = time.monotonic()
     await broadcast(
         {
             "type": "scan_progress",
@@ -1551,6 +1594,9 @@ async def _run_first_scan_streamed(
     )
     await recalculate_location_sizes(location_id)
     invalidate_stats_cache()
+    _debug_log.debug(
+        "PHASE5_COMPLETE: sizes rebuilt in %.1fs", time.monotonic() - t_rebuild
+    )
 
     async with db_writer() as db:
         await db.execute(
@@ -1562,6 +1608,7 @@ async def _run_first_scan_streamed(
             "UPDATE locations SET date_last_scanned = ? WHERE id = ?",
             (now_iso, location_id),
         )
+    _debug_log.debug("SCAN_COMPLETE: all phases done")
 
     await broadcast(
         {
