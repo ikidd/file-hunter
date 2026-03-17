@@ -1396,7 +1396,12 @@ WS.on('location_deleted', async (msg) => {
 
 WS.on('stats_updated', async () => {
     await StatusBar.loadStats();
-    await Detail.refreshStats();
+    await Tree.reload();
+    if (selectedNode) {
+        selectedNode = Tree._findNode(selectedNode.id);
+        if (selectedNode) await FileList.showFolder(selectedNode.id);
+    }
+    await refreshDetailPanel();
 });
 
 WS.on('repair_started', () => {
