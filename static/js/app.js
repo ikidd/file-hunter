@@ -1009,6 +1009,9 @@ WS.on('scan_progress', (msg) => {
         const pct = total > 0 ? ` (${Math.round(done / total * 100)}%)` : '';
         statusText = `${msg.location} — Partial hashing: ${done.toLocaleString()} / ${total.toLocaleString()}${pct}`;
         logText = `${msg.location} — ${msg.filesFound.toLocaleString()} found, ${done.toLocaleString()} partial hashed`;
+    } else if (msg.phase === 'finding_candidates') {
+        statusText = `${msg.location} — Finding duplicate candidates...`;
+        logText = `${msg.location} — finding duplicate candidates`;
     } else if (msg.phase === 'confirming') {
         const total = msg.filesToHash || 0;
         const done = msg.filesHashed || 0;
@@ -1018,6 +1021,9 @@ WS.on('scan_progress', (msg) => {
     } else if (msg.phase === 'recounting') {
         statusText = `${msg.location} — Recounting duplicates...`;
         logText = `${msg.location} — recounting duplicates`;
+    } else if (msg.phase === 'rebuilding') {
+        statusText = `${msg.location} — Rebuilding sizes...`;
+        logText = `${msg.location} — rebuilding sizes`;
     } else {
         const skippedSuffix = msg.filesSkipped ? `, ${msg.filesSkipped.toLocaleString()} skipped` : '';
         const matchesSuffix = msg.potentialMatches ? `, ${msg.potentialMatches.toLocaleString()} matches` : '';

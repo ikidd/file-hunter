@@ -1262,7 +1262,7 @@ async def _run_first_scan_streamed(
             "type": "scan_progress",
             "locationId": location_id,
             "location": location_name,
-            "phase": "confirming",
+            "phase": "finding_candidates",
             "filesFound": files_found,
             "filesHashed": 0,
         }
@@ -1361,6 +1361,14 @@ async def _run_first_scan_streamed(
         await optimized_dup_recount(location_id=location_id)
 
     # --- Phase 5: Finalize ---
+    await broadcast({
+        "type": "scan_progress",
+        "locationId": location_id,
+        "location": location_name,
+        "phase": "rebuilding",
+        "filesFound": files_found,
+        "filesHashed": 0,
+    })
     await recalculate_location_sizes(location_id)
     invalidate_stats_cache()
 
