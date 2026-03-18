@@ -283,6 +283,17 @@ const ImportCatalog = {
             } else if (p.status === 'recalculating') {
                 textEl.textContent = `Recalculating sizes... (${p.files_imported.toLocaleString()} files imported)`;
                 fillEl.style.width = '100%';
+            } else if (p.status === 'candidates') {
+                textEl.textContent = 'Processing hashes...';
+                fillEl.style.width = '100%';
+            } else if (p.status === 'hashing') {
+                const hashPct = p.dup_hashes_total > 0
+                    ? Math.round((p.dup_hashes_done / p.dup_hashes_total) * 100)
+                    : 0;
+                fillEl.style.width = hashPct + '%';
+                textEl.textContent = p.dup_hashes_total > 0
+                    ? `Processing hashes... ${p.dup_hashes_done.toLocaleString()} / ${p.dup_hashes_total.toLocaleString()}`
+                    : 'Processing hashes...';
             } else if (p.status === 'dup_recount') {
                 const dupPct = p.dup_hashes_total > 0
                     ? Math.round((p.dup_hashes_done / p.dup_hashes_total) * 100)
