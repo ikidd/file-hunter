@@ -32,75 +32,90 @@ async def _batched_recalc(
     """Recalculate dup_count for files sharing the given hashes.
 
     hash_column: "hash_strong" or "hash_fast".
-    - hash_strong: GROUP BY hash_strong, UPDATE all matching files.
-    - hash_fast: GROUP BY hash_fast (counting ALL files with that hash),
-      but UPDATE only files WHERE hash_strong IS NULL (verified files
+    - hash_strong: UPDATE all matching files.
+    - hash_fast: UPDATE only files WHERE hash_strong IS NULL (verified files
       get their dup_count from hash_strong grouping).
 
-    Uses batched GROUP BY for counts (one query per batch of RECALC_BATCH
-    hashes) and grouped UPDATEs by dup_count value. Yields between batches.
-
-    Reads via get_db(), writes via db_writer() per batch.
+    Temp table JOIN + Python Counter for counting, batched UPDATEs for writes.
+    Reads via open_connection(), writes via db_writer().
 
     Returns the number of hashes processed.
     """
+    from collections import Counter
+    from file_hunter.db import open_connection
+
     hash_list = list(hashes)
     total = len(hash_list)
-    processed = 0
-    effective_batch = batch_size if batch_size > 0 else RECALC_BATCH
-    db = await get_db()
+    if not total:
+        return 0
 
     # For hash_fast updates, only target files without hash_strong
     update_extra = " AND hash_strong IS NULL" if hash_column == "hash_fast" else ""
 
-    for i in range(0, total, effective_batch):
-        batch = hash_list[i : i + effective_batch]
-        ph = ",".join("?" for _ in batch)
-
-        # One GROUP BY query gives counts for the whole batch (read)
-        rows = await db.execute_fetchall(
-            f"""SELECT {hash_column}, COUNT(*) as cnt FROM files
-                WHERE {hash_column} IN ({ph})
-                  AND stale = 0 AND dup_exclude = 0
-                GROUP BY {hash_column}""",
-            batch,
+    # Read phase: temp table + JOIN + Python Counter
+    conn = await open_connection()
+    try:
+        await conn.execute("CREATE TEMP TABLE _recalc_hashes (hash_val TEXT)")
+        await conn.executemany(
+            "INSERT INTO _recalc_hashes VALUES (?)",
+            [(h,) for h in hash_list],
         )
-        count_map = {r[hash_column]: r["cnt"] for r in rows}
+        await conn.execute(
+            "CREATE INDEX _recalc_hashes_idx ON _recalc_hashes(hash_val)"
+        )
+        await conn.commit()
 
-        # Group hashes by their dup_count value for batched UPDATEs
-        by_dup_count = defaultdict(list)
-        for h in batch:
-            cnt = count_map.get(h, 0)
-            dc = cnt - 1 if cnt > 1 else 0
-            by_dup_count[dc].append(h)
+        rows = await conn.execute_fetchall(
+            f"SELECT f.{hash_column} FROM files f "
+            f"INNER JOIN _recalc_hashes h ON f.{hash_column} = h.hash_val "
+            f"WHERE f.stale = 0 AND f.dup_exclude = 0"
+        )
+    finally:
+        try:
+            await conn.execute("DROP TABLE IF EXISTS _recalc_hashes")
+        except Exception:
+            pass
+        await conn.close()
 
-        # Write phase: db_writer() per batch
-        async with db_writer() as wdb:
-            # Batched UPDATE per dup_count value (active files)
-            for dc, dc_hashes in by_dup_count.items():
-                dc_ph = ",".join("?" for _ in dc_hashes)
+    hash_counts = Counter(r[hash_column] for r in rows)
+
+    # Build dup_count map: group hashes by their target dup_count value
+    by_dup_count: dict[int, list[str]] = defaultdict(list)
+    for h in hash_list:
+        cnt = hash_counts.get(h, 0)
+        dc = cnt - 1 if cnt > 1 else 0
+        by_dup_count[dc].append(h)
+
+    # Write phase: batched UPDATEs via db_writer()
+    processed = 0
+    effective_batch = batch_size if batch_size > 0 else RECALC_BATCH
+    for dc, dc_hashes in by_dup_count.items():
+        for i in range(0, len(dc_hashes), effective_batch):
+            batch = dc_hashes[i : i + effective_batch]
+            ph = ",".join("?" for _ in batch)
+            async with db_writer() as wdb:
                 await wdb.execute(
                     f"UPDATE files SET dup_count = ? "
-                    f"WHERE {hash_column} IN ({dc_ph}) "
+                    f"WHERE {hash_column} IN ({ph}) "
                     f"AND stale = 0 AND dup_exclude = 0"
                     f"{update_extra}",
-                    [dc] + dc_hashes,
+                    [dc] + batch,
                 )
+            processed += len(batch)
 
-        processed += len(batch)
+            if on_progress:
+                await on_progress(processed, total)
 
-        if on_progress:
-            await on_progress(processed, total)
+            await asyncio.sleep(0)
 
-        if processed % 10000 < effective_batch or processed == total:
-            log.info(
-                "_batched_recalc: %s — %d / %d hashes",
-                hash_column,
-                processed,
-                total,
-            )
+    log.info(
+        "_batched_recalc: %s — %d hashes counted from %d rows",
+        hash_column,
+        total,
+        len(rows),
+    )
 
-        await asyncio.sleep(0.05)
+    return total
 
     return processed
 
