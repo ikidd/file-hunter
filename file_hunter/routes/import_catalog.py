@@ -192,11 +192,28 @@ async def _run_and_notify(
                     location_id,
                 )
 
-                # Batch hash_fast via agent
+                # Filter to files on this agent's locations only
                 from file_hunter.db import get_db
+
+                db = await get_db()
+                agent_loc_rows = await db.execute_fetchall(
+                    "SELECT id FROM locations WHERE agent_id = ?",
+                    (agent_id,),
+                )
+                agent_loc_ids = {r["id"] for r in agent_loc_rows}
+                candidates = [
+                    c for c in candidates if c["location_id"] in agent_loc_ids
+                ]
+                log.info(
+                    "Import: %d candidates on this agent for location %d",
+                    len(candidates),
+                    location_id,
+                )
+
+                # Batch hash_fast via agent
                 from file_hunter.services.settings import is_turbo_mode
 
-                turbo = await is_turbo_mode(await get_db())
+                turbo = await is_turbo_mode(db)
                 HASH_BATCH = 2000 if turbo else 200
                 hashed = 0
                 if candidates and agent_id:
