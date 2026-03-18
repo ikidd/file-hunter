@@ -625,7 +625,7 @@ async def find_dup_candidates(
         await conn.commit()
 
         candidates = await conn.execute_fetchall(
-            "SELECT f.id, f.full_path, f.location_id "
+            "SELECT f.id, f.full_path, f.location_id, f.file_size, f.hash_partial "
             "FROM files f "
             "INNER JOIN _dup_groups g "
             "ON f.hash_partial = g.hash_partial AND f.file_size = g.file_size "

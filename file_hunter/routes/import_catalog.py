@@ -179,9 +179,7 @@ async def _run_and_notify(
             )
             if _progress["status"] == "complete":
                 # --- Candidate detection + hash_fast ---
-                from file_hunter.services.agent_ops import hash_fast_batch
                 from file_hunter.services.dup_counts import find_dup_candidates
-                from file_hunter.services.scanner import write_hash_results
 
                 _progress["status"] = "candidates"
                 candidates = await find_dup_candidates(location_id=location_id)
@@ -210,39 +208,68 @@ async def _run_and_notify(
                     location_id,
                 )
 
-                # Batch hash_fast via agent
-                from file_hunter.services.settings import is_turbo_mode
+                # Hash candidates: small files copied from hash_partial,
+                # large files sent to agent one at a time
+                from file_hunter.db import db_writer
+                from file_hunter.services.agent_ops import dispatch
 
-                turbo = await is_turbo_mode(db)
-                HASH_BATCH = 2000 if turbo else 200
+                SMALL_FILE_THRESHOLD = 128 * 1024  # 128KB
+
+                small_files = [
+                    c for c in candidates if c["file_size"] <= SMALL_FILE_THRESHOLD
+                ]
+                large_files = [
+                    c for c in candidates if c["file_size"] > SMALL_FILE_THRESHOLD
+                ]
+
+                total = len(candidates)
                 hashed = 0
+
                 if candidates and agent_id:
                     _progress["status"] = "hashing"
-                    _progress["dup_hashes_total"] = len(candidates)
+                    _progress["dup_hashes_total"] = total
                     _progress["dup_hashes_done"] = 0
 
-                    path_to_id = {c["full_path"]: c["id"] for c in candidates}
-
-                    for i in range(0, len(candidates), HASH_BATCH):
-                        batch = candidates[i : i + HASH_BATCH]
-                        paths = [r["full_path"] for r in batch]
-                        try:
-                            result = await hash_fast_batch(agent_id, paths)
-                        except (ConnectionError, OSError):
-                            log.warning(
-                                "Agent offline during import hash_fast — stopping"
-                            )
-                            break
-
-                        written, _ = await write_hash_results(
-                            result.get("results", []), path_to_id
+                    # Small files: hash_partial == hash_fast, bulk copy
+                    if small_files:
+                        async with db_writer() as wdb:
+                            for c in small_files:
+                                await wdb.execute(
+                                    "UPDATE files SET hash_fast = ? WHERE id = ?",
+                                    (c["hash_partial"], c["id"]),
+                                )
+                        hashed += len(small_files)
+                        _progress["dup_hashes_done"] = hashed
+                        log.info(
+                            "Import: %d small files hash_fast copied from hash_partial",
+                            len(small_files),
                         )
-                        hashed += written
+
+                    # Large files: one at a time via agent
+                    for c in large_files:
+                        try:
+                            result = await dispatch(
+                                "file_hash", c["location_id"], path=c["full_path"]
+                            )
+                            async with db_writer() as wdb:
+                                await wdb.execute(
+                                    "UPDATE files SET hash_fast = ? WHERE id = ?",
+                                    (result["hash_fast"], c["id"]),
+                                )
+                            hashed += 1
+                        except (ConnectionError, OSError, Exception) as e:
+                            log.warning(
+                                "Import hash_fast failed for %s: %s",
+                                c["full_path"],
+                                e,
+                            )
                         _progress["dup_hashes_done"] = hashed
 
                     log.info(
-                        "Import: %d files full-hashed for location %d",
+                        "Import: %d files hashed (%d small, %d large) for location %d",
                         hashed,
+                        len(small_files),
+                        len(large_files),
                         location_id,
                     )
 
