@@ -625,7 +625,8 @@ async def find_dup_candidates(
         await conn.commit()
 
         candidates = await conn.execute_fetchall(
-            "SELECT f.id, f.full_path, f.location_id, f.file_size, f.hash_partial "
+            "SELECT f.id, f.full_path, f.location_id, f.file_size, "
+            "f.hash_partial, f.inode "
             "FROM files f "
             "INNER JOIN _dup_groups g "
             "ON f.hash_partial = g.hash_partial AND f.file_size = g.file_size "
@@ -943,22 +944,18 @@ RETRY_DELAY = 5
 async def hash_candidates_for_location(
     location_id: int,
     agent_id: int,
-    on_progress=None,
-) -> tuple[int, int, set[str]]:
-    """Find and hash dup candidates for a location.
+) -> tuple[int, int, int]:
+    """Find dup candidates for a location, handle small files, queue large.
 
     Finds files needing hash_fast that share (size, hash_partial) with other
-    files.  Small files (<=128KB): copy hash_partial to hash_fast.  Large
-    files: per-file dispatch("file_hash") via agent with retry.
+    files.  Small files (<=128KB): copy hash_partial to hash_fast and submit
+    to coalesced dup writer.  Large files: insert into pending_hashes for
+    the hash drainer to process.
 
-    on_progress(hashed, total): called after each file/batch.
-
-    Returns (total_candidates, total_hashed, new_fast_hashes).
+    Returns (total_candidates, small_handled, large_queued).
     """
-    import asyncio
-
     from file_hunter.db import db_writer, read_db
-    from file_hunter.services.agent_ops import dispatch
+    from datetime import datetime, timezone
 
     candidates = await find_dup_candidates(location_id=location_id)
 
@@ -986,15 +983,13 @@ async def hash_candidates_for_location(
 
     total = len(candidates)
     if total == 0:
-        return 0, 0, set()
+        return 0, 0, 0
 
     small_files = [c for c in candidates if c["file_size"] <= SMALL_FILE_THRESHOLD]
     large_files = [c for c in candidates if c["file_size"] > SMALL_FILE_THRESHOLD]
 
-    hashed = 0
-    new_fast_hashes: set[str] = set()
-
-    # Small files: hash_partial == hash_fast, bulk copy
+    # Small files: hash_partial == hash_fast, bulk copy + submit to coalesced writer
+    small_fast_hashes: set[str] = set()
     if small_files:
         async with db_writer() as wdb:
             for c in small_files:
@@ -1002,80 +997,60 @@ async def hash_candidates_for_location(
                     "UPDATE files SET hash_fast = ? WHERE id = ?",
                     (c["hash_partial"], c["id"]),
                 )
-                new_fast_hashes.add(c["hash_partial"])
-        hashed += len(small_files)
+                small_fast_hashes.add(c["hash_partial"])
         log.info(
             "hash_candidates_for_location: %d small files hash_fast copied from hash_partial",
             len(small_files),
         )
-        if on_progress:
-            await on_progress(hashed, total)
+        # Submit to coalesced writer for incremental dup recounting
+        submit_hashes_for_recalc(
+            fast_hashes=small_fast_hashes,
+            source=f"small file candidates location {location_id}",
+            location_ids={location_id},
+        )
 
-    # Large files: batch by bytes, very large files go individually
+    # Large files: insert into pending_hashes for the drainer
     if large_files:
-        from file_hunter.services.agent_ops import hash_fast_batch
-
-        # Sort by size so we process smaller files first in batches
-        large_files.sort(key=lambda c: c["file_size"])
-
-        batch: list[dict] = []
-        batch_bytes = 0
-
-        async def _flush_batch():
-            nonlocal hashed
-            if not batch:
-                return
-            paths = [c["full_path"] for c in batch]
-            path_to_candidate = {c["full_path"]: c for c in batch}
-            try:
-                result = await hash_fast_batch(agent_id, paths)
-                async with db_writer() as wdb:
-                    for hr in result.get("results", []):
-                        cand = path_to_candidate.get(hr["path"])
-                        hf = hr.get("hash_fast")
-                        if cand and hf:
-                            await wdb.execute(
-                                "UPDATE files SET hash_fast = ? WHERE id = ?",
-                                (hf, cand["id"]),
-                            )
-                            new_fast_hashes.add(hf)
-                            hashed += 1
-            except Exception as e:
-                log.error(
-                    "hash_candidates batch failed (%d files, %dMB): %s",
-                    len(batch),
-                    batch_bytes // (1024 * 1024),
-                    e,
-                )
-            if on_progress:
-                await on_progress(hashed, total)
-
+        now_iso = datetime.now(timezone.utc).isoformat(timespec="seconds")
+        batch = []
         for c in large_files:
-            batch.append(c)
-            batch_bytes += c["file_size"]
-            if batch_bytes >= HASH_BATCH_BYTES:
-                await _flush_batch()
+            batch.append((
+                c["id"],
+                c["location_id"],
+                agent_id,
+                c["full_path"],
+                c.get("inode", 0),
+                now_iso,
+            ))
+            if len(batch) >= 5000:
+                async with db_writer() as wdb:
+                    await wdb.executemany(
+                        "INSERT INTO pending_hashes "
+                        "(file_id, location_id, agent_id, full_path, inode, created_at) "
+                        "VALUES (?, ?, ?, ?, ?, ?)",
+                        batch,
+                    )
                 batch.clear()
-                batch_bytes = 0
-
-        # Flush remaining
-        await _flush_batch()
-
+        if batch:
+            async with db_writer() as wdb:
+                await wdb.executemany(
+                    "INSERT INTO pending_hashes "
+                    "(file_id, location_id, agent_id, full_path, inode, created_at) "
+                    "VALUES (?, ?, ?, ?, ?, ?)",
+                    batch,
+                )
         log.info(
-            "hash_candidates_for_location: %d large files hashed via agent",
-            hashed - len(small_files),
+            "hash_candidates_for_location: %d large files queued in pending_hashes",
+            len(large_files),
         )
 
     log.info(
-        "hash_candidates_for_location: %d/%d hashed (%d small, %d large) for location %d",
-        hashed,
-        total,
-        len(small_files),
-        len(large_files),
-        location_id,
+        "hash_candidates_for_location: %d total (%d small handled, %d large queued) "
+        "for location %d",
+        total, len(small_files), len(large_files), location_id,
     )
 
-    return total, hashed, new_fast_hashes
+    return total, len(small_files), len(large_files)
 
 
 async def run_hash_file(op_id: int, agent_id: int, params: dict):

@@ -232,45 +232,8 @@ async def run_scan(op_id: int, agent_id: int, params: dict):
             pass
         logger.info("Hash drainer finished for %s", location_name)
 
-        # --- Correction pass ---
-        from file_hunter.services.dup_counts import full_dup_recount
+        # --- Correction pass: rebuild stored counters ---
         from file_hunter.services.sizes import recalculate_location_sizes
-
-        recount_total = 0
-        last_recount_broadcast = time.monotonic()
-
-        async def _on_recount_total(total):
-            nonlocal recount_total
-            recount_total = total
-
-        async def _on_recount_progress(processed):
-            nonlocal last_recount_broadcast
-            now = time.monotonic()
-            if now - last_recount_broadcast >= 2.0:
-                await broadcast({
-                    "type": "scan_progress",
-                    "locationId": location_id,
-                    "location": location_name,
-                    "phase": "recounting",
-                    "checksDone": processed,
-                    "checksTotal": recount_total,
-                })
-                last_recount_broadcast = now
-
-        logger.info("Running dup recount for %s", location_name)
-        await broadcast({
-            "type": "scan_progress",
-            "locationId": location_id,
-            "location": location_name,
-            "phase": "recounting",
-            "checksDone": 0,
-            "checksTotal": 0,
-        })
-        await full_dup_recount(
-            location_id=location_id,
-            on_progress=_on_recount_progress,
-            on_total=_on_recount_total,
-        )
 
         logger.info("Running size recalc for %s", location_name)
         await broadcast({
@@ -309,6 +272,10 @@ async def run_scan(op_id: int, agent_id: int, params: dict):
             await db.execute(
                 "UPDATE scans SET status = 'cancelled', completed_at = ? WHERE id = ?",
                 (completed_iso, scan_id),
+            )
+            await db.execute(
+                "DELETE FROM pending_hashes WHERE location_id = ?",
+                (location_id,),
             )
         invalidate_stats_cache()
         await broadcast(
@@ -776,38 +743,20 @@ async def _apply_hashes_from_temp(
         "locationId": location_id,
         "location": location_name,
         "phase": "checking_duplicates",
-        "checksDone": 0,
-        "checksTotal": 0,
     })
 
-    # Find and process dup candidates — reuse import's shared function
+    # Find dup candidates — small files handled inline, large files queued
+    # for the hash drainer which runs concurrently
     from file_hunter.services.dup_counts import hash_candidates_for_location
 
-    last_dup_broadcast = time.monotonic()
-
-    async def _on_dup_progress(hashed, total):
-        nonlocal last_dup_broadcast
-        now = time.monotonic()
-        if now - last_dup_broadcast >= 2.0:
-            await broadcast({
-                "type": "scan_progress",
-                "locationId": location_id,
-                "location": location_name,
-                "phase": "checking_duplicates",
-                "checksDone": hashed,
-                "checksTotal": total,
-            })
-            last_dup_broadcast = now
-
-    candidates_total, candidates_hashed, new_hashes = await hash_candidates_for_location(
+    candidates_total, small_handled, large_queued = await hash_candidates_for_location(
         location_id=location_id,
         agent_id=agent_id,
-        on_progress=_on_dup_progress,
     )
 
     logger.info(
-        "Dup candidates: %d found, %d hashed for %s",
-        candidates_total, candidates_hashed, location_name,
+        "Dup candidates: %d total (%d small handled, %d large queued) for %s",
+        candidates_total, small_handled, large_queued, location_name,
     )
 
     return applied
@@ -884,28 +833,113 @@ async def _drain_pending_hashes(
 ):
     """Background task: drain pending_hashes by sending batches to the agent.
 
-    Runs concurrently with the scan on a separate HTTP connection to the agent.
-    Polls the pending_hashes table, sends inode-sorted batches to the agent's
-    /files/hash-batch endpoint, writes results back, and submits to the
-    coalesced dup recalc writer.
+    Runs concurrently with the scan. Polls the pending_hashes table for
+    this agent, sends inode-sorted batches to the agent's /files/hash-batch
+    endpoint, writes results back, and submits to the coalesced dup recalc
+    writer for incremental dup counting.
 
+    Batches by bytes (HASH_BATCH_BYTES) not count — predictable I/O per batch.
     Exits when scan_done is set AND the table is empty.
     """
     from file_hunter.services.agent_ops import hash_fast_batch
-    from file_hunter.services.dup_counts import submit_hashes_for_recalc
+    from file_hunter.services.dup_counts import submit_hashes_for_recalc, HASH_BATCH_BYTES
 
-    BATCH_SIZE = 200
+    # Fetch a large chunk, then split into byte-sized batches
+    FETCH_LIMIT = 2000
+    total_hashed = 0
+    total_pending = 0
+    last_broadcast = time.monotonic()
+
+    async def _broadcast_drainer_progress():
+        nonlocal last_broadcast
+        now = time.monotonic()
+        if now - last_broadcast >= 2.0:
+            remaining = total_pending - total_hashed
+            await broadcast({
+                "type": "scan_progress",
+                "locationId": location_id,
+                "location": location_name,
+                "phase": "checking_duplicates",
+                "checksDone": total_hashed,
+                "checksTotal": total_pending,
+            })
+            last_broadcast = now
+
+    async def _process_batch(batch_rows):
+        """Hash a batch via agent, write results, submit to coalesced writer."""
+        nonlocal total_hashed
+        paths = [r["full_path"] for r in batch_rows]
+        path_to_file_id = {r["full_path"]: r["file_id"] for r in batch_rows}
+        pending_ids = [r["id"] for r in batch_rows]
+        affected_locs = {r["location_id"] for r in batch_rows}
+
+        try:
+            result = await hash_fast_batch(agent_id, paths)
+        except (ConnectionError, OSError, httpx.ConnectError):
+            logger.warning(
+                "Hash drainer: agent %d offline, stopping", agent_id
+            )
+            raise
+
+        hash_results = result.get("results", [])
+        affected_fast: set[str] = set()
+
+        if hash_results:
+            async with db_writer() as db:
+                for hr in hash_results:
+                    fid = path_to_file_id.get(hr["path"])
+                    hf = hr.get("hash_fast")
+                    if fid and hf:
+                        await db.execute(
+                            "UPDATE files SET hash_fast = ? WHERE id = ?",
+                            (hf, fid),
+                        )
+                        affected_fast.add(hf)
+
+        # Remove processed entries from pending_hashes
+        for i in range(0, len(pending_ids), 500):
+            batch = pending_ids[i : i + 500]
+            ph = ",".join("?" for _ in batch)
+            async with db_writer() as db:
+                await db.execute(
+                    f"DELETE FROM pending_hashes WHERE id IN ({ph})",
+                    batch,
+                )
+
+        total_hashed += len(hash_results)
+
+        if affected_fast:
+            submit_hashes_for_recalc(
+                strong_hashes=None,
+                fast_hashes=affected_fast,
+                source=f"hash drainer {location_name}",
+                location_ids=affected_locs,
+            )
+
+        logger.info(
+            "Hash drainer: %d hashed (%d / %d) for %s",
+            len(hash_results), total_hashed, total_pending, location_name,
+        )
+
+        await _broadcast_drainer_progress()
 
     try:
         while True:
             async with read_db() as rdb:
                 rows = await rdb.execute_fetchall(
-                    "SELECT id, file_id, full_path, inode FROM pending_hashes "
-                    "WHERE agent_id = ? AND location_id = ? "
+                    "SELECT id, file_id, full_path, inode, location_id FROM pending_hashes "
+                    "WHERE agent_id = ? "
                     "ORDER BY inode "
                     "LIMIT ?",
-                    (agent_id, location_id, BATCH_SIZE),
+                    (agent_id, FETCH_LIMIT),
                 )
+                # Get total pending on first fetch or periodically
+                if total_pending == 0 or len(rows) == FETCH_LIMIT:
+                    count_row = await rdb.execute_fetchall(
+                        "SELECT COUNT(*) as c FROM pending_hashes WHERE agent_id = ?",
+                        (agent_id,),
+                    )
+                    total_pending = total_hashed + count_row[0]["c"]
 
             if not rows:
                 if scan_done.is_set():
@@ -914,58 +948,41 @@ async def _drain_pending_hashes(
                 await asyncio.sleep(2)
                 continue
 
-            paths = [r["full_path"] for r in rows]
-            path_to_file_id = {r["full_path"]: r["file_id"] for r in rows}
-            pending_ids = [r["id"] for r in rows]
+            # Get file sizes for byte-based batching
+            file_ids = [r["file_id"] for r in rows]
+            size_map: dict[int, int] = {}
+            for i in range(0, len(file_ids), 500):
+                batch_ids = file_ids[i : i + 500]
+                ph = ",".join("?" for _ in batch_ids)
+                async with read_db() as rdb:
+                    size_rows = await rdb.execute_fetchall(
+                        f"SELECT id, file_size FROM files WHERE id IN ({ph})",
+                        batch_ids,
+                    )
+                for sr in size_rows:
+                    size_map[sr["id"]] = sr["file_size"]
 
-            try:
-                result = await hash_fast_batch(agent_id, paths)
-            except (ConnectionError, OSError, httpx.ConnectError):
-                logger.warning(
-                    "Hash drainer: agent %d offline, stopping", agent_id
-                )
-                return
+            # Build byte-sized batches and process
+            batch_rows: list[dict] = []
+            batch_bytes = 0
 
-            hash_results = result.get("results", [])
-            affected_fast: set[str] = set()
+            for r in rows:
+                fsize = size_map.get(r["file_id"], 0)
+                batch_rows.append(dict(r))
+                batch_bytes += fsize
 
-            if hash_results:
-                async with db_writer() as db:
-                    for hr in hash_results:
-                        fid = path_to_file_id.get(hr["path"])
-                        hf = hr.get("hash_fast")
-                        if fid and hf:
-                            await db.execute(
-                                "UPDATE files SET hash_fast = ? WHERE id = ?",
-                                (hf, fid),
-                            )
-                            affected_fast.add(hf)
+                if batch_bytes >= HASH_BATCH_BYTES:
+                    await _process_batch(batch_rows)
+                    batch_rows = []
+                    batch_bytes = 0
 
-            if pending_ids:
-                for i in range(0, len(pending_ids), 500):
-                    batch = pending_ids[i : i + 500]
-                    ph = ",".join("?" for _ in batch)
-                    async with db_writer() as db:
-                        await db.execute(
-                            f"DELETE FROM pending_hashes WHERE id IN ({ph})",
-                            batch,
-                        )
-
-            if affected_fast:
-                submit_hashes_for_recalc(
-                    strong_hashes=None,
-                    fast_hashes=affected_fast,
-                    source=f"hash drainer {location_name}",
-                    location_ids={location_id},
-                )
-
-            logger.info(
-                "Hash drainer: %d hashed for %s",
-                len(hash_results), location_name,
-            )
+            if batch_rows:
+                await _process_batch(batch_rows)
 
             await asyncio.sleep(0)
 
+    except (ConnectionError, OSError, httpx.ConnectError):
+        return
     except asyncio.CancelledError:
         return
 

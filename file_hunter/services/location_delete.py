@@ -8,14 +8,12 @@ removes anything from the catalog.
 import asyncio
 import logging
 
-from file_hunter.db import db_writer, execute_write, read_db
+from file_hunter.db import read_db
 from file_hunter.services.agent_ops import delete_agent_location, invalidate_loc_cache
 from file_hunter.services.stats import invalidate_stats_cache
 from file_hunter.ws.scan import broadcast
 
 logger = logging.getLogger("file_hunter")
-
-RECOUNT_BATCH = 500
 
 
 async def run_delete_location(op_id: int, agent_id: int | None, params: dict):
@@ -42,33 +40,26 @@ async def run_delete_location(op_id: int, agent_id: int | None, params: dict):
             location_id,
         )
 
-    # Step 2: Collect hashes that will need recounting after deletion
+    # Step 2: Collect affected hashes before deletion
     affected_fast, affected_strong = await _collect_affected_hashes(location_id)
     logger.info(
         "Delete location #%d: %d affected hash_fast, %d affected hash_strong",
         location_id, len(affected_fast), len(affected_strong),
     )
 
-    # Step 3: Clean up catalog
-    await execute_write(_purge_location, location_id)
+    # Step 3: Clean up catalog — batched to avoid holding writer lock
+    await _purge_location_batched(location_id)
 
-    # Step 4: Recount dup_count for affected hashes
+    # Step 4: Submit affected hashes to coalesced writer for background recount
     if affected_fast or affected_strong:
-        await _recount_affected_hashes(affected_fast, affected_strong)
-        logger.info(
-            "Delete location #%d: dup recount complete", location_id
+        from file_hunter.services.dup_counts import submit_hashes_for_recalc
+        submit_hashes_for_recalc(
+            strong_hashes=affected_strong or None,
+            fast_hashes=affected_fast or None,
+            source=f"delete location {location_name}",
         )
 
-    # Step 5: Recalculate sizes for locations that had affected dups
-    if affected_fast or affected_strong:
-        from file_hunter.services.sizes import recalculate_location_sizes
-        affected_loc_ids = await _find_affected_locations(
-            affected_fast, affected_strong
-        )
-        for lid in affected_loc_ids:
-            await recalculate_location_sizes(lid)
-
-    # Step 6: Clean up in-memory state
+    # Step 5: Clean up in-memory state
     invalidate_loc_cache(location_id)
     invalidate_stats_cache()
 
@@ -119,120 +110,56 @@ async def _collect_affected_hashes(location_id: int) -> tuple[set[str], set[str]
     return affected_fast, affected_strong
 
 
-async def _recount_affected_hashes(
-    affected_fast: set[str], affected_strong: set[str]
-):
-    """Recount dup_count for files sharing the given hash values.
 
-    After the location's files are deleted, GROUP BY the remaining files
-    to get new counts, then UPDATE in batches.
-    """
-    configs = [
-        ("hash_strong", affected_strong, ""),
-        ("hash_fast", affected_fast, " AND hash_strong IS NULL"),
-    ]
+async def _purge_location_batched(location_id: int):
+    """Remove all traces of a location, batched to avoid holding writer lock."""
+    from file_hunter.db import db_writer
 
-    for hash_column, hash_set, update_extra in configs:
-        if not hash_set:
-            continue
+    DELETE_BATCH = 5000
 
-        hash_list = list(hash_set)
+    # Batch-delete files first (largest table)
+    while True:
+        async with db_writer() as db:
+            cursor = await db.execute(
+                "DELETE FROM files WHERE rowid IN "
+                "(SELECT rowid FROM files WHERE location_id = ? LIMIT ?)",
+                (location_id, DELETE_BATCH),
+            )
+            deleted = cursor.rowcount
+        if deleted < DELETE_BATCH:
+            break
+        await asyncio.sleep(0)
 
-        # GROUP BY in batches to get new counts
-        from collections import defaultdict
-        by_dc: dict[int, list[str]] = defaultdict(list)
+    # Batch-delete folders
+    while True:
+        async with db_writer() as db:
+            cursor = await db.execute(
+                "DELETE FROM folders WHERE rowid IN "
+                "(SELECT rowid FROM folders WHERE location_id = ? LIMIT ?)",
+                (location_id, DELETE_BATCH),
+            )
+            deleted = cursor.rowcount
+        if deleted < DELETE_BATCH:
+            break
+        await asyncio.sleep(0)
 
-        for i in range(0, len(hash_list), RECOUNT_BATCH):
-            batch = hash_list[i : i + RECOUNT_BATCH]
-            ph = ",".join("?" for _ in batch)
-            async with read_db() as rdb:
-                rows = await rdb.execute_fetchall(
-                    f"SELECT {hash_column} as hash_val, COUNT(*) as cnt "
-                    f"FROM files "
-                    f"WHERE {hash_column} IN ({ph}) "
-                    f"AND stale = 0 AND dup_exclude = 0 "
-                    f"GROUP BY {hash_column}",
-                    batch,
-                )
-            counted_hashes = set()
-            for r in rows:
-                cnt = r["cnt"]
-                dc = cnt - 1 if cnt > 1 else 0
-                by_dc[dc].append(r["hash_val"])
-                counted_hashes.add(r["hash_val"])
-
-            # Hashes with no remaining files — zero out
-            for h in batch:
-                if h not in counted_hashes:
-                    by_dc[0].append(h)
-
-        # Write updated dup_counts
-        for dc, dc_hashes in by_dc.items():
-            for i in range(0, len(dc_hashes), RECOUNT_BATCH):
-                batch = dc_hashes[i : i + RECOUNT_BATCH]
-                ph = ",".join("?" for _ in batch)
-                async with db_writer() as wdb:
-                    await wdb.execute(
-                        f"UPDATE files SET dup_count = ? "
-                        f"WHERE {hash_column} IN ({ph}) "
-                        f"AND stale = 0 AND dup_exclude = 0"
-                        f"{update_extra}",
-                        [dc] + batch,
-                    )
-                await asyncio.sleep(0)
-
-        logger.info(
-            "Recount %s: %d hashes recounted",
-            hash_column, len(hash_set),
+    # Small tables — single deletes, each releases writer
+    async with db_writer() as db:
+        await db.execute(
+            "DELETE FROM operation_queue WHERE params LIKE ?",
+            (f'%"location_id": {location_id}%',),
         )
 
+    async with db_writer() as db:
+        await db.execute(
+            "DELETE FROM pending_backfills WHERE location_id = ?", (location_id,)
+        )
 
-async def _find_affected_locations(
-    affected_fast: set[str], affected_strong: set[str]
-) -> set[int]:
-    """Find location IDs that have files with any of the affected hashes."""
-    loc_ids: set[int] = set()
+    async with db_writer() as db:
+        await db.execute(
+            "DELETE FROM pending_hashes WHERE location_id = ?", (location_id,)
+        )
 
-    for hash_column, hash_set in [
-        ("hash_fast", affected_fast),
-        ("hash_strong", affected_strong),
-    ]:
-        if not hash_set:
-            continue
-        hash_list = list(hash_set)
-        for i in range(0, len(hash_list), RECOUNT_BATCH):
-            batch = hash_list[i : i + RECOUNT_BATCH]
-            ph = ",".join("?" for _ in batch)
-            async with read_db() as rdb:
-                rows = await rdb.execute_fetchall(
-                    f"SELECT DISTINCT location_id FROM files "
-                    f"WHERE {hash_column} IN ({ph}) AND stale = 0",
-                    batch,
-                )
-            for r in rows:
-                loc_ids.add(r["location_id"])
-
-    return loc_ids
-
-
-async def _purge_location(db, location_id: int):
-    """Remove all traces of a location from the database."""
-    # Operation queue entries (params is JSON, no FK cascade)
-    await db.execute(
-        "DELETE FROM operation_queue WHERE params LIKE ?",
-        (f'%"location_id": {location_id}%',),
-    )
-
-    # Pending backfills (no FK cascade)
-    await db.execute(
-        "DELETE FROM pending_backfills WHERE location_id = ?", (location_id,)
-    )
-
-    # Pending hashes (no FK cascade)
-    await db.execute(
-        "DELETE FROM pending_hashes WHERE location_id = ?", (location_id,)
-    )
-
-    # Location row (CASCADE handles files, folders, scans, consolidation_jobs, ignored_files)
-    await db.execute("DELETE FROM locations WHERE id = ?", (location_id,))
-    await db.commit()
+    # Location row — children already deleted, no heavy CASCADE
+    async with db_writer() as db:
+        await db.execute("DELETE FROM locations WHERE id = ?", (location_id,))
