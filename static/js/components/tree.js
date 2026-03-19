@@ -599,6 +599,7 @@ const Tree = {
             if (this._scanningLocations.has(node.id) && !node.totalSize) {
                 const phaseLabels = {
                     scanning: 'metadata...',
+                    comparing: 'comparing...',
                     hashing: 'partials...',
                     cataloging: 'ingest...',
                     cataloging_hashes: 'hashing...',

@@ -443,7 +443,8 @@ def _parse_tsv_line(line: str) -> dict | None:
     return None
 
 
-async def stream_tree(agent_id: int, root_path: str, prefix: str | None = None):
+async def stream_tree(agent_id: int, root_path: str, prefix: str | None = None,
+                      metadata_only: bool = False):
     """Stream the full metadata tree from an agent as parsed dicts.
 
     Each directory arrives as a batch: one "dir" dict followed by all "file"
@@ -451,6 +452,8 @@ async def stream_tree(agent_id: int, root_path: str, prefix: str | None = None):
 
     Yields dicts: {"type":"dir",...}, {"type":"file",...}, {"type":"end",...}
     Raises ConnectionError if the agent is offline.
+
+    metadata_only: if True, agent skips hash phase. Used for rescan.
     """
     resolved = _resolve_agent(agent_id)
     if not resolved:
@@ -461,6 +464,8 @@ async def stream_tree(agent_id: int, root_path: str, prefix: str | None = None):
     body = {"path": root_path}
     if prefix:
         body["prefix"] = prefix
+    if metadata_only:
+        body["metadata_only"] = True
 
     timeout = httpx.Timeout(1800.0, connect=10.0)
     async with httpx.AsyncClient(timeout=timeout) as client:

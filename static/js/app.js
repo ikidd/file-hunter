@@ -984,6 +984,9 @@ WS.on('scan_progress', (msg) => {
         const pct = total > 0 ? ` (${Math.round(done / total * 100)}%)` : '';
         statusText = `${msg.location} — Hashing: ${done.toLocaleString()} / ${total.toLocaleString()}${pct}`;
         logText = `${msg.location} — ${done.toLocaleString()} / ${total.toLocaleString()} hashed`;
+    } else if (msg.phase === 'comparing') {
+        statusText = `${msg.location} — Comparing catalog...`;
+        logText = `${msg.location} — comparing catalog`;
     } else if (msg.phase === 'cataloging') {
         const total = msg.catalogTotal || 0;
         const done = msg.catalogDone || 0;
