@@ -466,7 +466,7 @@ async def stream_tree(agent_id: int, root_path: str, prefix: str | None = None):
     if prefix:
         body["prefix"] = prefix
 
-    timeout = httpx.Timeout(1800.0, connect=10.0)
+    timeout = httpx.Timeout(None, connect=10.0)
     async with httpx.AsyncClient(timeout=timeout) as client:
         async with client.stream(
             "POST",
