@@ -1249,6 +1249,13 @@ WS.on('dup_backfill_completed', msg => {
     }
     StatusBar.loadStats();
 });
+WS.on('recalc_progress', msg => {
+    const recalcBtn = document.getElementById('detail-recalc-stats');
+    if (recalcBtn) {
+        recalcBtn.textContent = `Recalculating: ${msg.location} (${msg.done}/${msg.total})`;
+    }
+    ActivityLog.add(`Recalculating: ${msg.location} (${msg.done}/${msg.total})`);
+});
 WS.on('size_recalc_completed', msg => {
     ActivityLog.add('Location sizes recalculated');
     StatusBar.loadStats();

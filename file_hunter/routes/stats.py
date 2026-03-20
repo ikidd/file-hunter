@@ -64,11 +64,21 @@ async def _bg_recalculate():
 
     try:
         async with read_db() as db:
-            loc_rows = await db.execute_fetchall("SELECT id FROM locations")
-        for loc in loc_rows:
+            loc_rows = await db.execute_fetchall(
+                "SELECT id, name FROM locations WHERE name NOT LIKE '__deleting_%'"
+            )
+        total = len(loc_rows)
+        for i, loc in enumerate(loc_rows, 1):
+            log.info("Recalculating stats: %s (%d/%d)", loc["name"], i, total)
+            await broadcast({
+                "type": "recalc_progress",
+                "location": loc["name"],
+                "done": i,
+                "total": total,
+            })
             await recalculate_location_sizes(loc["id"])
         invalidate_stats_cache()
-        log.info("Stats recalculated for %d locations", len(loc_rows))
+        log.info("Stats recalculated for %d locations", total)
         await broadcast(
             {
                 "type": "size_recalc_completed",
