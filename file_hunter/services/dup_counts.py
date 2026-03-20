@@ -111,6 +111,7 @@ async def _batched_recalc(
                     f"SELECT file_id FROM file_hashes "
                     f"WHERE {hash_column} IN ({ph})"
                     f"{update_extra}",
+                    batch,
                 )
                 affected_ids = [r[0] for r in await affected_rows.fetchall()]
 
@@ -264,6 +265,7 @@ async def full_dup_recount(
                         f"SELECT file_id FROM file_hashes "
                         f"WHERE {hash_column} IN ({ph})"
                         f"{update_extra}",
+                        batch,
                     )
                     affected_ids = [r[0] for r in await affected_rows.fetchall()]
 
@@ -394,6 +396,7 @@ async def optimized_dup_recount(
                 rows = await wdb.execute(
                     f"SELECT file_id FROM file_hashes "
                     f"WHERE {hash_column} = ?{update_extra}",
+                    (h,),
                 )
                 for r in await rows.fetchall():
                     catalog_updates.append((dc, r[0]))
