@@ -72,7 +72,7 @@ def migrate(catalog_path: str, hashes_path: str):
         return
 
     BATCH = 5000
-    offset = 0
+    last_id = 0
     migrated = 0
     t0 = time.monotonic()
     last_print = t0
@@ -81,10 +81,10 @@ def migrate(catalog_path: str, hashes_path: str):
         rows = cat.execute(
             "SELECT id, location_id, file_size, hash_partial, hash_fast, hash_strong "
             "FROM files "
-            "WHERE stale = 0 AND dup_exclude = 0 "
+            "WHERE id > ? AND stale = 0 AND dup_exclude = 0 "
             "AND (hash_partial IS NOT NULL OR hash_fast IS NOT NULL OR hash_strong IS NOT NULL) "
-            "LIMIT ? OFFSET ?",
-            (BATCH, offset),
+            "ORDER BY id LIMIT ?",
+            (last_id, BATCH),
         ).fetchall()
 
         if not rows:
@@ -104,8 +104,8 @@ def migrate(catalog_path: str, hashes_path: str):
         )
         hdb.commit()
 
+        last_id = rows[-1]["id"]
         migrated += len(batch)
-        offset += BATCH
 
         now = time.monotonic()
         if now - last_print >= 1.0 or migrated == total:

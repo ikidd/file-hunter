@@ -87,7 +87,7 @@ def migrate(catalog_path: str, stats_path: str):
     print(f"\n{total_folders:,} folders to migrate\n")
 
     BATCH = 10000
-    offset = 0
+    last_id = 0
     migrated = 0
     t0 = time.monotonic()
     last_print = t0
@@ -96,8 +96,8 @@ def migrate(catalog_path: str, stats_path: str):
         rows = cat.execute(
             "SELECT id, location_id, file_count, total_size, "
             "duplicate_count, type_counts, hidden_count "
-            "FROM folders LIMIT ? OFFSET ?",
-            (BATCH, offset),
+            "FROM folders WHERE id > ? ORDER BY id LIMIT ?",
+            (last_id, BATCH),
         ).fetchall()
 
         if not rows:
@@ -119,8 +119,8 @@ def migrate(catalog_path: str, stats_path: str):
         )
         sdb.commit()
 
+        last_id = rows[-1]["id"]
         migrated += len(batch)
-        offset += BATCH
 
         now = time.monotonic()
         if now - last_print >= 1.0 or migrated >= total_folders:
