@@ -784,6 +784,13 @@ async def _diff_and_update(
         await conn.execute(f"ATTACH DATABASE '{tmp_path}' AS temp_scan")
 
         # New files: in temp DB but not in catalog
+        await broadcast({
+            "type": "scan_progress",
+            "locationId": location_id,
+            "location": location_name,
+            "phase": "comparing",
+            "compareStep": "Finding new files...",
+        })
         new_rows = await conn.execute_fetchall(
             "SELECT t.rel_dir, t.rel_path, t.file_size, t.mtime, t.ctime, t.inode "
             "FROM temp_scan.files t "
@@ -796,6 +803,13 @@ async def _diff_and_update(
         logger.info("Rescan diff: %d new files for %s", new_count, location_name)
 
         # Changed files: in both but size or mtime differs
+        await broadcast({
+            "type": "scan_progress",
+            "locationId": location_id,
+            "location": location_name,
+            "phase": "comparing",
+            "compareStep": f"{new_count:,} new — finding changed files...",
+        })
         changed_rows = await conn.execute_fetchall(
             "SELECT t.rel_dir, t.rel_path, t.file_size, t.mtime, t.ctime, t.inode, "
             "c.id as file_id, c.file_size as old_size, c.file_type_high as old_type, "
@@ -811,6 +825,13 @@ async def _diff_and_update(
         logger.info("Rescan diff: %d changed files for %s", changed_count, location_name)
 
         # Stale files: in catalog but not in temp DB (with details for stats)
+        await broadcast({
+            "type": "scan_progress",
+            "locationId": location_id,
+            "location": location_name,
+            "phase": "comparing",
+            "compareStep": f"{new_count:,} new, {changed_count:,} changed — finding stale files...",
+        })
         stale_ids = await conn.execute_fetchall(
             "SELECT c.id, c.folder_id, c.file_size, c.file_type_high, c.hidden "
             "FROM main.files c "

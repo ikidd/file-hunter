@@ -985,8 +985,9 @@ WS.on('scan_progress', (msg) => {
         statusText = `${msg.location} — Hashing: ${done.toLocaleString()} / ${total.toLocaleString()}${pct}`;
         logText = `${msg.location} — ${done.toLocaleString()} / ${total.toLocaleString()} hashed`;
     } else if (msg.phase === 'comparing') {
-        statusText = `${msg.location} — Comparing catalog...`;
-        logText = `${msg.location} — comparing catalog`;
+        const step = msg.compareStep || '';
+        statusText = `${msg.location} — Comparing: ${step || 'starting...'}`;
+        logText = `${msg.location} — comparing: ${step || 'starting'}`;
     } else if (msg.phase === 'cataloging') {
         const total = msg.catalogTotal || 0;
         const done = msg.catalogDone || 0;
