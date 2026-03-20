@@ -143,6 +143,11 @@ async def on_startup():
     await init_hashes_db()
     _elapsed("hashes db ready")
 
+    from file_hunter.stats_db import init_stats_db
+
+    await init_stats_db()
+    _elapsed("stats db ready")
+
     # Local agent is created by preflight.py before the server starts.
     # If somehow missed (e.g. manual startup), create it now.
     from file_hunter.services.agents import ensure_local_agent
@@ -234,6 +239,10 @@ async def on_shutdown():
     from file_hunter.hashes_db import close_hashes_db
 
     await close_hashes_db()
+
+    from file_hunter.stats_db import close_stats_db
+
+    await close_stats_db()
 
 
 app = Starlette(
