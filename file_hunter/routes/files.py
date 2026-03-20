@@ -212,8 +212,7 @@ async def file_verify(request: Request):
 
     async with read_db() as db:
         row = await db.execute_fetchall(
-            """SELECT f.id, f.filename, f.full_path, f.location_id,
-                      f.hash_fast, f.hash_strong, l.root_path
+            """SELECT f.id, f.filename, f.full_path, f.location_id, l.root_path
                FROM files f
                JOIN locations l ON l.id = f.location_id
                WHERE f.id = ?""",
@@ -222,9 +221,13 @@ async def file_verify(request: Request):
         if not row:
             return json_error("File not found.", 404)
 
-        f = row[0]
-        if f["hash_strong"]:
-            # Already verified — just return detail
+        f = dict(row[0])
+
+        # Check hashes from hashes.db
+        from file_hunter.hashes_db import get_file_hashes
+        h_map = await get_file_hashes([file_id])
+        h = h_map.get(file_id, {})
+        if h.get("hash_strong"):
             detail = await get_file_detail(db, file_id)
             return json_ok(detail)
 
@@ -264,7 +267,7 @@ async def file_verify(request: Request):
     # Recalc dup counts: new hash_strong group + old hash_fast group
     from file_hunter.services.dup_counts import submit_hashes_for_recalc
 
-    old_hash_fast = f["hash_fast"]
+    old_hash_fast = h.get("hash_fast")
     submit_hashes_for_recalc(
         strong_hashes={hash_strong},
         fast_hashes={old_hash_fast} if old_hash_fast else None,

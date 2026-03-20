@@ -84,7 +84,7 @@ async def drain_pending_ops(location_id: int, root_path: str):
             # Re-read file — it may have been cancelled or changed
             async with read_db() as db:
                 file_row = await db.execute_fetchall(
-                    "SELECT id, full_path, filename, hash_fast, hash_strong, "
+                    "SELECT id, full_path, filename, "
                     "location_id, folder_id, file_size, file_type_high, hidden, "
                     "pending_op FROM files WHERE id = ?",
                     (file_id,),
@@ -114,10 +114,12 @@ async def drain_pending_ops(location_id: int, root_path: str):
 
             if op_type == "delete":
                 await _drain_delete(f, op_id, now_iso)
-                if f["hash_strong"]:
-                    affected_strong.add(f["hash_strong"])
-                elif f["hash_fast"]:
-                    affected_fast.add(f["hash_fast"])
+                from file_hunter.hashes_db import get_file_hashes as _gfh
+                _h = (await _gfh([file_id])).get(file_id, {})
+                if _h.get("hash_strong"):
+                    affected_strong.add(_h["hash_strong"])
+                elif _h.get("hash_fast"):
+                    affected_fast.add(_h["hash_fast"])
 
             elif op_type == "move":
                 dst_location_id = await _drain_move(f, params, op_id, now_iso)
@@ -281,9 +283,12 @@ async def _drain_verify(f, op_id: int, now_iso: str) -> dict | None:
     file_id = f["id"]
     full_path = f["full_path"]
     location_id = f["location_id"]
-    old_hash_fast = f["hash_fast"]
 
-    if f["hash_strong"]:
+    from file_hunter.hashes_db import get_file_hashes as _gfh
+    _h = (await _gfh([file_id])).get(file_id, {})
+    old_hash_fast = _h.get("hash_fast")
+
+    if _h.get("hash_strong"):
         # Already verified — just clear pending_op
         async with db_writer() as wdb:
             await wdb.execute(

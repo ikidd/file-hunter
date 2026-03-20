@@ -51,11 +51,14 @@ async def run_consolidation(file_id: int, mode: str, dest_folder_id: str | None)
 
         selected = dict(rows[0])
         filename = selected["filename"]
-        hash_strong = selected["hash_strong"]
-        hash_fast = selected["hash_fast"]
+        selected_loc_id = selected["location_id"]
+
+        from file_hunter.hashes_db import get_file_hashes as _gfh
+        _h = (await _gfh([file_id])).get(file_id, {})
+        hash_strong = _h.get("hash_strong")
+        hash_fast = _h.get("hash_fast")
         effective_hash = hash_strong or hash_fast
         hash_col = "hash_strong" if hash_strong else "hash_fast"
-        selected_loc_id = selected["location_id"]
 
         if not effective_hash:
             await broadcast(
@@ -89,19 +92,29 @@ async def run_consolidation(file_id: int, mode: str, dest_folder_id: str | None)
             }
         )
 
-        # Find ALL copies by effective hash (including the selected file)
+        # Find ALL copies by effective hash from hashes.db
+        from file_hunter.hashes_db import read_hashes
+
+        async with read_hashes() as hdb:
+            dup_rows = await hdb.execute_fetchall(
+                f"SELECT file_id FROM file_hashes WHERE {hash_col} = ?",
+                (effective_hash,),
+            )
+        copy_ids = [r["file_id"] for r in dup_rows]
+
         async with read_db() as db:
+            ph = ",".join("?" for _ in copy_ids)
             all_copies = await db.execute_fetchall(
                 f"""SELECT f.id, f.filename, f.full_path, f.rel_path,
                           f.location_id, f.folder_id,
                           f.file_type_high, f.file_type_low, f.file_size,
-                          f.hash_fast, f.hash_strong, f.description, f.tags,
+                          f.description, f.tags,
                           f.created_date, f.modified_date, f.date_cataloged,
                           l.name as location_name, l.root_path
                    FROM files f
                    JOIN locations l ON l.id = f.location_id
-                   WHERE f.{hash_col} = ?""",
-                (effective_hash,),
+                   WHERE f.id IN ({ph})""",
+                copy_ids,
             )
         all_copies = [dict(r) for r in all_copies]
 

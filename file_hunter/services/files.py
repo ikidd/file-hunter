@@ -114,12 +114,11 @@ async def list_files(
     )
     total = count_row[0]["cnt"] if count_row else 0
 
-    # Fetch paged files (include full_path + root_path for missing check)
+    # Fetch paged files (structural data only — hashes come from hashes.db)
     files = await db.execute_fetchall(
         f"""SELECT f.id, f.filename, f.file_type_high, f.file_type_low,
                    f.file_size, f.modified_date, f.full_path,
-                   f.hash_fast, f.hash_strong, f.stale, f.dup_count, f.hidden,
-                   f.pending_op, l.root_path
+                   f.stale, f.hidden, f.pending_op, l.root_path
             FROM files f
             JOIN locations l ON l.id = f.location_id
             WHERE {where}
@@ -146,36 +145,44 @@ async def list_files(
         for fld in folders
     ]
 
+    # Fetch hash data from hashes.db
+    from file_hunter.hashes_db import get_file_hashes
     from file_hunter.services.dup_counts import batch_dup_counts
 
-    strong_list = [f["hash_strong"] for f in files if f["hash_strong"]]
+    file_ids = [f["id"] for f in files]
+    hash_map = await get_file_hashes(file_ids)
+
+    strong_list = [h["hash_strong"] for h in hash_map.values() if h["hash_strong"]]
     fast_list = [
-        f["hash_fast"] for f in files if not f["hash_strong"] and f["hash_fast"]
+        h["hash_fast"] for h in hash_map.values()
+        if not h["hash_strong"] and h["hash_fast"]
     ]
     live_dups = await batch_dup_counts(
         strong_hashes=strong_list, fast_hashes=fast_list
     )
 
-    file_items = [
-        {
+    file_items = []
+    for f in files:
+        h = hash_map.get(f["id"], {})
+        hs = h.get("hash_strong")
+        hf = h.get("hash_fast")
+        file_items.append({
             "id": f["id"],
             "name": f["filename"],
             "typeHigh": f["file_type_high"],
             "typeLow": f["file_type_low"],
             "size": f["file_size"],
             "date": f["modified_date"],
-            "dups": live_dups.get(f["hash_strong"] or f["hash_fast"], 0),
-            "hashStrong": f["hash_strong"],
-            "hashFast": f["hash_fast"],
+            "dups": live_dups.get(hs or hf, 0),
+            "hashStrong": hs,
+            "hashFast": hf,
             "stale": bool(f["stale"]) and f["id"] not in unstale_set,
             "missing": False
             if (f["stale"] and f["id"] not in unstale_set)
             else f["id"] in missing_file_ids,
             "hidden": bool(f["hidden"]),
             "pendingOp": f["pending_op"],
-        }
-        for f in files
-    ]
+        })
 
     # Build breadcrumb for folder navigation
     breadcrumb = []
@@ -226,7 +233,11 @@ async def list_files(
 async def get_file_detail(db, file_id: int):
     """Return full file detail with duplicates."""
     row = await db.execute_fetchall(
-        """SELECT f.*, l.name as location_name, l.root_path as location_root_path
+        """SELECT f.id, f.filename, f.full_path, f.rel_path, f.location_id,
+                  f.folder_id, f.file_type_high, f.file_type_low, f.file_size,
+                  f.description, f.tags, f.created_date, f.modified_date,
+                  f.date_cataloged, f.date_last_seen, f.stale, f.hidden, f.pending_op,
+                  l.name as location_name, l.root_path as location_root_path
            FROM files f
            JOIN locations l ON l.id = f.location_id
            WHERE f.id = ?""",
@@ -236,35 +247,56 @@ async def get_file_detail(db, file_id: int):
         return None
     f = dict(row[0])
 
-    # Find duplicates — use hash_strong if available, else hash_fast
+    # Hash data from hashes.db
+    from file_hunter.hashes_db import get_file_hashes
+
+    hash_map = await get_file_hashes([file_id])
+    h = hash_map.get(file_id, {})
+    hash_partial = h.get("hash_partial")
+    hash_fast = h.get("hash_fast")
+    hash_strong = h.get("hash_strong")
+
+    # Find duplicates from hashes.db — use hash_strong if available, else hash_fast
     dups = []
     dup_total = 0
-    effective_hash = f["hash_strong"] or f["hash_fast"]
-    hash_col = "hash_strong" if f["hash_strong"] else "hash_fast"
+    effective_hash = hash_strong or hash_fast
+    hash_col = "hash_strong" if hash_strong else "hash_fast"
     if effective_hash:
-        count_row = await db.execute_fetchall(
-            f"SELECT COUNT(*) as cnt FROM files "
-            f"WHERE {hash_col} = ? AND id != ? AND stale = 0 AND dup_exclude = 0",
-            (effective_hash, file_id),
-        )
-        dup_total = count_row[0]["cnt"] if count_row else 0
+        from file_hunter.hashes_db import read_hashes
 
-        dup_rows = await db.execute_fetchall(
-            f"SELECT f2.id, f2.filename, f2.rel_path, l.name as location_name "
-            f"FROM files f2 "
-            f"JOIN locations l ON l.id = f2.location_id "
-            f"WHERE f2.{hash_col} = ? AND f2.id != ? AND f2.stale = 0 AND f2.dup_exclude = 0 "
-            f"LIMIT 10",
-            (effective_hash, file_id),
-        )
-        for d in dup_rows:
-            dups.append(
-                {
-                    "fileId": d["id"],
-                    "location": d["location_name"],
-                    "path": f"/{d['rel_path']}",
-                }
+        async with read_hashes() as hdb:
+            count_row = await hdb.execute_fetchall(
+                f"SELECT COUNT(*) as cnt FROM file_hashes "
+                f"WHERE {hash_col} = ? AND file_id != ?",
+                (effective_hash, file_id),
             )
+            dup_total = count_row[0]["cnt"] if count_row else 0
+
+            dup_file_rows = await hdb.execute_fetchall(
+                f"SELECT file_id FROM file_hashes "
+                f"WHERE {hash_col} = ? AND file_id != ? LIMIT 10",
+                (effective_hash, file_id),
+            )
+
+        # Fetch file info from catalog for the dup file IDs
+        if dup_file_rows:
+            dup_ids = [r["file_id"] for r in dup_file_rows]
+            ph = ",".join("?" for _ in dup_ids)
+            dup_rows = await db.execute_fetchall(
+                f"SELECT f2.id, f2.filename, f2.rel_path, l.name as location_name "
+                f"FROM files f2 "
+                f"JOIN locations l ON l.id = f2.location_id "
+                f"WHERE f2.id IN ({ph})",
+                dup_ids,
+            )
+            for d in dup_rows:
+                dups.append(
+                    {
+                        "fileId": d["id"],
+                        "location": d["location_name"],
+                        "path": f"/{d['rel_path']}",
+                    }
+                )
 
     tags = [t.strip() for t in f["tags"].split(",") if t.strip()] if f["tags"] else []
 
@@ -323,10 +355,10 @@ async def get_file_detail(db, file_id: int):
         "created": f["created_date"],
         "cataloged": f["date_cataloged"],
         "lastSeen": f["date_last_seen"],
-        "hashPartial": f["hash_partial"],
-        "hashFast": f["hash_fast"],
-        "hashStrong": f["hash_strong"],
-        "verified": bool(f["hash_strong"]),
+        "hashPartial": hash_partial,
+        "hashFast": hash_fast,
+        "hashStrong": hash_strong,
+        "verified": bool(hash_strong),
         "stale": stale,
         "pendingOp": f.get("pending_op"),
         "description": f["description"] or "",

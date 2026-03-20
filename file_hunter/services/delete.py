@@ -10,7 +10,7 @@ async def delete_file(db, file_id: int) -> dict:
     row = await db.execute_fetchall(
         """SELECT f.id, f.filename, f.full_path, f.location_id,
                   f.folder_id, f.file_size, f.file_type_high, f.hidden,
-                  f.hash_fast, f.hash_strong, l.root_path
+                  l.root_path
            FROM files f
            JOIN locations l ON l.id = f.location_id
            WHERE f.id = ?""",
@@ -24,8 +24,13 @@ async def delete_file(db, file_id: int) -> dict:
     full_path = rec["full_path"]
     root_path = rec["root_path"]
     location_id = rec["location_id"]
-    hash_fast = rec["hash_fast"]
-    hash_strong = rec["hash_strong"]
+
+    # Get hash values from hashes.db for dup recalc
+    from file_hunter.hashes_db import get_file_hashes
+    h_map = await get_file_hashes([file_id])
+    h = h_map.get(file_id, {})
+    hash_fast = h.get("hash_fast")
+    hash_strong = h.get("hash_strong")
 
     # Check if location is online
     online = await fs.dir_exists(root_path, location_id)
@@ -82,18 +87,21 @@ async def delete_file(db, file_id: int) -> dict:
 
 async def delete_file_and_duplicates(db, file_id: int) -> dict:
     """Delete a file and all its duplicates (same hash_strong) from disk and catalog."""
-    # Look up the file's hash
+    # Look up filename from catalog, hash from hashes.db
     row = await db.execute_fetchall(
-        """SELECT f.id, f.filename, f.hash_strong, f.hash_fast
-           FROM files f WHERE f.id = ?""",
+        "SELECT id, filename FROM files WHERE id = ?",
         (file_id,),
     )
     if not row:
         return None
 
     filename = row[0]["filename"]
-    hash_strong = row[0]["hash_strong"]
-    hash_fast = row[0]["hash_fast"]
+
+    from file_hunter.hashes_db import get_file_hashes
+    h_map = await get_file_hashes([file_id])
+    h = h_map.get(file_id, {})
+    hash_strong = h.get("hash_strong")
+    hash_fast = h.get("hash_fast")
     effective_hash = hash_strong or hash_fast
     hash_col = "hash_strong" if hash_strong else "hash_fast"
 
@@ -101,14 +109,26 @@ async def delete_file_and_duplicates(db, file_id: int) -> dict:
         # No hash at all — fall back to single-file delete
         return await delete_file(db, file_id)
 
-    # Find all files with the same effective hash
+    # Find all files with the same effective hash from hashes.db
+    from file_hunter.hashes_db import read_hashes
+    async with read_hashes() as hdb:
+        dup_rows = await hdb.execute_fetchall(
+            f"SELECT file_id FROM file_hashes WHERE {hash_col} = ?",
+            (effective_hash,),
+        )
+    dup_file_ids = [r["file_id"] for r in dup_rows]
+
+    if not dup_file_ids:
+        return await delete_file(db, file_id)
+
+    ph = ",".join("?" for _ in dup_file_ids)
     all_rows = await db.execute_fetchall(
         f"""SELECT f.id, f.full_path, f.location_id, f.folder_id,
                   f.file_size, f.file_type_high, f.hidden, l.root_path
            FROM files f
            JOIN locations l ON l.id = f.location_id
-           WHERE f.{hash_col} = ?""",
-        (effective_hash,),
+           WHERE f.id IN ({ph})""",
+        dup_file_ids,
     )
 
     deleted_count = 0

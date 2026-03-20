@@ -8,7 +8,6 @@ removes anything from the catalog.
 import asyncio
 import logging
 
-from file_hunter.db import read_db
 from file_hunter.services.agent_ops import delete_agent_location, invalidate_loc_cache
 from file_hunter.services.stats import invalidate_stats_cache
 
@@ -78,9 +77,11 @@ async def _collect_affected_hashes(location_id: int) -> tuple[set[str], set[str]
     affected_fast: set[str] = set()
     affected_strong: set[str] = set()
 
-    async with read_db() as rdb:
-        fast_rows = await rdb.execute_fetchall(
-            "SELECT DISTINCT hash_fast FROM files "
+    from file_hunter.hashes_db import read_hashes
+
+    async with read_hashes() as hdb:
+        fast_rows = await hdb.execute_fetchall(
+            "SELECT DISTINCT hash_fast FROM file_hashes "
             "WHERE location_id = ? AND dup_count > 0 "
             "AND hash_fast IS NOT NULL AND hash_fast != ''",
             (location_id,),
@@ -88,8 +89,8 @@ async def _collect_affected_hashes(location_id: int) -> tuple[set[str], set[str]
         for r in fast_rows:
             affected_fast.add(r["hash_fast"])
 
-        strong_rows = await rdb.execute_fetchall(
-            "SELECT DISTINCT hash_strong FROM files "
+        strong_rows = await hdb.execute_fetchall(
+            "SELECT DISTINCT hash_strong FROM file_hashes "
             "WHERE location_id = ? AND dup_count > 0 "
             "AND hash_strong IS NOT NULL AND hash_strong != ''",
             (location_id,),

@@ -131,6 +131,34 @@ async def read_hashes():
         await conn.close()
 
 
+async def get_file_hashes(file_ids: list[int]) -> dict[int, dict]:
+    """Fetch hash data from hashes.db for a batch of file IDs.
+
+    Returns {file_id: {hash_partial, hash_fast, hash_strong, dup_count}}.
+    Missing IDs are omitted from the result.
+    """
+    if not file_ids:
+        return {}
+    result: dict[int, dict] = {}
+    async with read_hashes() as hdb:
+        for i in range(0, len(file_ids), 500):
+            batch = file_ids[i : i + 500]
+            ph = ",".join("?" for _ in batch)
+            rows = await hdb.execute_fetchall(
+                f"SELECT file_id, hash_partial, hash_fast, hash_strong, dup_count "
+                f"FROM file_hashes WHERE file_id IN ({ph})",
+                batch,
+            )
+            for r in rows:
+                result[r["file_id"]] = {
+                    "hash_partial": r["hash_partial"],
+                    "hash_fast": r["hash_fast"],
+                    "hash_strong": r["hash_strong"],
+                    "dup_count": r["dup_count"],
+                }
+    return result
+
+
 async def remove_file_hashes(file_ids: list[int]):
     """Remove entries from hashes.db for deleted/stale/excluded files.
 

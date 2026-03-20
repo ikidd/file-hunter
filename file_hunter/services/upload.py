@@ -41,14 +41,22 @@ async def run_upload(
             )
 
             # Check for existing file with same strong hash (read)
-            async with read_db() as db:
-                rows = await db.execute_fetchall(
-                    """SELECT f.id, f.filename, f.full_path, l.name as location_name
-                       FROM files f
-                       JOIN locations l ON l.id = f.location_id
-                       WHERE f.hash_strong = ? LIMIT 1""",
+            from file_hunter.hashes_db import read_hashes
+            async with read_hashes() as hdb:
+                hash_rows = await hdb.execute_fetchall(
+                    "SELECT file_id FROM file_hashes WHERE hash_strong = ? LIMIT 1",
                     (hash_strong,),
                 )
+            rows = []
+            if hash_rows:
+                async with read_db() as db:
+                    rows = await db.execute_fetchall(
+                        """SELECT f.id, f.filename, f.full_path, l.name as location_name
+                           FROM files f
+                           JOIN locations l ON l.id = f.location_id
+                           WHERE f.id = ?""",
+                        (hash_rows[0]["file_id"],),
+                    )
 
             if rows:
                 # Duplicate — remove uploaded file, write .moved stub

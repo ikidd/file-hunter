@@ -211,12 +211,11 @@ async def search_files(
         )
         total = count_row[0]["cnt"] if count_row else 0
 
-        # Fetch paged results (include full_path + root_path for missing check)
+        # Fetch paged results (structural data — hashes from hashes.db)
         rows = await db.execute_fetchall(
             f"""SELECT f.id, f.filename, f.file_type_high, f.file_type_low,
                        f.file_size, f.modified_date, f.full_path,
-                       f.hash_fast, f.hash_strong, f.stale, f.location_id, f.dup_count,
-                       f.hidden, l.root_path
+                       f.stale, f.location_id, f.hidden, l.root_path
                 FROM files f
                 JOIN locations l ON l.id = f.location_id
                 WHERE {where}
@@ -228,33 +227,40 @@ async def search_files(
         # All locations are agent-backed — no local file existence checks
         missing_set = set()
 
+        from file_hunter.hashes_db import get_file_hashes
         from file_hunter.services.dup_counts import batch_dup_counts
 
-        strong_list = [r["hash_strong"] for r in rows if r["hash_strong"]]
+        file_ids = [r["id"] for r in rows]
+        hash_map = await get_file_hashes(file_ids)
+
+        strong_list = [h["hash_strong"] for h in hash_map.values() if h["hash_strong"]]
         fast_list = [
-            r["hash_fast"] for r in rows if not r["hash_strong"] and r["hash_fast"]
+            h["hash_fast"] for h in hash_map.values()
+            if not h["hash_strong"] and h["hash_fast"]
         ]
         live_dups = await batch_dup_counts(
             strong_hashes=strong_list, fast_hashes=fast_list
         )
 
-        items = [
-            {
+        items = []
+        for r in rows:
+            h = hash_map.get(r["id"], {})
+            hs = h.get("hash_strong")
+            hf = h.get("hash_fast")
+            items.append({
                 "id": r["id"],
                 "name": r["filename"],
                 "typeHigh": r["file_type_high"],
                 "typeLow": r["file_type_low"],
                 "size": r["file_size"],
                 "date": r["modified_date"],
-                "dups": live_dups.get(r["hash_strong"] or r["hash_fast"], 0),
-                "hashStrong": r["hash_strong"],
-                "hashFast": r["hash_fast"],
+                "dups": live_dups.get(hs or hf, 0),
+                "hashStrong": hs,
+                "hashFast": hf,
                 "stale": bool(r["stale"]),
                 "missing": False if r["stale"] else r["id"] in missing_set,
                 "hidden": bool(r["hidden"]),
-            }
-            for r in rows
-        ]
+            })
 
     # Folder search (name filter only)
     folders = []
@@ -520,8 +526,7 @@ async def search_files_advanced(
         rows = await db.execute_fetchall(
             f"""SELECT f.id, f.filename, f.file_type_high, f.file_type_low,
                        f.file_size, f.modified_date, f.full_path,
-                       f.hash_fast, f.hash_strong, f.stale, f.location_id, f.dup_count,
-                       f.hidden, l.root_path
+                       f.stale, f.location_id, f.hidden, l.root_path
                 FROM files f
                 JOIN locations l ON l.id = f.location_id
                 WHERE {where}
@@ -530,36 +535,41 @@ async def search_files_advanced(
             where_params + [PAGE_SIZE, offset],
         )
 
-        # All locations are agent-backed — no local file existence checks
         missing_set = set()
 
+        from file_hunter.hashes_db import get_file_hashes
         from file_hunter.services.dup_counts import batch_dup_counts
 
-        strong_list = [r["hash_strong"] for r in rows if r["hash_strong"]]
+        file_ids = [r["id"] for r in rows]
+        hash_map = await get_file_hashes(file_ids)
+
+        strong_list = [h["hash_strong"] for h in hash_map.values() if h["hash_strong"]]
         fast_list = [
-            r["hash_fast"] for r in rows if not r["hash_strong"] and r["hash_fast"]
+            h["hash_fast"] for h in hash_map.values()
+            if not h["hash_strong"] and h["hash_fast"]
         ]
         live_dups = await batch_dup_counts(
             strong_hashes=strong_list, fast_hashes=fast_list
         )
 
-        items = [
-            {
+        for r in rows:
+            h = hash_map.get(r["id"], {})
+            hs = h.get("hash_strong")
+            hf = h.get("hash_fast")
+            items.append({
                 "id": r["id"],
                 "name": r["filename"],
                 "typeHigh": r["file_type_high"],
                 "typeLow": r["file_type_low"],
                 "size": r["file_size"],
                 "date": r["modified_date"],
-                "dups": live_dups.get(r["hash_strong"] or r["hash_fast"], 0),
-                "hashStrong": r["hash_strong"],
-                "hashFast": r["hash_fast"],
+                "dups": live_dups.get(hs or hf, 0),
+                "hashStrong": hs,
+                "hashFast": hf,
                 "stale": bool(r["stale"]),
                 "missing": False if r["stale"] else r["id"] in missing_set,
                 "hidden": bool(r["hidden"]),
-            }
-            for r in rows
-        ]
+            })
 
     # Folder search — apply name conditions to folder name
     folders = []

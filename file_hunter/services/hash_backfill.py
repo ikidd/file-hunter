@@ -383,30 +383,47 @@ async def _backfill_agents(
         "Cross-agent backfill: querying candidates for location %d", agent_location_id
     )
 
-    db = await open_connection()
+    from file_hunter.hashes_db import open_hashes_connection
+
+    hconn = await open_hashes_connection()
     try:
-        rows = await db.execute_fetchall(
-            """SELECT f.id, f.full_path, f.location_id
-               FROM files f
-               WHERE f.hash_fast IS NULL
-                 AND f.hash_partial IS NOT NULL
-                 AND f.file_size > 0
-                 AND f.stale = 0
-                 AND f.location_id != ?
+        rows = await hconn.execute_fetchall(
+            """SELECT fh.file_id as id, fh.location_id
+               FROM file_hashes fh
+               WHERE fh.hash_fast IS NULL
+                 AND fh.hash_partial IS NOT NULL
+                 AND fh.file_size > 0
+                 AND fh.location_id != ?
                  AND EXISTS (
-                     SELECT 1 FROM files f2
-                     WHERE f2.location_id = ?
-                       AND f2.file_size = f.file_size
-                       AND f2.hash_partial = f.hash_partial
-                       AND f2.hash_fast IS NOT NULL
-                 )
-                 AND f.location_id IN (
-                     SELECT id FROM locations WHERE agent_id IS NOT NULL
+                     SELECT 1 FROM file_hashes fh2
+                     WHERE fh2.location_id = ?
+                       AND fh2.file_size = fh.file_size
+                       AND fh2.hash_partial = fh.hash_partial
+                       AND fh2.hash_fast IS NOT NULL
                  )""",
             (agent_location_id, agent_location_id),
         )
     finally:
-        await db.close()
+        await hconn.close()
+
+    # Fetch full_path from catalog for candidates
+    if rows:
+        file_ids = [r["id"] for r in rows]
+        db = await open_connection()
+        try:
+            ph = ",".join("?" for _ in file_ids)
+            path_rows = await db.execute_fetchall(
+                f"SELECT id, full_path, location_id FROM files WHERE id IN ({ph})",
+                file_ids,
+            )
+        finally:
+            await db.close()
+        path_map = {r["id"]: r for r in path_rows}
+        rows = [
+            {"id": r["id"], "full_path": path_map[r["id"]]["full_path"],
+             "location_id": r["location_id"]}
+            for r in rows if r["id"] in path_map
+        ]
 
     if not rows:
         logger.info("Cross-agent backfill: no candidates found")
