@@ -254,13 +254,15 @@ async def run_scan(op_id: int, agent_id: int, params: dict):
 
         invalidate_stats_cache()
 
-        async with read_db() as rdb:
-            loc_row = await rdb.execute_fetchall(
-                "SELECT duplicate_count, total_size FROM locations WHERE id = ?",
+        from file_hunter.stats_db import read_stats as read_stats_db
+
+        async with read_stats_db() as sdb:
+            loc_stats = await sdb.execute_fetchall(
+                "SELECT duplicate_count, total_size FROM location_stats WHERE location_id = ?",
                 (location_id,),
             )
-        final_dup_count = (loc_row[0]["duplicate_count"] or 0) if loc_row else 0
-        final_total_size = (loc_row[0]["total_size"] or 0) if loc_row else 0
+        final_dup_count = (loc_stats[0]["duplicate_count"] or 0) if loc_stats else 0
+        final_total_size = (loc_stats[0]["total_size"] or 0) if loc_stats else 0
 
         await broadcast(
             {

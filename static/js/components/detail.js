@@ -155,8 +155,12 @@ const Detail = {
         }
 
         // Location view — patch location counters
+        // Skip if this location is currently scanning — scan_progress has
+        // real-time data, the API would overwrite with stale values
         if (!this._currentLocationNode) return;
         const locId = String(this._currentLocationNode.id).replace('loc-', '');
+        if (Tree._scanningLocations.has('loc-' + locId)) return;
+
         const res = await API.get(`/api/locations/${locId}/stats`);
         if (!res.ok) return;
         const s = res.data;
