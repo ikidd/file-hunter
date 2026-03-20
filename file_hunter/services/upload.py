@@ -44,7 +44,7 @@ async def run_upload(
             from file_hunter.hashes_db import read_hashes
             async with read_hashes() as hdb:
                 hash_rows = await hdb.execute_fetchall(
-                    "SELECT file_id FROM file_hashes WHERE hash_strong = ? LIMIT 1",
+                    "SELECT file_id FROM active_hashes WHERE hash_strong = ? LIMIT 1",
                     (hash_strong,),
                 )
             rows = []

@@ -81,7 +81,7 @@ async def _collect_affected_hashes(location_id: int) -> tuple[set[str], set[str]
 
     async with read_hashes() as hdb:
         fast_rows = await hdb.execute_fetchall(
-            "SELECT DISTINCT hash_fast FROM file_hashes "
+            "SELECT DISTINCT hash_fast FROM active_hashes "
             "WHERE location_id = ? AND dup_count > 0 "
             "AND hash_fast IS NOT NULL AND hash_fast != ''",
             (location_id,),
@@ -90,7 +90,7 @@ async def _collect_affected_hashes(location_id: int) -> tuple[set[str], set[str]
             affected_fast.add(r["hash_fast"])
 
         strong_rows = await hdb.execute_fetchall(
-            "SELECT DISTINCT hash_strong FROM file_hashes "
+            "SELECT DISTINCT hash_strong FROM active_hashes "
             "WHERE location_id = ? AND dup_count > 0 "
             "AND hash_strong IS NOT NULL AND hash_strong != ''",
             (location_id,),

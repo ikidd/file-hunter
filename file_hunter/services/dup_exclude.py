@@ -248,15 +248,16 @@ async def toggle_dup_exclude(folder_id: int, exclude: bool):
 
             await asyncio.sleep(0)
 
-        # Update hashes.db: excluding removes from hashes, un-excluding re-adds
-        if flag == 1:
-            # Excluding — remove from hashes.db
-            from file_hunter.hashes_db import remove_file_hashes
-            await remove_file_hashes(all_file_ids)
-        else:
-            # Un-excluding — re-register in hashes.db
-            from file_hunter.services.scan import _register_hashes_for_location
-            await _register_hashes_for_location(location_id, f"location {location_id}")
+        # Toggle excluded flag in hashes.db — preserves hash data
+        from file_hunter.hashes_db import hashes_writer
+        for i in range(0, len(all_file_ids), 500):
+            batch = all_file_ids[i : i + 500]
+            ph = ",".join("?" for _ in batch)
+            async with hashes_writer() as hdb:
+                await hdb.execute(
+                    f"UPDATE file_hashes SET excluded = ? WHERE file_id IN ({ph})",
+                    [flag] + batch,
+                )
 
         invalidate_stats_cache()
         await broadcast({"type": "stats_changed"})

@@ -113,7 +113,7 @@ async def delete_file_and_duplicates(db, file_id: int) -> dict:
     from file_hunter.hashes_db import read_hashes
     async with read_hashes() as hdb:
         dup_rows = await hdb.execute_fetchall(
-            f"SELECT file_id FROM file_hashes WHERE {hash_col} = ?",
+            f"SELECT file_id FROM active_hashes WHERE {hash_col} = ?",
             (effective_hash,),
         )
     dup_file_ids = [r["file_id"] for r in dup_rows]

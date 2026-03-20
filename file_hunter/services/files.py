@@ -266,14 +266,14 @@ async def get_file_detail(db, file_id: int):
 
         async with read_hashes() as hdb:
             count_row = await hdb.execute_fetchall(
-                f"SELECT COUNT(*) as cnt FROM file_hashes "
+                f"SELECT COUNT(*) as cnt FROM active_hashes "
                 f"WHERE {hash_col} = ? AND file_id != ?",
                 (effective_hash, file_id),
             )
             dup_total = count_row[0]["cnt"] if count_row else 0
 
             dup_file_rows = await hdb.execute_fetchall(
-                f"SELECT file_id FROM file_hashes "
+                f"SELECT file_id FROM active_hashes "
                 f"WHERE {hash_col} = ? AND file_id != ? LIMIT 10",
                 (effective_hash, file_id),
             )

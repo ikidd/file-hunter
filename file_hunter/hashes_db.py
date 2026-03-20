@@ -28,7 +28,8 @@ CREATE TABLE IF NOT EXISTS file_hashes (
     hash_partial TEXT,
     hash_fast TEXT,
     hash_strong TEXT,
-    dup_count INTEGER NOT NULL DEFAULT 0
+    dup_count INTEGER NOT NULL DEFAULT 0,
+    excluded INTEGER NOT NULL DEFAULT 0
 );
 
 CREATE INDEX IF NOT EXISTS idx_hashes_size_partial
@@ -39,6 +40,9 @@ CREATE INDEX IF NOT EXISTS idx_hashes_strong
     ON file_hashes(hash_strong);
 CREATE INDEX IF NOT EXISTS idx_hashes_location
     ON file_hashes(location_id);
+
+CREATE VIEW IF NOT EXISTS active_hashes AS
+    SELECT * FROM file_hashes WHERE excluded = 0;
 """
 
 
@@ -66,6 +70,16 @@ async def init_hashes_db():
             if stmt:
                 await conn.execute(stmt)
         await conn.commit()
+
+        # Column migration (idempotent)
+        import sqlite3 as _sqlite3
+        try:
+            await conn.execute(
+                "ALTER TABLE file_hashes ADD COLUMN excluded INTEGER NOT NULL DEFAULT 0"
+            )
+            await conn.commit()
+        except _sqlite3.OperationalError:
+            pass  # column already exists
     finally:
         await conn.close()
 

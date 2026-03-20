@@ -9,9 +9,9 @@ Dual-hash support: files with hash_strong use hash_strong for dup grouping.
 Files without hash_strong use hash_fast. The dup_count on each file_hashes
 row reflects duplicates found via its effective hash.
 
-The hashes DB only contains active, non-excluded files. Stale and
-dup_exclude files are removed from hashes.db rather than filtered at
-query time.
+Excluded files are flagged in file_hashes (excluded=1) and filtered
+via the active_hashes view. All read queries use active_hashes;
+writes target file_hashes directly.
 """
 
 import asyncio
@@ -72,7 +72,7 @@ async def _batched_recalc(
         await conn.commit()
 
         rows = await conn.execute_fetchall(
-            f"SELECT f.{hash_column} FROM file_hashes f "
+            f"SELECT f.{hash_column} FROM active_hashes f "
             f"INNER JOIN _recalc_hashes h ON f.{hash_column} = h.hash_val"
         )
     finally:
@@ -161,7 +161,7 @@ async def full_dup_recount(
                 await conn.execute("CREATE TEMP TABLE _recount_hashes (hash_val TEXT)")
                 await conn.execute(
                     f"INSERT INTO _recount_hashes "
-                    f"SELECT DISTINCT {hash_column} FROM file_hashes "
+                    f"SELECT DISTINCT {hash_column} FROM active_hashes "
                     f"WHERE location_id = ? AND {hash_column} IS NOT NULL "
                     f"AND {hash_column} != ''",
                     (location_id,),
@@ -173,7 +173,7 @@ async def full_dup_recount(
 
                 rows = await conn.execute_fetchall(
                     f"SELECT f.{hash_column} as hash_val, COUNT(*) as cnt "
-                    f"FROM file_hashes f "
+                    f"FROM active_hashes f "
                     f"INNER JOIN _recount_hashes h ON f.{hash_column} = h.hash_val "
                     f"GROUP BY f.{hash_column}"
                 )
@@ -181,7 +181,7 @@ async def full_dup_recount(
             else:
                 rows = await conn.execute_fetchall(
                     f"SELECT {hash_column} as hash_val, COUNT(*) as cnt "
-                    f"FROM file_hashes "
+                    f"FROM active_hashes "
                     f"WHERE {hash_column} IS NOT NULL AND {hash_column} != ''"
                     f"{update_extra} "
                     f"GROUP BY {hash_column}"
@@ -290,7 +290,7 @@ async def optimized_dup_recount(
                 await conn.execute("CREATE TEMP TABLE _recount_hashes (hash_val TEXT)")
                 await conn.execute(
                     f"INSERT INTO _recount_hashes "
-                    f"SELECT DISTINCT {hash_column} FROM file_hashes "
+                    f"SELECT DISTINCT {hash_column} FROM active_hashes "
                     f"WHERE location_id = ? AND {hash_column} IS NOT NULL "
                     f"AND {hash_column} != ''",
                     (location_id,),
@@ -301,13 +301,13 @@ async def optimized_dup_recount(
                 await conn.commit()
 
                 rows = await conn.execute_fetchall(
-                    f"SELECT f.{hash_column} FROM file_hashes f "
+                    f"SELECT f.{hash_column} FROM active_hashes f "
                     f"INNER JOIN _recount_hashes h ON f.{hash_column} = h.hash_val"
                 )
                 await conn.execute("DROP TABLE IF EXISTS _recount_hashes")
             else:
                 rows = await conn.execute_fetchall(
-                    f"SELECT {hash_column} FROM file_hashes "
+                    f"SELECT {hash_column} FROM active_hashes "
                     f"WHERE {hash_column} IS NOT NULL AND {hash_column} != ''"
                     f"{update_extra}"
                 )
@@ -474,7 +474,7 @@ async def _dup_recalc_writer():
                     h_list = list(merged_strong)
                     h_ph = ",".join("?" for _ in h_list)
                     rows = await hdb.execute_fetchall(
-                        f"SELECT DISTINCT location_id FROM file_hashes WHERE hash_strong IN ({h_ph})",
+                        f"SELECT DISTINCT location_id FROM active_hashes WHERE hash_strong IN ({h_ph})",
                         h_list,
                     )
                     affected |= {r["location_id"] for r in rows}
@@ -483,7 +483,7 @@ async def _dup_recalc_writer():
                     h_list = list(merged_fast)
                     h_ph = ",".join("?" for _ in h_list)
                     rows = await hdb.execute_fetchall(
-                        f"SELECT DISTINCT location_id FROM file_hashes WHERE hash_fast IN ({h_ph})",
+                        f"SELECT DISTINCT location_id FROM active_hashes WHERE hash_fast IN ({h_ph})",
                         h_list,
                     )
                     affected |= {r["location_id"] for r in rows}
@@ -529,7 +529,7 @@ async def find_dup_candidates(
             )
             await conn.execute(
                 "INSERT INTO _dup_pairs "
-                "SELECT DISTINCT hash_partial, file_size FROM file_hashes "
+                "SELECT DISTINCT hash_partial, file_size FROM active_hashes "
                 "WHERE location_id = ? AND hash_partial IS NOT NULL "
                 "AND file_size > 0",
                 (location_id,),
@@ -540,14 +540,14 @@ async def find_dup_candidates(
             await conn.commit()
 
             rows = await conn.execute_fetchall(
-                "SELECT f.hash_partial, f.file_size FROM file_hashes f "
+                "SELECT f.hash_partial, f.file_size FROM active_hashes f "
                 "INNER JOIN _dup_pairs p "
                 "ON f.hash_partial = p.hash_partial AND f.file_size = p.file_size"
             )
             await conn.execute("DROP TABLE IF EXISTS _dup_pairs")
         else:
             rows = await conn.execute_fetchall(
-                "SELECT hash_partial, file_size FROM file_hashes "
+                "SELECT hash_partial, file_size FROM active_hashes "
                 "WHERE hash_partial IS NOT NULL AND file_size > 0"
             )
 
@@ -588,7 +588,7 @@ async def find_dup_candidates(
 
         candidate_rows = await conn.execute_fetchall(
             "SELECT f.file_id, f.location_id, f.file_size, f.hash_partial "
-            "FROM file_hashes f "
+            "FROM active_hashes f "
             "INNER JOIN _dup_groups g "
             "ON f.hash_partial = g.hash_partial AND f.file_size = g.file_size "
             "WHERE f.hash_fast IS NULL"
@@ -667,7 +667,7 @@ async def update_location_dup_counts(location_ids: set[int]):
         loc_updates = []
         for lid in location_ids:
             rows = await conn.execute_fetchall(
-                "SELECT COUNT(*) as c FROM file_hashes "
+                "SELECT COUNT(*) as c FROM active_hashes "
                 "WHERE location_id = ? AND dup_count > 0",
                 (lid,),
             )
@@ -710,7 +710,7 @@ async def batch_dup_counts(
         if unique_strong:
             ph = ",".join("?" for _ in unique_strong)
             rows = await hdb.execute_fetchall(
-                f"""SELECT hash_strong, COUNT(*) as cnt FROM file_hashes
+                f"""SELECT hash_strong, COUNT(*) as cnt FROM active_hashes
                     WHERE hash_strong IN ({ph})
                     GROUP BY hash_strong HAVING COUNT(*) > 1""",
                 list(unique_strong),
@@ -721,7 +721,7 @@ async def batch_dup_counts(
         if unique_fast:
             ph = ",".join("?" for _ in unique_fast)
             rows = await hdb.execute_fetchall(
-                f"""SELECT hash_fast, COUNT(*) as cnt FROM file_hashes
+                f"""SELECT hash_fast, COUNT(*) as cnt FROM active_hashes
                     WHERE hash_fast IN ({ph})
                     GROUP BY hash_fast HAVING COUNT(*) > 1""",
                 list(unique_fast),
@@ -787,23 +787,23 @@ async def backfill_dup_counts():
         async with read_hashes() as hdb:
             # Quick check: any entry with dup_count=0 that actually has duplicates?
             stale_strong_check = await hdb.execute_fetchall(
-                """SELECT 1 FROM file_hashes f
+                """SELECT 1 FROM active_hashes f
                    WHERE f.hash_strong IS NOT NULL AND f.hash_strong != ''
                      AND f.dup_count = 0
                      AND EXISTS (
-                         SELECT 1 FROM file_hashes f2
+                         SELECT 1 FROM active_hashes f2
                          WHERE f2.hash_strong = f.hash_strong
                            AND f2.file_id != f.file_id
                      )
                    LIMIT 1"""
             )
             stale_fast_check = await hdb.execute_fetchall(
-                """SELECT 1 FROM file_hashes f
+                """SELECT 1 FROM active_hashes f
                    WHERE f.hash_fast IS NOT NULL AND f.hash_fast != ''
                      AND f.hash_strong IS NULL
                      AND f.dup_count = 0
                      AND EXISTS (
-                         SELECT 1 FROM file_hashes f2
+                         SELECT 1 FROM active_hashes f2
                          WHERE f2.hash_fast = f.hash_fast
                            AND f2.file_id != f.file_id
                      )
@@ -819,11 +819,11 @@ async def backfill_dup_counts():
             if stale_strong_check:
                 rows = await hdb.execute_fetchall(
                     """SELECT DISTINCT f.hash_strong
-                       FROM file_hashes f
+                       FROM active_hashes f
                        WHERE f.hash_strong IS NOT NULL AND f.hash_strong != ''
                          AND f.dup_count = 0
                          AND EXISTS (
-                             SELECT 1 FROM file_hashes f2
+                             SELECT 1 FROM active_hashes f2
                              WHERE f2.hash_strong = f.hash_strong
                                AND f2.file_id != f.file_id
                          )"""
@@ -832,11 +832,11 @@ async def backfill_dup_counts():
 
                 fp_rows = await hdb.execute_fetchall(
                     """SELECT DISTINCT f.hash_strong
-                       FROM file_hashes f
+                       FROM active_hashes f
                        WHERE f.hash_strong IS NOT NULL AND f.hash_strong != ''
                          AND f.dup_count > 0
                          AND NOT EXISTS (
-                             SELECT 1 FROM file_hashes f2
+                             SELECT 1 FROM active_hashes f2
                              WHERE f2.hash_strong = f.hash_strong
                                AND f2.file_id != f.file_id
                          )"""
@@ -847,12 +847,12 @@ async def backfill_dup_counts():
             if stale_fast_check:
                 rows = await hdb.execute_fetchall(
                     """SELECT DISTINCT f.hash_fast
-                       FROM file_hashes f
+                       FROM active_hashes f
                        WHERE f.hash_fast IS NOT NULL AND f.hash_fast != ''
                          AND f.hash_strong IS NULL
                          AND f.dup_count = 0
                          AND EXISTS (
-                             SELECT 1 FROM file_hashes f2
+                             SELECT 1 FROM active_hashes f2
                              WHERE f2.hash_fast = f.hash_fast
                                AND f2.file_id != f.file_id
                          )"""
@@ -861,12 +861,12 @@ async def backfill_dup_counts():
 
                 fp_rows = await hdb.execute_fetchall(
                     """SELECT DISTINCT f.hash_fast
-                       FROM file_hashes f
+                       FROM active_hashes f
                        WHERE f.hash_fast IS NOT NULL AND f.hash_fast != ''
                          AND f.hash_strong IS NULL
                          AND f.dup_count > 0
                          AND NOT EXISTS (
-                             SELECT 1 FROM file_hashes f2
+                             SELECT 1 FROM active_hashes f2
                              WHERE f2.hash_fast = f.hash_fast
                                AND f2.file_id != f.file_id
                          )"""

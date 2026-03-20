@@ -97,7 +97,7 @@ async def run_consolidation(file_id: int, mode: str, dest_folder_id: str | None)
 
         async with read_hashes() as hdb:
             dup_rows = await hdb.execute_fetchall(
-                f"SELECT file_id FROM file_hashes WHERE {hash_col} = ?",
+                f"SELECT file_id FROM active_hashes WHERE {hash_col} = ?",
                 (effective_hash,),
             )
         copy_ids = [r["file_id"] for r in dup_rows]

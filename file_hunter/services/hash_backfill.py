@@ -389,13 +389,13 @@ async def _backfill_agents(
     try:
         rows = await hconn.execute_fetchall(
             """SELECT fh.file_id as id, fh.location_id
-               FROM file_hashes fh
+               FROM active_hashes fh
                WHERE fh.hash_fast IS NULL
                  AND fh.hash_partial IS NOT NULL
                  AND fh.file_size > 0
                  AND fh.location_id != ?
                  AND EXISTS (
-                     SELECT 1 FROM file_hashes fh2
+                     SELECT 1 FROM active_hashes fh2
                      WHERE fh2.location_id = ?
                        AND fh2.file_size = fh.file_size
                        AND fh2.hash_partial = fh.hash_partial

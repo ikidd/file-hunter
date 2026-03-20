@@ -590,6 +590,7 @@ async def _bulk_ingest(
 
         batch = []
         batch_deltas: list[tuple] = []  # (folder_id, file_size, type_high, is_hidden)
+        batch_hashes: list[tuple] = []  # (rel_path, file_size, hash_partial)
         for r in rows:
             rel_path = r["rel_path"]
             filename = os.path.basename(rel_path)
@@ -620,10 +621,15 @@ async def _bulk_ingest(
                 is_hidden,
                 dup_exclude,
                 r["inode"],
-                r["hash_partial"],
             ))
 
             batch_deltas.append((folder_id, r["file_size"], file_type_high, is_hidden))
+
+            # Collect hash data for hashes.db
+            if r["hash_partial"] or r["file_size"] > 0:
+                batch_hashes.append((
+                    rel_path, r["file_size"], r["hash_partial"],
+                ))
 
         async with db_writer() as db:
             await db.executemany(
@@ -632,8 +638,8 @@ async def _bulk_ingest(
                 "file_type_high, file_type_low, file_size, "
                 "created_date, modified_date, "
                 "date_cataloged, date_last_seen, scan_id, "
-                "hidden, dup_exclude, inode, hash_partial) "
-                "VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?) "
+                "hidden, dup_exclude, inode) "
+                "VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?) "
                 "ON CONFLICT(location_id, rel_path) DO UPDATE SET "
                 "filename=excluded.filename, full_path=excluded.full_path, "
                 "folder_id=excluded.folder_id, "
@@ -646,23 +652,43 @@ async def _bulk_ingest(
                 "scan_id=excluded.scan_id, "
                 "hidden=excluded.hidden, "
                 "inode=excluded.inode, "
-                "stale=0, "
-                "hash_partial=CASE "
-                "  WHEN excluded.hash_partial IS NOT NULL "
-                "  THEN excluded.hash_partial "
-                "  WHEN excluded.file_size = files.file_size "
-                "    AND excluded.modified_date = files.modified_date "
-                "  THEN files.hash_partial ELSE NULL END, "
-                "hash_fast=CASE "
-                "  WHEN excluded.file_size = files.file_size "
-                "    AND excluded.modified_date = files.modified_date "
-                "  THEN hash_fast ELSE NULL END, "
-                "hash_strong=CASE "
-                "  WHEN excluded.file_size = files.file_size "
-                "    AND excluded.modified_date = files.modified_date "
-                "  THEN hash_strong ELSE NULL END",
+                "stale=0",
                 batch,
             )
+
+        # Register hashes in hashes.db directly
+        if batch_hashes:
+            # Resolve file_ids from catalog for this batch
+            rel_paths = [h[0] for h in batch_hashes]
+            hash_by_rel = {h[0]: h for h in batch_hashes}
+            async with read_db() as rdb:
+                ph = ",".join("?" for _ in rel_paths)
+                id_rows = await rdb.execute_fetchall(
+                    f"SELECT id, rel_path, file_size FROM files "
+                    f"WHERE location_id = ? AND rel_path IN ({ph})",
+                    [location_id] + rel_paths,
+                )
+            hashes_to_insert = []
+            for ir in id_rows:
+                h = hash_by_rel.get(ir["rel_path"])
+                if h:
+                    hashes_to_insert.append((
+                        ir["id"], location_id, ir["file_size"],
+                        h[2], None, None,  # hash_partial, hash_fast, hash_strong
+                    ))
+            if hashes_to_insert:
+                async with hashes_writer() as hdb:
+                    await hdb.executemany(
+                        "INSERT INTO file_hashes "
+                        "(file_id, location_id, file_size, hash_partial, hash_fast, hash_strong) "
+                        "VALUES (?, ?, ?, ?, ?, ?) "
+                        "ON CONFLICT(file_id) DO UPDATE SET "
+                        "file_size=excluded.file_size, "
+                        "hash_partial=COALESCE(excluded.hash_partial, file_hashes.hash_partial), "
+                        "hash_fast=COALESCE(excluded.hash_fast, file_hashes.hash_fast), "
+                        "hash_strong=COALESCE(excluded.hash_strong, file_hashes.hash_strong)",
+                        hashes_to_insert,
+                    )
 
         # Update stats.db with deltas — runs on stats writer, no catalog contention
         from file_hunter.stats_db import apply_file_deltas, read_stats as read_stats_db
@@ -709,9 +735,6 @@ async def _bulk_ingest(
         await asyncio.sleep(0)
 
     tmp_db.close()
-
-    # Register hashes in hashes.db — bulk insert from catalog
-    await _register_hashes_for_location(location_id, location_name)
 
     # Count new files
     async with read_db() as rdb:
@@ -957,6 +980,29 @@ async def _diff_and_update(
             from file_hunter.stats_db import apply_file_deltas as _apply_deltas
             await _apply_deltas(location_id, folder_parents, added=batch_deltas)
 
+            # Register in hashes.db (no hash values yet — populated in phase 2e)
+            rel_paths = [b[2] for b in batch]  # rel_path
+            async with read_db() as rdb:
+                ph = ",".join("?" for _ in rel_paths)
+                id_rows = await rdb.execute_fetchall(
+                    f"SELECT id, file_size FROM files "
+                    f"WHERE location_id = ? AND rel_path IN ({ph})",
+                    [location_id] + rel_paths,
+                )
+            if id_rows:
+                h_batch = [
+                    (ir["id"], location_id, ir["file_size"], None, None, None)
+                    for ir in id_rows
+                ]
+                async with hashes_writer() as hdb:
+                    await hdb.executemany(
+                        "INSERT INTO file_hashes "
+                        "(file_id, location_id, file_size, hash_partial, hash_fast, hash_strong) "
+                        "VALUES (?, ?, ?, ?, ?, ?) "
+                        "ON CONFLICT(file_id) DO UPDATE SET file_size=excluded.file_size",
+                        h_batch,
+                    )
+
             await broadcast({
                 "type": "scan_progress",
                 "locationId": location_id,
@@ -1076,16 +1122,9 @@ async def _diff_and_update(
 
             if batch_bytes >= HASH_BATCH_BYTES:
                 result = await hash_partial_batch(agent_id, batch_paths)
-                async with db_writer() as db:
-                    for hr in result.get("results", []):
-                        hp = hr.get("hash_partial")
-                        if hp:
-                            rel = os.path.relpath(hr["path"], root_path)
-                            await db.execute(
-                                "UPDATE files SET hash_partial = ? "
-                                "WHERE location_id = ? AND rel_path = ?",
-                                (hp, location_id, rel),
-                            )
+                await _write_hash_partials_to_hashes_db(
+                    result, root_path, location_id,
+                )
                 hashed += len(batch_paths)
                 batch_paths = []
                 batch_bytes = 0
@@ -1105,25 +1144,14 @@ async def _diff_and_update(
         # Flush remaining
         if batch_paths:
             result = await hash_partial_batch(agent_id, batch_paths)
-            async with db_writer() as db:
-                for hr in result.get("results", []):
-                    hp = hr.get("hash_partial")
-                    if hp:
-                        rel = os.path.relpath(hr["path"], root_path)
-                        await db.execute(
-                            "UPDATE files SET hash_partial = ? "
-                            "WHERE location_id = ? AND rel_path = ?",
-                            (hp, location_id, rel),
-                        )
+            await _write_hash_partials_to_hashes_db(
+                result, root_path, location_id,
+            )
             hashed += len(batch_paths)
 
         logger.info(
             "Rescan: %d hash partials applied for %s", hashed, location_name
         )
-
-    # Register hashes in hashes.db — only if files changed
-    if new_count > 0 or changed_count > 0 or stale_count > 0:
-        await _register_hashes_for_location(location_id, location_name)
 
     # Broadcast updated tree children
     await _broadcast_location_children(location_id)
@@ -1131,71 +1159,51 @@ async def _diff_and_update(
     return new_count, changed_count, stale_count
 
 
-async def _register_hashes_for_location(location_id: int, location_name: str):
-    """Bulk register/update file hashes in hashes.db from catalog.
+async def _write_hash_partials_to_hashes_db(
+    result: dict, root_path: str, location_id: int,
+):
+    """Write hash_partial results from agent directly to hashes.db.
 
-    Reads file hash data from catalog, upserts into hashes.db.
-    Only includes active, non-excluded files (stale and dup_exclude
-    files are not registered — hashes.db only contains active files).
+    Resolves file_ids from catalog by rel_path, then updates hash_partial
+    in hashes.db. Used by rescan phase 2e for new/changed files.
     """
-    from file_hunter.db import open_connection
-
-    t0 = time.monotonic()
-    conn = await open_connection()
-    try:
-        rows = await conn.execute_fetchall(
-            "SELECT id, location_id, file_size, hash_partial, hash_fast, hash_strong "
-            "FROM files WHERE location_id = ? AND stale = 0 AND dup_exclude = 0 "
-            "AND (hash_partial IS NOT NULL OR hash_fast IS NOT NULL OR hash_strong IS NOT NULL)",
-            (location_id,),
-        )
-    finally:
-        await conn.close()
-
-    if not rows:
-        logger.info("No hashes to register for %s", location_name)
+    hash_results = result.get("results", [])
+    if not hash_results:
         return
 
-    batch = []
-    for r in rows:
-        batch.append((
-            r["id"], r["location_id"], r["file_size"],
-            r["hash_partial"], r["hash_fast"], r["hash_strong"],
-        ))
-        if len(batch) >= 5000:
+    updates = []
+    for hr in hash_results:
+        hp = hr.get("hash_partial")
+        if hp:
+            rel = os.path.relpath(hr["path"], root_path)
+            updates.append((rel, hp))
+
+    if not updates:
+        return
+
+    rel_paths = [u[0] for u in updates]
+    hash_by_rel = {u[0]: u[1] for u in updates}
+
+    async with read_db() as rdb:
+        ph = ",".join("?" for _ in rel_paths)
+        id_rows = await rdb.execute_fetchall(
+            f"SELECT id, rel_path, file_size FROM files "
+            f"WHERE location_id = ? AND rel_path IN ({ph})",
+            [location_id] + rel_paths,
+        )
+
+    if id_rows:
+        h_updates = []
+        for ir in id_rows:
+            hp = hash_by_rel.get(ir["rel_path"])
+            if hp:
+                h_updates.append((hp, ir["id"]))
+        if h_updates:
             async with hashes_writer() as hdb:
                 await hdb.executemany(
-                    "INSERT INTO file_hashes "
-                    "(file_id, location_id, file_size, hash_partial, hash_fast, hash_strong) "
-                    "VALUES (?, ?, ?, ?, ?, ?) "
-                    "ON CONFLICT(file_id) DO UPDATE SET "
-                    "file_size=excluded.file_size, "
-                    "hash_partial=COALESCE(excluded.hash_partial, file_hashes.hash_partial), "
-                    "hash_fast=COALESCE(excluded.hash_fast, file_hashes.hash_fast), "
-                    "hash_strong=COALESCE(excluded.hash_strong, file_hashes.hash_strong)",
-                    batch,
+                    "UPDATE file_hashes SET hash_partial = ? WHERE file_id = ?",
+                    h_updates,
                 )
-            batch.clear()
-            await asyncio.sleep(0)
-
-    if batch:
-        async with hashes_writer() as hdb:
-            await hdb.executemany(
-                "INSERT INTO file_hashes "
-                "(file_id, location_id, file_size, hash_partial, hash_fast, hash_strong) "
-                "VALUES (?, ?, ?, ?, ?, ?) "
-                "ON CONFLICT(file_id) DO UPDATE SET "
-                "file_size=excluded.file_size, "
-                "hash_partial=COALESCE(excluded.hash_partial, file_hashes.hash_partial), "
-                "hash_fast=COALESCE(excluded.hash_fast, file_hashes.hash_fast), "
-                "hash_strong=COALESCE(excluded.hash_strong, file_hashes.hash_strong)",
-                batch,
-            )
-
-    logger.info(
-        "Registered %d file hashes in hashes.db for %s in %.1fs",
-        len(rows), location_name, time.monotonic() - t0,
-    )
 
 
 async def _broadcast_location_children(location_id: int):
