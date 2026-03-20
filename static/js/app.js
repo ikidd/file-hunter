@@ -1253,6 +1253,11 @@ WS.on('size_recalc_completed', msg => {
     ActivityLog.add('Location sizes recalculated');
     StatusBar.loadStats();
     Detail.refreshStats();
+    const recalcBtn = document.getElementById('detail-recalc-stats');
+    if (recalcBtn) {
+        recalcBtn.textContent = 'Recalculate Stats';
+        recalcBtn.disabled = false;
+    }
 });
 WS.on('dup_recalc_completed', async (msg) => {
     await StatusBar.loadStats();
