@@ -104,6 +104,10 @@ async def _collect_affected_hashes(location_id: int) -> tuple[set[str], set[str]
 async def _purge_location_batched(location_id: int):
     """Remove all traces of a location, batched to avoid holding writer lock."""
     from file_hunter.db import db_writer
+    from file_hunter.hashes_db import remove_location_hashes
+
+    # Remove all hashes for this location from hashes.db
+    await remove_location_hashes(location_id)
 
     DELETE_BATCH = 5000
 

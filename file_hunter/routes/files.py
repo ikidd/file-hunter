@@ -55,8 +55,7 @@ async def file_dup_counts(request: Request):
     # Auto-detect: SHA-256 = 64 hex chars, xxHash64 = 16 hex chars
     strong = [h for h in hashes if h and len(h) == 64]
     fast = [h for h in hashes if h and len(h) == 16]
-    async with read_db() as db:
-        counts = await batch_dup_counts(db, strong_hashes=strong, fast_hashes=fast)
+    counts = await batch_dup_counts(strong_hashes=strong, fast_hashes=fast)
     return json_ok({"counts": counts})
 
 
@@ -259,11 +258,8 @@ async def file_verify(request: Request):
         logger.warning("Verify failed for %s: %r", f["full_path"], exc)
         return json_error(f"Hash computation failed: {exc}", 500)
 
-    async with db_writer() as wdb:
-        await wdb.execute(
-            "UPDATE files SET hash_fast = ?, hash_strong = ? WHERE id = ?",
-            (hash_fast, hash_strong, file_id),
-        )
+    from file_hunter.hashes_db import update_file_hash
+    await update_file_hash(file_id, hash_fast=hash_fast, hash_strong=hash_strong)
 
     # Recalc dup counts: new hash_strong group + old hash_fast group
     from file_hunter.services.dup_counts import submit_hashes_for_recalc

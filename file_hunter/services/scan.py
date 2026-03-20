@@ -25,6 +25,7 @@ from datetime import datetime, timezone
 import httpx
 
 from file_hunter.db import db_writer, read_db
+from file_hunter.hashes_db import hashes_writer
 from file_hunter.services.scanner import (
     ensure_folder_hierarchy,
     mark_stale_files,
@@ -687,6 +688,9 @@ async def _bulk_ingest(
 
     tmp_db.close()
 
+    # Register hashes in hashes.db — bulk insert from catalog
+    await _register_hashes_for_location(location_id, location_name)
+
     # Count new files
     async with read_db() as rdb:
         after_rows = await rdb.execute_fetchall(
@@ -801,6 +805,10 @@ async def _diff_and_update(
                     [scan_id] + batch,
                 )
             await asyncio.sleep(0)
+
+        # Remove stale files from hashes.db
+        from file_hunter.hashes_db import remove_file_hashes
+        await remove_file_hashes(stale_id_list)
 
     # Mark all seen files with current scan_id — batched to avoid holding writer
     async with read_db() as rdb:
@@ -1022,10 +1030,80 @@ async def _diff_and_update(
             "Rescan: %d hash partials applied for %s", hashed, location_name
         )
 
+    # Register hashes in hashes.db
+    await _register_hashes_for_location(location_id, location_name)
+
     # Broadcast updated tree children
     await _broadcast_location_children(location_id)
 
     return new_count, changed_count, stale_count
+
+
+async def _register_hashes_for_location(location_id: int, location_name: str):
+    """Bulk register/update file hashes in hashes.db from catalog.
+
+    Reads file hash data from catalog, upserts into hashes.db.
+    Only includes active, non-excluded files (stale and dup_exclude
+    files are not registered — hashes.db only contains active files).
+    """
+    from file_hunter.db import open_connection
+
+    t0 = time.monotonic()
+    conn = await open_connection()
+    try:
+        rows = await conn.execute_fetchall(
+            "SELECT id, location_id, file_size, hash_partial, hash_fast, hash_strong "
+            "FROM files WHERE location_id = ? AND stale = 0 AND dup_exclude = 0 "
+            "AND (hash_partial IS NOT NULL OR hash_fast IS NOT NULL OR hash_strong IS NOT NULL)",
+            (location_id,),
+        )
+    finally:
+        await conn.close()
+
+    if not rows:
+        logger.info("No hashes to register for %s", location_name)
+        return
+
+    batch = []
+    for r in rows:
+        batch.append((
+            r["id"], r["location_id"], r["file_size"],
+            r["hash_partial"], r["hash_fast"], r["hash_strong"],
+        ))
+        if len(batch) >= 5000:
+            async with hashes_writer() as hdb:
+                await hdb.executemany(
+                    "INSERT INTO file_hashes "
+                    "(file_id, location_id, file_size, hash_partial, hash_fast, hash_strong) "
+                    "VALUES (?, ?, ?, ?, ?, ?) "
+                    "ON CONFLICT(file_id) DO UPDATE SET "
+                    "file_size=excluded.file_size, "
+                    "hash_partial=COALESCE(excluded.hash_partial, file_hashes.hash_partial), "
+                    "hash_fast=COALESCE(excluded.hash_fast, file_hashes.hash_fast), "
+                    "hash_strong=COALESCE(excluded.hash_strong, file_hashes.hash_strong)",
+                    batch,
+                )
+            batch.clear()
+            await asyncio.sleep(0)
+
+    if batch:
+        async with hashes_writer() as hdb:
+            await hdb.executemany(
+                "INSERT INTO file_hashes "
+                "(file_id, location_id, file_size, hash_partial, hash_fast, hash_strong) "
+                "VALUES (?, ?, ?, ?, ?, ?) "
+                "ON CONFLICT(file_id) DO UPDATE SET "
+                "file_size=excluded.file_size, "
+                "hash_partial=COALESCE(excluded.hash_partial, file_hashes.hash_partial), "
+                "hash_fast=COALESCE(excluded.hash_fast, file_hashes.hash_fast), "
+                "hash_strong=COALESCE(excluded.hash_strong, file_hashes.hash_strong)",
+                batch,
+            )
+
+    logger.info(
+        "Registered %d file hashes in hashes.db for %s in %.1fs",
+        len(rows), location_name, time.monotonic() - t0,
+    )
 
 
 async def _broadcast_location_children(location_id: int):
@@ -1223,13 +1301,14 @@ async def _drain_pending_hashes(
         affected_fast: set[str] = set()
 
         if hash_results:
-            async with db_writer() as db:
+            from file_hunter.hashes_db import hashes_writer
+            async with hashes_writer() as hdb:
                 for hr in hash_results:
                     fid = path_to_file_id.get(hr["path"])
                     hf = hr.get("hash_fast")
                     if fid and hf:
-                        await db.execute(
-                            "UPDATE files SET hash_fast = ? WHERE id = ?",
+                        await hdb.execute(
+                            "UPDATE file_hashes SET hash_fast = ? WHERE file_id = ?",
                             (hf, fid),
                         )
                         affected_fast.add(hf)

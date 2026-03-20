@@ -359,11 +359,12 @@ async def run_backfill(
 
 
 async def _flush_writes(writes: list[tuple[int, str]]):
-    """Batch-update hash_fast for a list of file IDs."""
-    async with db_writer() as wdb:
+    """Batch-update hash_fast in hashes.db for a list of file IDs."""
+    from file_hunter.hashes_db import hashes_writer
+    async with hashes_writer() as wdb:
         for file_id, hash_fast in writes:
             await wdb.execute(
-                "UPDATE files SET hash_fast = ? WHERE id = ?",
+                "UPDATE file_hashes SET hash_fast = ? WHERE file_id = ?",
                 (hash_fast, file_id),
             )
 

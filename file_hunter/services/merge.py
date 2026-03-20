@@ -268,6 +268,11 @@ async def run_merge(source_id, source_info, destination_id, dest_info):
                         )
 
                         # Stub source with .moved
+                        # Get IDs of files being replaced at stub path
+                        _replaced = await wdb.execute_fetchall(
+                            "SELECT id FROM files WHERE location_id=? AND rel_path=? AND id!=?",
+                            (src_file["location_id"], stub_rel, src_file["id"]),
+                        )
                         await wdb.execute(
                             "DELETE FROM files WHERE location_id=? AND rel_path=? AND id!=?",
                             (src_file["location_id"], stub_rel, src_file["id"]),
@@ -288,6 +293,10 @@ async def run_merge(source_id, source_info, destination_id, dest_info):
                                 src_file["id"],
                             ),
                         )
+
+                    from file_hunter.hashes_db import remove_file_hashes
+                    _del_ids = [r["id"] for r in _replaced] + [src_file["id"]]
+                    await remove_file_hashes(_del_ids)
 
                     # Filesystem I/O outside write lock
                     await fs.write_moved_stub(
@@ -358,6 +367,10 @@ async def run_merge(source_id, source_info, destination_id, dest_info):
 
                     async with db_writer() as wdb:
                         # Remove any stale .moved record (e.g. from a previous merge)
+                        _replaced = await wdb.execute_fetchall(
+                            "SELECT id FROM files WHERE location_id=? AND rel_path=? AND id!=?",
+                            (src_file["location_id"], stub_rel, src_file["id"]),
+                        )
                         await wdb.execute(
                             "DELETE FROM files WHERE location_id=? AND rel_path=? AND id!=?",
                             (src_file["location_id"], stub_rel, src_file["id"]),
@@ -378,6 +391,10 @@ async def run_merge(source_id, source_info, destination_id, dest_info):
                                 src_file["id"],
                             ),
                         )
+
+                    from file_hunter.hashes_db import remove_file_hashes
+                    _del_ids = [r["id"] for r in _replaced] + [src_file["id"]]
+                    await remove_file_hashes(_del_ids)
 
                     # Filesystem: write .moved stub at source (outside write lock)
                     await fs.write_moved_stub(
@@ -526,6 +543,10 @@ async def run_merge(source_id, source_info, destination_id, dest_info):
 
                         # DB operations for source stub
                         # Remove any stale .moved record (e.g. from a previous merge)
+                        _replaced = await wdb.execute_fetchall(
+                            "SELECT id FROM files WHERE location_id=? AND rel_path=? AND id!=?",
+                            (src_file["location_id"], stub_rel, src_file["id"]),
+                        )
                         await wdb.execute(
                             "DELETE FROM files WHERE location_id=? AND rel_path=? AND id!=?",
                             (src_file["location_id"], stub_rel, src_file["id"]),
@@ -546,6 +567,10 @@ async def run_merge(source_id, source_info, destination_id, dest_info):
                                 src_file["id"],
                             ),
                         )
+
+                    from file_hunter.hashes_db import remove_file_hashes
+                    _del_ids = [r["id"] for r in _replaced] + [src_file["id"]]
+                    await remove_file_hashes(_del_ids)
 
                     # Add to index so subsequent files with same hash are caught
                     dest_hash_index[copy_strong] = {

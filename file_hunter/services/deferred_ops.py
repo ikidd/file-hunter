@@ -196,6 +196,9 @@ async def _drain_delete(f, op_id: int, now_iso: str):
             (now_iso, op_id),
         )
 
+    from file_hunter.hashes_db import remove_file_hashes
+    await remove_file_hashes([file_id])
+
 
 async def _drain_move(f, params: dict, op_id: int, now_iso: str) -> int | None:
     """Execute a deferred move: move on disk, update DB record.
@@ -293,15 +296,17 @@ async def _drain_verify(f, op_id: int, now_iso: str) -> dict | None:
 
     async with db_writer() as wdb:
         await wdb.execute(
-            "UPDATE files SET hash_fast = ?, hash_strong = ?, pending_op = NULL "
-            "WHERE id = ?",
-            (hash_fast, hash_strong, file_id),
+            "UPDATE files SET pending_op = NULL WHERE id = ?",
+            (file_id,),
         )
         await wdb.execute(
             "UPDATE pending_file_ops SET status = 'completed', "
             "date_completed = ? WHERE id = ?",
             (now_iso, op_id),
         )
+
+    from file_hunter.hashes_db import update_file_hash
+    await update_file_hash(file_id, hash_fast=hash_fast, hash_strong=hash_strong)
 
     await broadcast(
         {

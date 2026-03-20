@@ -14,25 +14,42 @@ async def _mark_stale_files(
 ) -> int:
     """Mark files not seen in this scan as stale. Returns count.
 
+    Also removes stale files from hashes.db (only active files belong there).
+
     When scan_prefix is set, only marks files within that subtree stale.
     Files in the folder have rel_path like "prefix/filename", and files
     in subdirectories have "prefix/sub/filename" — both matched by
     ``prefix/%``.
     """
+    # Collect IDs before marking stale — for hashes.db cleanup
     if scan_prefix:
+        stale_rows = await db.execute_fetchall(
+            "SELECT id FROM files WHERE location_id=? AND scan_id!=? AND stale=0 "
+            "AND rel_path LIKE ?",
+            (location_id, scan_id, scan_prefix + "/%"),
+        )
         cursor = await db.execute(
             """UPDATE files SET stale=1
                WHERE location_id=? AND scan_id!=? AND stale=0
                AND rel_path LIKE ?""",
             (location_id, scan_id, scan_prefix + "/%"),
         )
-        return cursor.rowcount
     else:
+        stale_rows = await db.execute_fetchall(
+            "SELECT id FROM files WHERE location_id=? AND scan_id!=? AND stale=0",
+            (location_id, scan_id),
+        )
         cursor = await db.execute(
             "UPDATE files SET stale=1 WHERE location_id=? AND scan_id!=? AND stale=0",
             (location_id, scan_id),
         )
-        return cursor.rowcount
+
+    stale_ids = [r["id"] for r in stale_rows]
+    if stale_ids:
+        from file_hunter.hashes_db import remove_file_hashes
+        await remove_file_hashes(stale_ids)
+
+    return cursor.rowcount
 
 
 async def _ensure_folder_hierarchy(

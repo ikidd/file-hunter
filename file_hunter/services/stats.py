@@ -103,7 +103,7 @@ async def _refresh_dashboard(db):
             "SELECT COUNT(*) as c, COALESCE(SUM(total_size), 0) as s, "
             "COALESCE(SUM(file_count), 0) as fc, "
             "COALESCE(SUM(duplicate_count), 0) as dc "
-            "FROM locations"
+            "FROM locations WHERE name NOT LIKE '__deleting_%'"
         ),
         db.execute_fetchall(
             """SELECT s.id, l.name as location_name, s.status, s.started_at,
@@ -122,7 +122,8 @@ async def _refresh_dashboard(db):
 
     # Aggregate type_counts from all locations
     loc_type_rows = await db.execute_fetchall(
-        "SELECT type_counts FROM locations WHERE type_counts != '{}'"
+        "SELECT type_counts FROM locations "
+        "WHERE type_counts != '{}' AND name NOT LIKE '__deleting_%'"
     )
     merged_types: dict[str, int] = {}
     for r in loc_type_rows:
@@ -170,7 +171,8 @@ async def _refresh_all_locations(db):
         "SELECT id, name, root_path, date_added, "
         "total_size, file_count, duplicate_count, hidden_count, type_counts, "
         "scan_schedule_enabled, scan_schedule_days, scan_schedule_time, "
-        "scan_schedule_last_run FROM locations"
+        "scan_schedule_last_run FROM locations "
+        "WHERE name NOT LIKE '__deleting_%'"
     )
     for loc in loc_rows:
         await _refresh_location(db, loc)
@@ -235,10 +237,11 @@ async def get_stats(db):
             "SELECT COUNT(*) as c, COALESCE(SUM(total_size), 0) as s, "
             "COALESCE(SUM(file_count), 0) as fc, "
             "COALESCE(SUM(duplicate_count), 0) as dc "
-            "FROM locations"
+            "FROM locations WHERE name NOT LIKE '__deleting_%'"
         ),
         db.execute_fetchall(
-            "SELECT type_counts FROM locations WHERE type_counts != '{}'"
+            "SELECT type_counts FROM locations "
+            "WHERE type_counts != '{}' AND name NOT LIKE '__deleting_%'"
         ),
         db.execute_fetchall(
             """SELECT s.id, l.name as location_name, s.status, s.started_at,

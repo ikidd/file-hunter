@@ -50,6 +50,9 @@ async def delete_file(db, file_id: int) -> dict:
     await db.execute("DELETE FROM files WHERE id = ?", (file_id,))
     await db.commit()
 
+    from file_hunter.hashes_db import remove_file_hashes
+    await remove_file_hashes([file_id])
+
     from file_hunter.services.stats import invalidate_stats_cache
 
     invalidate_stats_cache()
@@ -105,6 +108,7 @@ async def delete_file_and_duplicates(db, file_id: int) -> dict:
     deleted_count = 0
     deleted_from_disk_count = 0
     deferred_count = 0
+    deleted_ids: list[int] = []
 
     for rec in all_rows:
         fid = rec["id"]
@@ -119,6 +123,7 @@ async def delete_file_and_duplicates(db, file_id: int) -> dict:
                 await fs.file_delete(full_path, loc_id)
                 deleted_from_disk_count += 1
             await db.execute("DELETE FROM files WHERE id = ?", (fid,))
+            deleted_ids.append(fid)
             deleted_count += 1
         else:
             # Defer for offline locations
@@ -128,6 +133,10 @@ async def delete_file_and_duplicates(db, file_id: int) -> dict:
             deferred_count += 1
 
     await db.commit()
+
+    if deleted_ids:
+        from file_hunter.hashes_db import remove_file_hashes
+        await remove_file_hashes(deleted_ids)
 
     from file_hunter.services.stats import invalidate_stats_cache
 
@@ -211,6 +220,19 @@ async def delete_folder(db, folder_id: int) -> dict:
             await fs.dir_delete(abs_path, location_id)
             deleted_from_disk = True
 
+    # Collect file IDs for hashes cleanup before deleting
+    file_id_rows = await db.execute_fetchall(
+        """SELECT id FROM files WHERE folder_id IN (
+               WITH RECURSIVE descendants(id) AS (
+                   SELECT ? UNION ALL
+                   SELECT f.id FROM folders f JOIN descendants d ON f.parent_id = d.id
+               )
+               SELECT id FROM descendants
+           )""",
+        (folder_id,),
+    )
+    deleted_file_ids = [r["id"] for r in file_id_rows]
+
     # Delete files first (folder FK is ON DELETE SET NULL, not CASCADE)
     await db.execute(
         """DELETE FROM files WHERE folder_id IN (
@@ -226,6 +248,10 @@ async def delete_folder(db, folder_id: int) -> dict:
     # Delete folder — CASCADE handles child folders
     await db.execute("DELETE FROM folders WHERE id = ?", (folder_id,))
     await db.commit()
+
+    if deleted_file_ids:
+        from file_hunter.hashes_db import remove_file_hashes
+        await remove_file_hashes(deleted_file_ids)
 
     from file_hunter.services.stats import invalidate_stats_cache
 

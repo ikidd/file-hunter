@@ -153,7 +153,7 @@ async def list_files(
         f["hash_fast"] for f in files if not f["hash_strong"] and f["hash_fast"]
     ]
     live_dups = await batch_dup_counts(
-        db, strong_hashes=strong_list, fast_hashes=fast_list
+        strong_hashes=strong_list, fast_hashes=fast_list
     )
 
     file_items = [

@@ -235,7 +235,7 @@ async def search_files(
             r["hash_fast"] for r in rows if not r["hash_strong"] and r["hash_fast"]
         ]
         live_dups = await batch_dup_counts(
-            db, strong_hashes=strong_list, fast_hashes=fast_list
+            strong_hashes=strong_list, fast_hashes=fast_list
         )
 
         items = [
@@ -540,7 +540,7 @@ async def search_files_advanced(
             r["hash_fast"] for r in rows if not r["hash_strong"] and r["hash_fast"]
         ]
         live_dups = await batch_dup_counts(
-            db, strong_hashes=strong_list, fast_hashes=fast_list
+            strong_hashes=strong_list, fast_hashes=fast_list
         )
 
         items = [

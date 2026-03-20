@@ -354,6 +354,8 @@ async def run_consolidation(file_id: int, mode: str, dest_folder_id: str | None)
                                 copy["id"],
                             ),
                         )
+                    from file_hunter.hashes_db import remove_file_hashes
+                    await remove_file_hashes([copy["id"]])
                     stubs_written += 1
                 except Exception:
                     stubs_queued += 1
@@ -528,11 +530,22 @@ async def drain_pending_jobs(location_id: int, root_path: str):
                                 fid,
                             ),
                         )
+                        # Stub has no hashes — remove from hashes.db
+                        from file_hunter.hashes_db import remove_file_hashes
+                        await remove_file_hashes([fid])
                     else:
+                        # Get file ID before deleting for hashes cleanup
+                        del_rows = await wdb.execute_fetchall(
+                            "SELECT id FROM files WHERE full_path = ? AND location_id = ?",
+                            (source_path, location_id),
+                        )
                         await wdb.execute(
                             "DELETE FROM files WHERE full_path = ? AND location_id = ?",
                             (source_path, location_id),
                         )
+                        if del_rows:
+                            from file_hunter.hashes_db import remove_file_hashes
+                            await remove_file_hashes([r["id"] for r in del_rows])
                     await wdb.execute(
                         "UPDATE consolidation_jobs SET status = 'completed', date_completed = ? WHERE id = ?",
                         (now_iso, job["id"]),
