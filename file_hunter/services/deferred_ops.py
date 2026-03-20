@@ -85,7 +85,8 @@ async def drain_pending_ops(location_id: int, root_path: str):
             async with read_db() as db:
                 file_row = await db.execute_fetchall(
                     "SELECT id, full_path, filename, hash_fast, hash_strong, "
-                    "location_id, pending_op FROM files WHERE id = ?",
+                    "location_id, folder_id, file_size, file_type_high, hidden, "
+                    "pending_op FROM files WHERE id = ?",
                     (file_id,),
                 )
             if not file_row:
@@ -198,6 +199,12 @@ async def _drain_delete(f, op_id: int, now_iso: str):
 
     from file_hunter.hashes_db import remove_file_hashes
     await remove_file_hashes([file_id])
+
+    from file_hunter.stats_db import update_stats_for_files
+    await update_stats_for_files(
+        location_id,
+        removed=[(f["folder_id"], f["file_size"] or 0, f["file_type_high"], f["hidden"])],
+    )
 
 
 async def _drain_move(f, params: dict, op_id: int, now_iso: str) -> int | None:

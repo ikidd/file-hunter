@@ -128,6 +128,215 @@ async def read_stats():
         await conn.close()
 
 
+async def apply_file_deltas(
+    location_id: int,
+    folder_parents: dict[int, int | None],
+    added: list[tuple] | None = None,
+    removed: list[tuple] | None = None,
+):
+    """Apply file add/remove deltas to stats.db, cascading up the folder tree.
+
+    folder_parents: {folder_id: parent_id} — the folder hierarchy.
+        Read from catalog once, reused across batches.
+
+    added: list of (folder_id, file_size, file_type_high, is_hidden)
+        for newly ingested files.
+
+    removed: list of (folder_id, file_size, file_type_high, is_hidden)
+        for stale/deleted files.
+
+    Computes per-folder deltas, walks up parent chain accumulating at
+    each level, writes all affected folder_stats + location_stats.
+    Runs on the stats writer — no catalog contention.
+    """
+    import json
+
+    if not added and not removed:
+        return
+
+    # Step 1: compute direct deltas per folder (from actual files only)
+    direct: dict[int | None, list[int, int, int, dict]] = {}
+    #                           count, size, hidden, {type: count}
+
+    def _apply(folder_id, file_size, file_type_high, is_hidden, sign):
+        if folder_id not in direct:
+            direct[folder_id] = [0, 0, 0, {}]
+        d = direct[folder_id]
+        d[0] += sign          # count
+        d[1] += file_size * sign  # size
+        if is_hidden:
+            d[2] += sign      # hidden
+        if file_type_high:
+            d[3][file_type_high] = d[3].get(file_type_high, 0) + sign
+
+    for folder_id, file_size, file_type_high, is_hidden in (added or []):
+        _apply(folder_id, file_size, file_type_high, is_hidden, 1)
+    for folder_id, file_size, file_type_high, is_hidden in (removed or []):
+        _apply(folder_id, file_size, file_type_high, is_hidden, -1)
+
+    # Step 2: cascade — each folder's delta includes its own files plus
+    # all descendant folders' deltas. Build cumulative per folder by walking
+    # up from each direct-delta folder.
+    cumulative: dict[int, list] = {}  # folder_id -> [count, size, hidden, {types}]
+
+    for folder_id in list(direct.keys()):
+        if folder_id is None:
+            continue
+        d = direct[folder_id]
+        # Walk up the chain, adding this folder's direct delta to every ancestor
+        current = folder_id
+        while current is not None:
+            if current not in cumulative:
+                cumulative[current] = [0, 0, 0, {}]
+            c = cumulative[current]
+            c[0] += d[0]
+            c[1] += d[1]
+            c[2] += d[2]
+            for t, cnt in d[3].items():
+                c[3][t] = c[3].get(t, 0) + cnt
+            current = folder_parents.get(current)
+
+    if not cumulative:
+        return
+
+    # Step 3: location delta = sum of ALL direct deltas (every file, regardless of folder)
+    loc_count = 0
+    loc_size = 0
+    loc_hidden = 0
+    loc_types: dict[str, int] = {}
+    for d in direct.values():
+        loc_count += d[0]
+        loc_size += d[1]
+        loc_hidden += d[2]
+        for t, cnt in d[3].items():
+            loc_types[t] = loc_types.get(t, 0) + cnt
+
+    # Step 4: write to stats.db
+    async with stats_writer() as sdb:
+        for fid, delta in cumulative.items():
+            if delta[0] == 0 and delta[1] == 0 and delta[2] == 0 and not delta[3]:
+                continue
+
+            row = await sdb.execute(
+                "SELECT file_count, total_size, hidden_count, type_counts "
+                "FROM folder_stats WHERE folder_id = ?",
+                (fid,),
+            )
+            existing = await row.fetchone()
+
+            if existing:
+                new_count = max(0, (existing["file_count"] or 0) + delta[0])
+                new_size = max(0, (existing["total_size"] or 0) + delta[1])
+                new_hidden = max(0, (existing["hidden_count"] or 0) + delta[2])
+                cur_types = json.loads(existing["type_counts"] or "{}")
+                for t, cnt in delta[3].items():
+                    cur_types[t] = cur_types.get(t, 0) + cnt
+                    if cur_types[t] <= 0:
+                        cur_types.pop(t, None)
+                await sdb.execute(
+                    "UPDATE folder_stats SET file_count=?, total_size=?, "
+                    "hidden_count=?, type_counts=? WHERE folder_id=?",
+                    (new_count, new_size, new_hidden, json.dumps(cur_types), fid),
+                )
+            else:
+                init_types = {t: c for t, c in delta[3].items() if c > 0}
+                await sdb.execute(
+                    "INSERT INTO folder_stats "
+                    "(folder_id, location_id, file_count, total_size, "
+                    "hidden_count, type_counts) "
+                    "VALUES (?, ?, ?, ?, ?, ?)",
+                    (fid, location_id, max(0, delta[0]), max(0, delta[1]),
+                     max(0, delta[2]), json.dumps(init_types)),
+                )
+
+        # Update location_stats
+        loc_existing = await sdb.execute(
+            "SELECT file_count, total_size, hidden_count, type_counts "
+            "FROM location_stats WHERE location_id = ?",
+            (location_id,),
+        )
+        loc_row = await loc_existing.fetchone()
+
+        if loc_row:
+            new_fc = max(0, (loc_row["file_count"] or 0) + loc_count)
+            new_ts = max(0, (loc_row["total_size"] or 0) + loc_size)
+            new_hc = max(0, (loc_row["hidden_count"] or 0) + loc_hidden)
+            lt = json.loads(loc_row["type_counts"] or "{}")
+            for t, cnt in loc_types.items():
+                lt[t] = lt.get(t, 0) + cnt
+                if lt[t] <= 0:
+                    lt.pop(t, None)
+            await sdb.execute(
+                "UPDATE location_stats SET file_count=?, total_size=?, "
+                "hidden_count=?, type_counts=? WHERE location_id=?",
+                (new_fc, new_ts, new_hc, json.dumps(lt), location_id),
+            )
+        else:
+            init_lt = {t: c for t, c in loc_types.items() if c > 0}
+            await sdb.execute(
+                "INSERT INTO location_stats "
+                "(location_id, file_count, total_size, hidden_count, type_counts) "
+                "VALUES (?, ?, ?, ?, ?)",
+                (location_id, max(0, loc_count), max(0, loc_size),
+                 max(0, loc_hidden), json.dumps(init_lt)),
+            )
+
+    return {
+        "fileCount": (loc_row["file_count"] or 0) + loc_count if loc_row else loc_count,
+        "totalSize": (loc_row["total_size"] or 0) + loc_size if loc_row else loc_size,
+    }
+
+
+async def update_stats_for_files(
+    location_id: int,
+    added: list[tuple] | None = None,
+    removed: list[tuple] | None = None,
+):
+    """Convenience wrapper: read folder hierarchy from catalog, apply deltas.
+
+    added/removed: list of (folder_id, file_size, file_type_high, is_hidden)
+
+    Reads folder parents from catalog (fast indexed query), then delegates
+    to apply_file_deltas for the cascade.
+    """
+    if not added and not removed:
+        return
+    from file_hunter.db import read_db
+
+    async with read_db() as rdb:
+        fp_rows = await rdb.execute_fetchall(
+            "SELECT id, parent_id FROM folders WHERE location_id = ?",
+            (location_id,),
+        )
+    folder_parents = {r["id"]: r["parent_id"] for r in fp_rows}
+    await apply_file_deltas(location_id, folder_parents, added=added, removed=removed)
+
+
+async def remove_folder_stats(folder_ids: list[int]):
+    """Remove folder_stats entries for deleted folders."""
+    if not folder_ids:
+        return
+    for i in range(0, len(folder_ids), 500):
+        batch = folder_ids[i : i + 500]
+        ph = ",".join("?" for _ in batch)
+        async with stats_writer() as sdb:
+            await sdb.execute(
+                f"DELETE FROM folder_stats WHERE folder_id IN ({ph})",
+                batch,
+            )
+
+
+async def remove_location_stats(location_id: int):
+    """Remove all stats for a location (folder_stats + location_stats)."""
+    async with stats_writer() as sdb:
+        await sdb.execute(
+            "DELETE FROM folder_stats WHERE location_id = ?", (location_id,)
+        )
+        await sdb.execute(
+            "DELETE FROM location_stats WHERE location_id = ?", (location_id,)
+        )
+
+
 async def close_stats_db():
     """Close the stats write connection. Called on shutdown."""
     global _write_db

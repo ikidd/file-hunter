@@ -557,12 +557,17 @@ async def _bulk_ingest(
 
     logger.info("Folders created for %s: %d", location_name, len(folder_cache))
 
-    # Batch ingest files — accumulate running totals for live UI updates
+    # Build folder_parents for stats cascade
+    async with read_db() as rdb:
+        fp_rows = await rdb.execute_fetchall(
+            "SELECT id, parent_id FROM folders WHERE location_id = ?",
+            (location_id,),
+        )
+    folder_parents = {r["id"]: r["parent_id"] for r in fp_rows}
+
+    # Batch ingest files — with real-time stats updates
     offset = 0
     ingested = 0
-    running_size = 0
-    running_types: dict[str, int] = {}
-    running_hidden = 0
     last_broadcast = time.monotonic()
 
     while True:
@@ -576,6 +581,7 @@ async def _bulk_ingest(
             break
 
         batch = []
+        batch_deltas: list[tuple] = []  # (folder_id, file_size, type_high, is_hidden)
         for r in rows:
             rel_path = r["rel_path"]
             filename = os.path.basename(rel_path)
@@ -609,12 +615,7 @@ async def _bulk_ingest(
                 r["hash_partial"],
             ))
 
-            # Accumulate running totals
-            running_size += r["file_size"]
-            if file_type_high:
-                running_types[file_type_high] = running_types.get(file_type_high, 0) + 1
-            if is_hidden:
-                running_hidden += 1
+            batch_deltas.append((folder_id, r["file_size"], file_type_high, is_hidden))
 
         async with db_writer() as db:
             await db.executemany(
@@ -638,7 +639,6 @@ async def _bulk_ingest(
                 "hidden=excluded.hidden, "
                 "inode=excluded.inode, "
                 "stale=0, "
-                # Use new hash_partial if provided, else preserve if file unchanged
                 "hash_partial=CASE "
                 "  WHEN excluded.hash_partial IS NOT NULL "
                 "  THEN excluded.hash_partial "
@@ -656,6 +656,13 @@ async def _bulk_ingest(
                 batch,
             )
 
+        # Update stats.db with deltas — runs on stats writer, no catalog contention
+        from file_hunter.stats_db import apply_file_deltas, read_stats as read_stats_db
+
+        live_totals = await apply_file_deltas(
+            location_id, folder_parents, added=batch_deltas,
+        )
+
         ingested += len(batch)
         offset += INGEST_BATCH_SIZE
 
@@ -665,10 +672,17 @@ async def _bulk_ingest(
                 "Ingest progress: %d / %d files for %s",
                 ingested, total_files, location_name,
             )
-            type_breakdown = [
-                {"type": t, "count": c}
-                for t, c in sorted(running_types.items(), key=lambda x: -x[1])
-            ]
+
+            # Read global totals from stats.db for status bar
+            async with read_stats_db() as sdb:
+                global_row = await sdb.execute_fetchall(
+                    "SELECT COALESCE(SUM(file_count), 0) as fc, "
+                    "COALESCE(SUM(total_size), 0) as ts "
+                    "FROM location_stats"
+                )
+            global_fc = global_row[0]["fc"] if global_row else 0
+            global_ts = global_row[0]["ts"] if global_row else 0
+
             await broadcast({
                 "type": "scan_progress",
                 "locationId": location_id,
@@ -676,11 +690,11 @@ async def _bulk_ingest(
                 "phase": "cataloging",
                 "catalogDone": ingested,
                 "catalogTotal": total_files,
-                "fileCount": ingested,
-                "totalSize": running_size,
+                "fileCount": live_totals.get("fileCount", ingested) if live_totals else ingested,
+                "totalSize": live_totals.get("totalSize", 0) if live_totals else 0,
                 "folderCount": len(folder_cache),
-                "hiddenCount": running_hidden,
-                "typeBreakdown": type_breakdown,
+                "globalFileCount": global_fc,
+                "globalTotalSize": global_ts,
             })
             last_broadcast = now_mono
 

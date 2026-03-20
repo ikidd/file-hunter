@@ -356,6 +356,14 @@ async def run_consolidation(file_id: int, mode: str, dest_folder_id: str | None)
                         )
                     from file_hunter.hashes_db import remove_file_hashes
                     await remove_file_hashes([copy["id"]])
+
+                    # Stats: original file removed, stub added
+                    from file_hunter.stats_db import update_stats_for_files
+                    await update_stats_for_files(
+                        copy_loc_id,
+                        removed=[(copy["folder_id"], copy["file_size"] or 0, copy["file_type_high"], 0)],
+                        added=[(copy["folder_id"], stub_size, "text", 0)],
+                    )
                     stubs_written += 1
                 except Exception:
                     stubs_queued += 1
@@ -503,7 +511,8 @@ async def drain_pending_jobs(location_id: int, root_path: str):
                 # Update the existing file record to reflect the .moved stub
                 async with read_db() as db:
                     file_rows = await db.execute_fetchall(
-                        "SELECT id, rel_path FROM files WHERE full_path = ? AND location_id = ?",
+                        "SELECT id, rel_path, folder_id, file_size, file_type_high "
+                        "FROM files WHERE full_path = ? AND location_id = ?",
                         (source_path, location_id),
                     )
 
@@ -511,6 +520,9 @@ async def drain_pending_jobs(location_id: int, root_path: str):
                     if file_rows:
                         fid = file_rows[0]["id"]
                         stub_rel = file_rows[0]["rel_path"] + ".moved"
+                        orig_folder_id = file_rows[0]["folder_id"]
+                        orig_size = file_rows[0]["file_size"] or 0
+                        orig_type = file_rows[0]["file_type_high"]
                         st = await fs.file_stat(stub_path, location_id)
                         stub_size = st["size"] if st else 0
                         await wdb.execute(
@@ -530,13 +542,19 @@ async def drain_pending_jobs(location_id: int, root_path: str):
                                 fid,
                             ),
                         )
-                        # Stub has no hashes — remove from hashes.db
                         from file_hunter.hashes_db import remove_file_hashes
                         await remove_file_hashes([fid])
+                        # Stats: original removed, stub added
+                        from file_hunter.stats_db import update_stats_for_files
+                        await update_stats_for_files(
+                            location_id,
+                            removed=[(orig_folder_id, orig_size, orig_type, 0)],
+                            added=[(orig_folder_id, stub_size, "text", 0)],
+                        )
                     else:
-                        # Get file ID before deleting for hashes cleanup
                         del_rows = await wdb.execute_fetchall(
-                            "SELECT id FROM files WHERE full_path = ? AND location_id = ?",
+                            "SELECT id, folder_id, file_size, file_type_high "
+                            "FROM files WHERE full_path = ? AND location_id = ?",
                             (source_path, location_id),
                         )
                         await wdb.execute(
@@ -546,6 +564,14 @@ async def drain_pending_jobs(location_id: int, root_path: str):
                         if del_rows:
                             from file_hunter.hashes_db import remove_file_hashes
                             await remove_file_hashes([r["id"] for r in del_rows])
+                            from file_hunter.stats_db import update_stats_for_files
+                            await update_stats_for_files(
+                                location_id,
+                                removed=[
+                                    (r["folder_id"], r["file_size"] or 0, r["file_type_high"], 0)
+                                    for r in del_rows
+                                ],
+                            )
                     await wdb.execute(
                         "UPDATE consolidation_jobs SET status = 'completed', date_completed = ? WHERE id = ?",
                         (now_iso, job["id"]),

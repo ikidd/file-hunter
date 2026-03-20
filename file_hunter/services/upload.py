@@ -95,6 +95,14 @@ async def run_upload(
 
                 affected_hashes.add(hash_strong)
                 duplicates += 1
+
+                # Stats: stub file added
+                from file_hunter.stats_db import update_stats_for_files
+                await update_stats_for_files(
+                    location_id,
+                    added=[(folder_id, stub_size, "text", 0)],
+                )
+
                 await broadcast(
                     {
                         "type": "upload_duplicate",
@@ -148,6 +156,14 @@ async def run_upload(
 
                 affected_hashes.add(hash_strong)
                 cataloged += 1
+
+                # Stats: new file added
+                is_hidden = 1 if sf["filename"].startswith(".") else 0
+                from file_hunter.stats_db import update_stats_for_files
+                await update_stats_for_files(
+                    location_id,
+                    added=[(folder_id, file_size, type_high, is_hidden)],
+                )
 
             await broadcast(
                 {

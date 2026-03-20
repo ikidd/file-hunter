@@ -8,7 +8,9 @@ from file_hunter.services import fs
 async def delete_file(db, file_id: int) -> dict:
     """Delete a single file from disk and catalog."""
     row = await db.execute_fetchall(
-        """SELECT f.id, f.filename, f.full_path, f.location_id, f.hash_fast, f.hash_strong, l.root_path
+        """SELECT f.id, f.filename, f.full_path, f.location_id,
+                  f.folder_id, f.file_size, f.file_type_high, f.hidden,
+                  f.hash_fast, f.hash_strong, l.root_path
            FROM files f
            JOIN locations l ON l.id = f.location_id
            WHERE f.id = ?""",
@@ -53,14 +55,17 @@ async def delete_file(db, file_id: int) -> dict:
     from file_hunter.hashes_db import remove_file_hashes
     await remove_file_hashes([file_id])
 
+    from file_hunter.stats_db import update_stats_for_files
+    await update_stats_for_files(
+        location_id,
+        removed=[(rec["folder_id"], rec["file_size"] or 0, rec["file_type_high"], rec["hidden"])],
+    )
+
     from file_hunter.services.stats import invalidate_stats_cache
 
     invalidate_stats_cache()
 
-    from file_hunter.services.sizes import schedule_size_recalc
     from file_hunter.services.dup_counts import submit_hashes_for_recalc
-
-    schedule_size_recalc(location_id)
     if hash_strong:
         submit_hashes_for_recalc(
             strong_hashes={hash_strong}, source=f"delete {filename}"
@@ -98,7 +103,8 @@ async def delete_file_and_duplicates(db, file_id: int) -> dict:
 
     # Find all files with the same effective hash
     all_rows = await db.execute_fetchall(
-        f"""SELECT f.id, f.full_path, f.location_id, l.root_path
+        f"""SELECT f.id, f.full_path, f.location_id, f.folder_id,
+                  f.file_size, f.file_type_high, f.hidden, l.root_path
            FROM files f
            JOIN locations l ON l.id = f.location_id
            WHERE f.{hash_col} = ?""",
@@ -109,6 +115,7 @@ async def delete_file_and_duplicates(db, file_id: int) -> dict:
     deleted_from_disk_count = 0
     deferred_count = 0
     deleted_ids: list[int] = []
+    removed_by_loc: dict[int, list[tuple]] = {}
 
     for rec in all_rows:
         fid = rec["id"]
@@ -125,8 +132,12 @@ async def delete_file_and_duplicates(db, file_id: int) -> dict:
             await db.execute("DELETE FROM files WHERE id = ?", (fid,))
             deleted_ids.append(fid)
             deleted_count += 1
+            if loc_id not in removed_by_loc:
+                removed_by_loc[loc_id] = []
+            removed_by_loc[loc_id].append(
+                (rec["folder_id"], rec["file_size"] or 0, rec["file_type_high"], rec["hidden"])
+            )
         else:
-            # Defer for offline locations
             from file_hunter.services.deferred_ops import queue_deferred_op
 
             await queue_deferred_op(db, fid, loc_id, "delete")
@@ -137,6 +148,12 @@ async def delete_file_and_duplicates(db, file_id: int) -> dict:
     if deleted_ids:
         from file_hunter.hashes_db import remove_file_hashes
         await remove_file_hashes(deleted_ids)
+
+    # Update stats per affected location
+    if removed_by_loc:
+        from file_hunter.stats_db import update_stats_for_files
+        for loc_id, removed_files in removed_by_loc.items():
+            await update_stats_for_files(loc_id, removed=removed_files)
 
     from file_hunter.services.stats import invalidate_stats_cache
 
@@ -220,9 +237,10 @@ async def delete_folder(db, folder_id: int) -> dict:
             await fs.dir_delete(abs_path, location_id)
             deleted_from_disk = True
 
-    # Collect file IDs for hashes cleanup before deleting
-    file_id_rows = await db.execute_fetchall(
-        """SELECT id FROM files WHERE folder_id IN (
+    # Collect file info for hashes + stats cleanup before deleting
+    file_info_rows = await db.execute_fetchall(
+        """SELECT id, folder_id, file_size, file_type_high, hidden
+           FROM files WHERE folder_id IN (
                WITH RECURSIVE descendants(id) AS (
                    SELECT ? UNION ALL
                    SELECT f.id FROM folders f JOIN descendants d ON f.parent_id = d.id
@@ -231,7 +249,22 @@ async def delete_folder(db, folder_id: int) -> dict:
            )""",
         (folder_id,),
     )
-    deleted_file_ids = [r["id"] for r in file_id_rows]
+    deleted_file_ids = [r["id"] for r in file_info_rows]
+    removed_deltas = [
+        (r["folder_id"], r["file_size"] or 0, r["file_type_high"], r["hidden"])
+        for r in file_info_rows
+    ]
+
+    # Collect descendant folder IDs for stats cleanup
+    desc_folder_rows = await db.execute_fetchall(
+        """WITH RECURSIVE descendants(id) AS (
+               SELECT ? UNION ALL
+               SELECT f.id FROM folders f JOIN descendants d ON f.parent_id = d.id
+           )
+           SELECT id FROM descendants""",
+        (folder_id,),
+    )
+    deleted_folder_ids = [r["id"] for r in desc_folder_rows]
 
     # Delete files first (folder FK is ON DELETE SET NULL, not CASCADE)
     await db.execute(
@@ -252,6 +285,12 @@ async def delete_folder(db, folder_id: int) -> dict:
     if deleted_file_ids:
         from file_hunter.hashes_db import remove_file_hashes
         await remove_file_hashes(deleted_file_ids)
+
+    # Update stats: remove file deltas from ancestor folders, remove folder_stats entries
+    if removed_deltas:
+        from file_hunter.stats_db import update_stats_for_files, remove_folder_stats
+        await update_stats_for_files(location_id, removed=removed_deltas)
+        await remove_folder_stats(deleted_folder_ids)
 
     from file_hunter.services.stats import invalidate_stats_cache
 

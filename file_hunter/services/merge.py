@@ -267,6 +267,11 @@ async def run_merge(source_id, source_info, destination_id, dest_info):
                             ),
                         )
 
+                    # Stats: file added at destination
+                    from file_hunter.stats_db import update_stats_for_files as _usf
+                    await _usf(dest_loc_id, added=[(dest_folder_id, file_size, type_high, 1)])
+
+                    async with db_writer() as wdb:
                         # Stub source with .moved
                         # Get IDs of files being replaced at stub path
                         _replaced = await wdb.execute_fetchall(
@@ -297,6 +302,14 @@ async def run_merge(source_id, source_info, destination_id, dest_info):
                     from file_hunter.hashes_db import remove_file_hashes
                     _del_ids = [r["id"] for r in _replaced] + [src_file["id"]]
                     await remove_file_hashes(_del_ids)
+
+                    # Stats: original file removed, stub added (size=0)
+                    from file_hunter.stats_db import update_stats_for_files
+                    await update_stats_for_files(
+                        src_file["location_id"],
+                        removed=[(src_file["folder_id"], src_file["file_size"] or 0, src_file["file_type_high"], src_file["hidden"])],
+                        added=[(src_file["folder_id"], 0, "text", 0)],
+                    )
 
                     # Filesystem I/O outside write lock
                     await fs.write_moved_stub(
@@ -395,6 +408,13 @@ async def run_merge(source_id, source_info, destination_id, dest_info):
                     from file_hunter.hashes_db import remove_file_hashes
                     _del_ids = [r["id"] for r in _replaced] + [src_file["id"]]
                     await remove_file_hashes(_del_ids)
+
+                    from file_hunter.stats_db import update_stats_for_files
+                    await update_stats_for_files(
+                        src_file["location_id"],
+                        removed=[(src_file["folder_id"], src_file["file_size"] or 0, src_file["file_type_high"], src_file["hidden"])],
+                        added=[(src_file["folder_id"], 0, "text", 0)],
+                    )
 
                     # Filesystem: write .moved stub at source (outside write lock)
                     await fs.write_moved_stub(
@@ -541,6 +561,12 @@ async def run_merge(source_id, source_info, destination_id, dest_info):
                         )
                         new_dest_file_id = new_rows[0]["id"] if new_rows else None
 
+                    # Stats: file added at destination
+                    from file_hunter.stats_db import update_stats_for_files as _usf
+                    is_hidden = 1 if dest_file_name.startswith(".") else 0
+                    await _usf(dest_loc_id, added=[(dest_folder_id, file_size, type_high, is_hidden)])
+
+                    async with db_writer() as wdb:
                         # DB operations for source stub
                         # Remove any stale .moved record (e.g. from a previous merge)
                         _replaced = await wdb.execute_fetchall(
@@ -571,6 +597,13 @@ async def run_merge(source_id, source_info, destination_id, dest_info):
                     from file_hunter.hashes_db import remove_file_hashes
                     _del_ids = [r["id"] for r in _replaced] + [src_file["id"]]
                     await remove_file_hashes(_del_ids)
+
+                    from file_hunter.stats_db import update_stats_for_files
+                    await update_stats_for_files(
+                        src_file["location_id"],
+                        removed=[(src_file["folder_id"], src_file["file_size"] or 0, src_file["file_type_high"], src_file["hidden"])],
+                        added=[(src_file["folder_id"], 0, "text", 0)],
+                    )
 
                     # Add to index so subsequent files with same hash are caught
                     dest_hash_index[copy_strong] = {

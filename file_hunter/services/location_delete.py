@@ -105,9 +105,11 @@ async def _purge_location_batched(location_id: int):
     """Remove all traces of a location, batched to avoid holding writer lock."""
     from file_hunter.db import db_writer
     from file_hunter.hashes_db import remove_location_hashes
+    from file_hunter.stats_db import remove_location_stats
 
-    # Remove all hashes for this location from hashes.db
+    # Remove all hashes and stats for this location
     await remove_location_hashes(location_id)
+    await remove_location_stats(location_id)
 
     DELETE_BATCH = 5000
 
