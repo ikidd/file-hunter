@@ -1121,8 +1121,9 @@ async def _diff_and_update(
             "Rescan: %d hash partials applied for %s", hashed, location_name
         )
 
-    # Register hashes in hashes.db
-    await _register_hashes_for_location(location_id, location_name)
+    # Register hashes in hashes.db — only if files changed
+    if new_count > 0 or changed_count > 0 or stale_count > 0:
+        await _register_hashes_for_location(location_id, location_name)
 
     # Broadcast updated tree children
     await _broadcast_location_children(location_id)
