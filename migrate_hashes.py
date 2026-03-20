@@ -56,10 +56,10 @@ def migrate(catalog_path: str, hashes_path: str):
     )
     hdb.commit()
 
-    # Count total files with any hash data
+    # Count total files with any hash data (including excluded — they keep their hashes)
     total = cat.execute(
         "SELECT COUNT(*) FROM files "
-        "WHERE stale = 0 AND dup_exclude = 0 "
+        "WHERE stale = 0 "
         "AND (hash_partial IS NOT NULL OR hash_fast IS NOT NULL OR hash_strong IS NOT NULL)"
     ).fetchone()[0]
 
@@ -79,9 +79,9 @@ def migrate(catalog_path: str, hashes_path: str):
 
     while True:
         rows = cat.execute(
-            "SELECT id, location_id, file_size, hash_partial, hash_fast, hash_strong "
+            "SELECT id, location_id, file_size, hash_partial, hash_fast, hash_strong, dup_exclude "
             "FROM files "
-            "WHERE id > ? AND stale = 0 AND dup_exclude = 0 "
+            "WHERE id > ? AND stale = 0 "
             "AND (hash_partial IS NOT NULL OR hash_fast IS NOT NULL OR hash_strong IS NOT NULL) "
             "ORDER BY id LIMIT ?",
             (last_id, BATCH),
@@ -92,14 +92,15 @@ def migrate(catalog_path: str, hashes_path: str):
 
         batch = [
             (r["id"], r["location_id"], r["file_size"],
-             r["hash_partial"], r["hash_fast"], r["hash_strong"])
+             r["hash_partial"], r["hash_fast"], r["hash_strong"],
+             1 if r["dup_exclude"] else 0)
             for r in rows
         ]
 
         hdb.executemany(
             "INSERT OR REPLACE INTO file_hashes "
-            "(file_id, location_id, file_size, hash_partial, hash_fast, hash_strong) "
-            "VALUES (?, ?, ?, ?, ?, ?)",
+            "(file_id, location_id, file_size, hash_partial, hash_fast, hash_strong, excluded) "
+            "VALUES (?, ?, ?, ?, ?, ?, ?)",
             batch,
         )
         hdb.commit()
@@ -130,8 +131,8 @@ def migrate(catalog_path: str, hashes_path: str):
     t1 = time.monotonic()
 
     hash_configs = [
-        ("hash_strong", " AND hash_strong IS NULL"),
-        ("hash_fast", ""),
+        ("hash_strong", ""),
+        ("hash_fast", " AND hash_strong IS NULL"),
     ]
 
     total_updated = 0
