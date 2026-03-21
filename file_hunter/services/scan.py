@@ -174,7 +174,7 @@ async def run_scan(op_id: int, agent_id: int, params: dict):
             )
 
             # --- Phase 2: diff temp DB against catalog, apply changes ---
-            new_count, changed_count, stale_count = await _diff_and_update(
+            new_count, changed_count, stale_count, recovered_count = await _diff_and_update(
                 tmp_path,
                 location_id,
                 scan_id,
@@ -183,19 +183,21 @@ async def run_scan(op_id: int, agent_id: int, params: dict):
                 agent_id,
                 location_name,
                 files_found,
+                scan_prefix=scan_prefix,
             )
             files_new = new_count
 
             logger.info(
-                "Rescan diff complete: %d new, %d changed, %d stale for %s",
+                "Rescan diff complete: %d new, %d changed, %d stale, %d recovered for %s",
                 new_count,
                 changed_count,
                 stale_count,
+                recovered_count,
                 location_name,
             )
 
-            # --- Phase 3: find dup candidates for new/changed files ---
-            if new_count > 0 or changed_count > 0:
+            # --- Phase 3: find dup candidates for new/changed/recovered files ---
+            if new_count > 0 or changed_count > 0 or recovered_count > 0:
                 from file_hunter.services.dup_counts import post_ingest_dup_processing
 
                 candidates_total = await post_ingest_dup_processing(
@@ -861,11 +863,15 @@ async def _diff_and_update(
     agent_id: int,
     location_name: str,
     total_files: int,
+    scan_prefix: str | None = None,
 ) -> tuple[int, int, int]:
     """Diff temp DB against catalog and apply only changes.
 
     Uses ATTACH DATABASE to JOIN temp DB and catalog in a single query.
     Only new/changed files are written. Missing files are marked stale.
+
+    When scan_prefix is set (subfolder scan), stale detection is scoped
+    to files within that prefix only.
 
     Returns (new_count, changed_count, stale_count).
     """
@@ -961,6 +967,7 @@ async def _diff_and_update(
         )
 
         # Stale files: in catalog but not in temp DB (with details for stats)
+        # Scoped to scan_prefix for subfolder scans
         await broadcast(
             {
                 "type": "scan_progress",
@@ -970,15 +977,38 @@ async def _diff_and_update(
                 "compareStep": f"{new_count:,} new, {changed_count:,} changed — finding stale files...",
             }
         )
+        stale_scope = ""
+        stale_params = [location_id]
+        if scan_prefix:
+            stale_scope = " AND c.rel_path LIKE ?"
+            stale_params.append(scan_prefix + "/%")
         stale_ids = await conn.execute_fetchall(
             "SELECT c.id, c.folder_id, c.file_size, c.file_type_high, c.hidden "
             "FROM main.files c "
             "LEFT JOIN temp_scan.files t ON t.rel_path = c.rel_path "
-            "WHERE c.location_id = ? AND c.stale = 0 AND t.rel_path IS NULL",
-            (location_id,),
+            f"WHERE c.location_id = ? AND c.stale = 0 AND t.rel_path IS NULL{stale_scope}",
+            stale_params,
         )
         stale_count = len(stale_ids)
         logger.info("Rescan diff: %d stale files for %s", stale_count, location_name)
+
+        # Recovered files: stale in catalog but exist on disk (in temp DB)
+        # Un-stale them and update scan_id
+        recovered_scope = ""
+        recovered_params = [location_id]
+        if scan_prefix:
+            recovered_scope = " AND c.rel_path LIKE ?"
+            recovered_params.append(scan_prefix + "/%")
+        recovered_rows = await conn.execute_fetchall(
+            "SELECT c.id "
+            "FROM main.files c "
+            "INNER JOIN temp_scan.files t ON t.rel_path = c.rel_path "
+            f"WHERE c.location_id = ? AND c.stale = 1{recovered_scope}",
+            recovered_params,
+        )
+        recovered_count = len(recovered_rows)
+        if recovered_count > 0:
+            logger.info("Rescan diff: %d recovered (un-staled) files for %s", recovered_count, location_name)
 
         await conn.execute("DETACH DATABASE temp_scan")
     finally:
@@ -1010,6 +1040,40 @@ async def _diff_and_update(
             for r in stale_ids
         ]
         await _apply_deltas(location_id, folder_parents, removed=stale_removed)
+
+    # Un-stale recovered files
+    if recovered_rows:
+        recovered_id_list = [r["id"] for r in recovered_rows]
+        for i in range(0, len(recovered_id_list), 5000):
+            batch = recovered_id_list[i : i + 5000]
+            ph = ",".join("?" for _ in batch)
+            async with db_writer() as db:
+                await db.execute(
+                    f"UPDATE files SET stale = 0, scan_id = ? WHERE id IN ({ph})",
+                    [scan_id] + batch,
+                )
+            await asyncio.sleep(0)
+
+        # Recovered files need hash_partial re-registered in hashes.db
+        # (removed when they went stale). Bulk re-insert from catalog data.
+        async with read_db() as rdb:
+            for i in range(0, len(recovered_id_list), 500):
+                batch = recovered_id_list[i : i + 500]
+                ph = ",".join("?" for _ in batch)
+                rows = await rdb.execute_fetchall(
+                    f"SELECT id, location_id, file_size, hash_partial "
+                    f"FROM files WHERE id IN ({ph})",
+                    batch,
+                )
+        if rows:
+            async with hashes_writer() as hdb:
+                for r in rows:
+                    await hdb.execute(
+                        "INSERT OR IGNORE INTO file_hashes "
+                        "(file_id, location_id, file_size, hash_partial) "
+                        "VALUES (?, ?, ?, ?)",
+                        (r["id"], r["location_id"], r["file_size"], r["hash_partial"]),
+                    )
 
     # Mark all seen files with current scan_id — batched to avoid holding writer
     async with read_db() as rdb:
@@ -1310,7 +1374,7 @@ async def _diff_and_update(
     # Broadcast updated tree children
     await _broadcast_location_children(location_id)
 
-    return new_count, changed_count, stale_count
+    return new_count, changed_count, stale_count, recovered_count
 
 
 async def _write_hash_partials_to_hashes_db(
