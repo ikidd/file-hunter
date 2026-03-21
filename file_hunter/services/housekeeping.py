@@ -405,6 +405,12 @@ async def _queue_pending_hash_candidates():
             {"location_id": loc["id"], "location_name": loc["name"]},
         )
 
+    names = ", ".join(loc["name"] for loc in loc_rows)
+    await broadcast({
+        "type": "activity",
+        "message": f"Duplicate detection queued for: {names}",
+    })
+
 
 async def _run_hash_candidates(task_id: int, agent_id: int | None, params: dict):
     """Find and hash dup candidates for a location.
