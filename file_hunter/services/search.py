@@ -96,6 +96,7 @@ async def search_files(
     page=0,
     sort="name",
     sort_dir="asc",
+    cached_total=None,
 ):
     """Search files with optional filters. Returns paged envelope."""
     from file_hunter.services.settings import get_setting
@@ -204,12 +205,15 @@ async def search_files(
     total = 0
     items = []
     if include_files:
-        # Count total matching
-        count_row = await db.execute_fetchall(
-            f"SELECT COUNT(*) as cnt FROM files f WHERE {where}",
-            params,
-        )
-        total = count_row[0]["cnt"] if count_row else 0
+        # Count total matching — skip if client cached it from a previous page
+        if cached_total is not None:
+            total = cached_total
+        else:
+            count_row = await db.execute_fetchall(
+                f"SELECT COUNT(*) as cnt FROM files f WHERE {where}",
+                params,
+            )
+            total = count_row[0]["cnt"] if count_row else 0
 
         # Fetch paged results (structural data — hashes from hashes.db)
         rows = await db.execute_fetchall(
@@ -483,6 +487,7 @@ async def search_files_advanced(
     page=0,
     sort="name",
     sort_dir="asc",
+    cached_total=None,
 ):
     """Search files with advanced include/exclude conditions."""
     from file_hunter.services.settings import get_setting
@@ -520,11 +525,14 @@ async def search_files_advanced(
     total = 0
     items = []
     if include_files:
-        count_row = await db.execute_fetchall(
-            f"SELECT COUNT(*) as cnt FROM files f WHERE {where}",
-            where_params,
-        )
-        total = count_row[0]["cnt"] if count_row else 0
+        if cached_total is not None:
+            total = cached_total
+        else:
+            count_row = await db.execute_fetchall(
+                f"SELECT COUNT(*) as cnt FROM files f WHERE {where}",
+                where_params,
+            )
+            total = count_row[0]["cnt"] if count_row else 0
 
         rows = await db.execute_fetchall(
             f"""SELECT f.id, f.filename, f.file_type_high, f.file_type_low,

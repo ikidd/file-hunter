@@ -460,6 +460,9 @@ const FileList = {
         params.set('page', this.currentPage);
         params.set('sort', this.sortKey);
         params.set('sortDir', this._sortDirStr());
+        if (this.currentPage > 0 && this.totalFiles > 0) {
+            params.set('cachedTotal', this.totalFiles);
+        }
 
         let res;
         try {

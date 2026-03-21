@@ -35,6 +35,7 @@ async def search(request: Request):
                 page=page,
                 sort=sort,
                 sort_dir=sort_dir,
+                cached_total=int(request.query_params["cachedTotal"]) if "cachedTotal" in request.query_params else None,
             )
         else:
             results = await search_files(
@@ -59,6 +60,7 @@ async def search(request: Request):
                 page=page,
                 sort=sort,
                 sort_dir=sort_dir,
+                cached_total=int(request.query_params["cachedTotal"]) if "cachedTotal" in request.query_params else None,
             )
     return json_ok(results)
 
