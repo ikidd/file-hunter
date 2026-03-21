@@ -154,35 +154,36 @@ async def list_files(
 
     strong_list = [h["hash_strong"] for h in hash_map.values() if h["hash_strong"]]
     fast_list = [
-        h["hash_fast"] for h in hash_map.values()
+        h["hash_fast"]
+        for h in hash_map.values()
         if not h["hash_strong"] and h["hash_fast"]
     ]
-    live_dups = await batch_dup_counts(
-        strong_hashes=strong_list, fast_hashes=fast_list
-    )
+    live_dups = await batch_dup_counts(strong_hashes=strong_list, fast_hashes=fast_list)
 
     file_items = []
     for f in files:
         h = hash_map.get(f["id"], {})
         hs = h.get("hash_strong")
         hf = h.get("hash_fast")
-        file_items.append({
-            "id": f["id"],
-            "name": f["filename"],
-            "typeHigh": f["file_type_high"],
-            "typeLow": f["file_type_low"],
-            "size": f["file_size"],
-            "date": f["modified_date"],
-            "dups": live_dups.get(hs or hf, 0),
-            "hashStrong": hs,
-            "hashFast": hf,
-            "stale": bool(f["stale"]) and f["id"] not in unstale_set,
-            "missing": False
-            if (f["stale"] and f["id"] not in unstale_set)
-            else f["id"] in missing_file_ids,
-            "hidden": bool(f["hidden"]),
-            "pendingOp": f["pending_op"],
-        })
+        file_items.append(
+            {
+                "id": f["id"],
+                "name": f["filename"],
+                "typeHigh": f["file_type_high"],
+                "typeLow": f["file_type_low"],
+                "size": f["file_size"],
+                "date": f["modified_date"],
+                "dups": live_dups.get(hs or hf, 0),
+                "hashStrong": hs,
+                "hashFast": hf,
+                "stale": bool(f["stale"]) and f["id"] not in unstale_set,
+                "missing": False
+                if (f["stale"] and f["id"] not in unstale_set)
+                else f["id"] in missing_file_ids,
+                "hidden": bool(f["hidden"]),
+                "pendingOp": f["pending_op"],
+            }
+        )
 
     # Build breadcrumb for folder navigation
     breadcrumb = []

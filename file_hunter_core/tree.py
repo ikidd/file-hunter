@@ -30,8 +30,9 @@ from file_hunter_core.hasher import hash_file_partial_sync
 logger = logging.getLogger("file_hunter_agent")
 
 
-def walk_tree(root: str, prefix: str | None = None, fmt: str = "tsv",
-              metadata_only: bool = False):
+def walk_tree(
+    root: str, prefix: str | None = None, fmt: str = "tsv", metadata_only: bool = False
+):
     """BFS generator: metadata phase then hash phase.
 
     Args:
@@ -53,7 +54,9 @@ def walk_tree(root: str, prefix: str | None = None, fmt: str = "tsv",
     total_files = 0
 
     # Collect all files for hash phase
-    all_files: list[tuple[int, str, str, int]] = []  # (inode, full_path, rel_path, size)
+    all_files: list[
+        tuple[int, str, str, int]
+    ] = []  # (inode, full_path, rel_path, size)
 
     # --- Phase 1: metadata ---
     while queue:
@@ -110,9 +113,7 @@ def walk_tree(root: str, prefix: str | None = None, fmt: str = "tsv",
             ino = st.st_ino
             if ino >= 2**63:
                 ino -= 2**64
-            dir_files.append(
-                (ino, entry.path, rel_path, st.st_size, mtime, ctime)
-            )
+            dir_files.append((ino, entry.path, rel_path, st.st_size, mtime, ctime))
 
         # Build chunk: D record + F records (no hashes)
         lines = [f"D\t{rel_dir.replace(chr(9), ' ')}\n"]

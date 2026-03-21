@@ -162,16 +162,16 @@ async def apply_file_deltas(
         if folder_id not in direct:
             direct[folder_id] = [0, 0, 0, {}]
         d = direct[folder_id]
-        d[0] += sign          # count
+        d[0] += sign  # count
         d[1] += file_size * sign  # size
         if is_hidden:
-            d[2] += sign      # hidden
+            d[2] += sign  # hidden
         if file_type_high:
             d[3][file_type_high] = d[3].get(file_type_high, 0) + sign
 
-    for folder_id, file_size, file_type_high, is_hidden in (added or []):
+    for folder_id, file_size, file_type_high, is_hidden in added or []:
         _apply(folder_id, file_size, file_type_high, is_hidden, 1)
-    for folder_id, file_size, file_type_high, is_hidden in (removed or []):
+    for folder_id, file_size, file_type_high, is_hidden in removed or []:
         _apply(folder_id, file_size, file_type_high, is_hidden, -1)
 
     # Step 2: cascade — each folder's delta includes its own files plus
@@ -245,8 +245,14 @@ async def apply_file_deltas(
                     "(folder_id, location_id, file_count, total_size, "
                     "hidden_count, type_counts) "
                     "VALUES (?, ?, ?, ?, ?, ?)",
-                    (fid, location_id, max(0, delta[0]), max(0, delta[1]),
-                     max(0, delta[2]), json.dumps(init_types)),
+                    (
+                        fid,
+                        location_id,
+                        max(0, delta[0]),
+                        max(0, delta[1]),
+                        max(0, delta[2]),
+                        json.dumps(init_types),
+                    ),
                 )
 
         # Update location_stats
@@ -277,9 +283,29 @@ async def apply_file_deltas(
                 "INSERT INTO location_stats "
                 "(location_id, file_count, total_size, hidden_count, type_counts) "
                 "VALUES (?, ?, ?, ?, ?)",
-                (location_id, max(0, loc_count), max(0, loc_size),
-                 max(0, loc_hidden), json.dumps(init_lt)),
+                (
+                    location_id,
+                    max(0, loc_count),
+                    max(0, loc_size),
+                    max(0, loc_hidden),
+                    json.dumps(init_lt),
+                ),
             )
+
+    # Patch the stats cache so the API returns current values
+    from file_hunter.services.stats import _cache
+
+    loc_entry = _cache.get(f"loc:{location_id}")
+    if loc_entry is not None:
+        new_fc = (loc_row["file_count"] or 0) + loc_count if loc_row else loc_count
+        new_ts = (loc_row["total_size"] or 0) + loc_size if loc_row else loc_size
+        new_hc = (loc_row["hidden_count"] or 0) + loc_hidden if loc_row else loc_hidden
+        loc_entry["fileCount"] = max(0, new_fc)
+        loc_entry["totalSize"] = max(0, new_ts)
+        from file_hunter.core import format_size
+
+        loc_entry["totalSizeFormatted"] = format_size(max(0, new_ts))
+        loc_entry["hiddenFiles"] = max(0, new_hc)
 
     return {
         "fileCount": (loc_row["file_count"] or 0) + loc_count if loc_row else loc_count,

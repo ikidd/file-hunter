@@ -47,6 +47,7 @@ async def _mark_stale_files(
     stale_ids = [r["id"] for r in stale_rows]
     if stale_ids:
         from file_hunter.hashes_db import remove_file_hashes
+
         await remove_file_hashes(stale_ids)
 
     return cursor.rowcount

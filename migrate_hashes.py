@@ -45,9 +45,7 @@ def migrate(catalog_path: str, hashes_path: str):
         "CREATE INDEX IF NOT EXISTS idx_hashes_size_partial "
         "ON file_hashes(file_size, hash_partial)"
     )
-    hdb.execute(
-        "CREATE INDEX IF NOT EXISTS idx_hashes_fast ON file_hashes(hash_fast)"
-    )
+    hdb.execute("CREATE INDEX IF NOT EXISTS idx_hashes_fast ON file_hashes(hash_fast)")
     hdb.execute(
         "CREATE INDEX IF NOT EXISTS idx_hashes_strong ON file_hashes(hash_strong)"
     )
@@ -91,9 +89,15 @@ def migrate(catalog_path: str, hashes_path: str):
             break
 
         batch = [
-            (r["id"], r["location_id"], r["file_size"],
-             r["hash_partial"], r["hash_fast"], r["hash_strong"],
-             1 if r["dup_exclude"] else 0)
+            (
+                r["id"],
+                r["location_id"],
+                r["file_size"],
+                r["hash_partial"],
+                r["hash_fast"],
+                r["hash_strong"],
+                1 if r["dup_exclude"] else 0,
+            )
             for r in rows
         ]
 
@@ -162,7 +166,11 @@ def migrate(catalog_path: str, hashes_path: str):
             updated += 1
             if updated % 10000 == 0:
                 hdb.commit()
-                print(f"\r    {updated:,} / {dup_count:,} groups updated\033[K", end="", flush=True)
+                print(
+                    f"\r    {updated:,} / {dup_count:,} groups updated\033[K",
+                    end="",
+                    flush=True,
+                )
 
         hdb.commit()
         total_updated += updated
@@ -182,13 +190,17 @@ def migrate(catalog_path: str, hashes_path: str):
 
 
 def main():
-    parser = argparse.ArgumentParser(description="Migrate hashes from catalog to hashes.db")
+    parser = argparse.ArgumentParser(
+        description="Migrate hashes from catalog to hashes.db"
+    )
     parser.add_argument(
-        "--catalog", default="data/file_hunter.db",
+        "--catalog",
+        default="data/file_hunter.db",
         help="Path to catalog DB (default: data/file_hunter.db)",
     )
     parser.add_argument(
-        "--hashes", default="data/hashes.db",
+        "--hashes",
+        default="data/hashes.db",
         help="Path to hashes DB (default: data/hashes.db)",
     )
     args = parser.parse_args()

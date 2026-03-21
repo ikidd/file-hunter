@@ -27,6 +27,7 @@ async def delete_file(db, file_id: int) -> dict:
 
     # Get hash values from hashes.db for dup recalc
     from file_hunter.hashes_db import get_file_hashes
+
     h_map = await get_file_hashes([file_id])
     h = h_map.get(file_id, {})
     hash_fast = h.get("hash_fast")
@@ -58,12 +59,21 @@ async def delete_file(db, file_id: int) -> dict:
     await db.commit()
 
     from file_hunter.hashes_db import remove_file_hashes
+
     await remove_file_hashes([file_id])
 
     from file_hunter.stats_db import update_stats_for_files
+
     await update_stats_for_files(
         location_id,
-        removed=[(rec["folder_id"], rec["file_size"] or 0, rec["file_type_high"], rec["hidden"])],
+        removed=[
+            (
+                rec["folder_id"],
+                rec["file_size"] or 0,
+                rec["file_type_high"],
+                rec["hidden"],
+            )
+        ],
     )
 
     from file_hunter.services.stats import invalidate_stats_cache
@@ -71,6 +81,7 @@ async def delete_file(db, file_id: int) -> dict:
     invalidate_stats_cache()
 
     from file_hunter.services.dup_counts import submit_hashes_for_recalc
+
     if hash_strong:
         submit_hashes_for_recalc(
             strong_hashes={hash_strong}, source=f"delete {filename}"
@@ -98,6 +109,7 @@ async def delete_file_and_duplicates(db, file_id: int) -> dict:
     filename = row[0]["filename"]
 
     from file_hunter.hashes_db import get_file_hashes
+
     h_map = await get_file_hashes([file_id])
     h = h_map.get(file_id, {})
     hash_strong = h.get("hash_strong")
@@ -111,6 +123,7 @@ async def delete_file_and_duplicates(db, file_id: int) -> dict:
 
     # Find all files with the same effective hash from hashes.db
     from file_hunter.hashes_db import read_hashes
+
     async with read_hashes() as hdb:
         dup_rows = await hdb.execute_fetchall(
             f"SELECT file_id FROM active_hashes WHERE {hash_col} = ?",
@@ -155,7 +168,12 @@ async def delete_file_and_duplicates(db, file_id: int) -> dict:
             if loc_id not in removed_by_loc:
                 removed_by_loc[loc_id] = []
             removed_by_loc[loc_id].append(
-                (rec["folder_id"], rec["file_size"] or 0, rec["file_type_high"], rec["hidden"])
+                (
+                    rec["folder_id"],
+                    rec["file_size"] or 0,
+                    rec["file_type_high"],
+                    rec["hidden"],
+                )
             )
         else:
             from file_hunter.services.deferred_ops import queue_deferred_op
@@ -167,11 +185,13 @@ async def delete_file_and_duplicates(db, file_id: int) -> dict:
 
     if deleted_ids:
         from file_hunter.hashes_db import remove_file_hashes
+
         await remove_file_hashes(deleted_ids)
 
     # Update stats per affected location
     if removed_by_loc:
         from file_hunter.stats_db import update_stats_for_files
+
         for loc_id, removed_files in removed_by_loc.items():
             await update_stats_for_files(loc_id, removed=removed_files)
 
@@ -304,11 +324,13 @@ async def delete_folder(db, folder_id: int) -> dict:
 
     if deleted_file_ids:
         from file_hunter.hashes_db import remove_file_hashes
+
         await remove_file_hashes(deleted_file_ids)
 
     # Update stats: remove file deltas from ancestor folders, remove folder_stats entries
     if removed_deltas:
         from file_hunter.stats_db import update_stats_for_files, remove_folder_stats
+
         await update_stats_for_files(location_id, removed=removed_deltas)
         await remove_folder_stats(deleted_folder_ids)
 

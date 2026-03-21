@@ -73,6 +73,7 @@ async def init_hashes_db():
 
         # Column migration (idempotent)
         import sqlite3 as _sqlite3
+
         try:
             await conn.execute(
                 "ALTER TABLE file_hashes ADD COLUMN excluded INTEGER NOT NULL DEFAULT 0"

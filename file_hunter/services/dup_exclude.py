@@ -138,14 +138,14 @@ async def toggle_dup_exclude(folder_id: int, exclude: bool):
         # Recursive CTE on folders table (small — ~100K rows max)
         async with read_db() as db:
             desc_rows = await db.execute_fetchall(
-            """WITH RECURSIVE descendants(id) AS (
+                """WITH RECURSIVE descendants(id) AS (
                    SELECT ?
                    UNION ALL
                    SELECT fo.id FROM folders fo JOIN descendants d ON fo.parent_id = d.id
                )
                SELECT id FROM descendants""",
-            (folder_id,),
-        )
+                (folder_id,),
+            )
         folder_ids = [r["id"] for r in desc_rows]
 
         # Batch folder flag updates
@@ -250,6 +250,7 @@ async def toggle_dup_exclude(folder_id: int, exclude: bool):
 
         # Toggle excluded flag in hashes.db — preserves hash data
         from file_hunter.hashes_db import hashes_writer
+
         for i in range(0, len(all_file_ids), 500):
             batch = all_file_ids[i : i + 500]
             ph = ",".join("?" for _ in batch)

@@ -291,6 +291,16 @@ async def _recover_interrupted():
     """On startup, reset any 'running' operations back to 'pending'
     and mark orphaned scan records as 'interrupted'."""
     async with db_writer() as db:
+        # Migration: delete_location moved to housekeeping queue
+        del_cursor = await db.execute(
+            "DELETE FROM operation_queue WHERE type = 'delete_location'"
+        )
+        if del_cursor.rowcount > 0:
+            logger.info(
+                "Queue manager: removed %d stale delete_location ops (moved to housekeeping)",
+                del_cursor.rowcount,
+            )
+
         cursor = await db.execute(
             "UPDATE operation_queue SET status = 'pending', started_at = NULL "
             "WHERE status = 'running'"
@@ -497,12 +507,6 @@ async def _handle_backfill_location(op_id: int, agent_id: int | None, params: di
     await run_backfill(agent_id, location_id, location_name, scan_prefix)
 
 
-async def _handle_delete_location(op_id: int, agent_id: int | None, params: dict):
-    from file_hunter.services.location_delete import run_delete_location
-
-    await run_delete_location(op_id, agent_id, params)
-
-
 async def _handle_rehash_partial(op_id: int, agent_id: int | None, params: dict):
     from file_hunter.services.rehash_partial import run_rehash_partial
 
@@ -518,7 +522,6 @@ async def _handle_hash_file(op_id: int, agent_id: int | None, params: dict):
 _HANDLERS = {
     "scan_dir": _handle_scan_dir,
     "backfill_location": _handle_backfill_location,
-    "delete_location": _handle_delete_location,
     "rehash_partial": _handle_rehash_partial,
     "hash_file": _handle_hash_file,
 }
@@ -531,7 +534,6 @@ async def get_queue_status_for_broadcast() -> dict:
     # Split running ops by type so frontend can show correct badges
     scanning_ids = []
     backfilling_ids = []
-    deleting_ids = []
     all_running_ids = []
     for item in status:
         if item.get("status") != "running":
@@ -545,8 +547,6 @@ async def get_queue_status_for_broadcast() -> dict:
             scanning_ids.append(loc_id)
         elif op_type in ("backfill_location", "hash_file"):
             backfilling_ids.append(loc_id)
-        elif op_type == "delete_location":
-            deleting_ids.append(loc_id)
 
     pending = [
         {
@@ -564,7 +564,6 @@ async def get_queue_status_for_broadcast() -> dict:
         "running_location_id": all_running_ids[0] if all_running_ids else None,
         "scanning_location_ids": scanning_ids,
         "backfilling_location_ids": backfilling_ids,
-        "deleting_location_ids": deleting_ids,
         "pending": pending,
     }
 

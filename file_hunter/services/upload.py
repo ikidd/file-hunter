@@ -42,6 +42,7 @@ async def run_upload(
 
             # Check for existing file with same strong hash (read)
             from file_hunter.hashes_db import read_hashes
+
             async with read_hashes() as hdb:
                 hash_rows = await hdb.execute_fetchall(
                     "SELECT file_id FROM active_hashes WHERE hash_strong = ? LIMIT 1",
@@ -106,6 +107,7 @@ async def run_upload(
 
                 # Stats: stub file added
                 from file_hunter.stats_db import update_stats_for_files
+
                 await update_stats_for_files(
                     location_id,
                     added=[(folder_id, stub_size, "text", 0)],
@@ -168,6 +170,7 @@ async def run_upload(
                 # Stats: new file added
                 is_hidden = 1 if sf["filename"].startswith(".") else 0
                 from file_hunter.stats_db import update_stats_for_files
+
                 await update_stats_for_files(
                     location_id,
                     added=[(folder_id, file_size, type_high, is_hidden)],

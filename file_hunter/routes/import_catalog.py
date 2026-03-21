@@ -141,6 +141,12 @@ async def import_catalog_run(request: Request):
             "Must specify location_id or agent_id + root_path + location_name"
         )
 
+    # Register in online check state so location shows as online immediately
+    if agent_id is not None:
+        from file_hunter.services.online_check import register_agent_location
+
+        register_agent_location(agent_id, location_id)
+
     # Launch import in background
     asyncio.create_task(
         _run_and_notify(temp_path, location_id, root_path, agent_id, location_name)
@@ -171,14 +177,43 @@ async def _run_and_notify(
         async with paused_queue("import", location_name):
             await run_import(catalog_path, location_id, root_path)
 
-            # Post-ingest: find dup candidates + recount
+            # Post-ingest: same order as scan
             if _progress["status"] == "complete":
-                from file_hunter.services.dup_counts import post_ingest_dup_processing
+                # 1. Find dup candidates, copy small file hashes, queue large files
+                from file_hunter.services.dup_counts import (
+                    post_ingest_dup_processing,
+                    drain_pending_hashes,
+                )
 
                 _progress["status"] = "checking_duplicates"
                 await post_ingest_dup_processing(
-                    location_id, agent_id, location_name,
+                    location_id,
+                    agent_id,
+                    location_name,
                 )
+
+                # 2. Drain pending_hashes for this location (large file hashing)
+                _progress["status"] = "hashing_duplicates"
+                _progress["hash_done"] = 0
+                _progress["hash_total"] = 0
+
+                async def _import_drain_progress(done, total):
+                    _progress["hash_done"] = done
+                    _progress["hash_total"] = total
+
+                await drain_pending_hashes(
+                    agent_id,
+                    location_id,
+                    location_name,
+                    on_progress=_import_drain_progress,
+                )
+
+                # 3. Rebuild stats with correct dup counts
+                _progress["status"] = "rebuilding_stats"
+                from file_hunter.services.sizes import recalculate_location_sizes
+
+                await recalculate_location_sizes(location_id)
+
                 _progress["status"] = "complete"
 
     except Exception as e:
@@ -187,7 +222,9 @@ async def _run_and_notify(
         _progress["error"] = str(e)
 
     invalidate_stats_cache()
-    log.info("Broadcasting import_completed for %s (location %d)", location_name, location_id)
+    log.info(
+        "Broadcasting import_completed for %s (location %d)", location_name, location_id
+    )
     await broadcast(
         {
             "type": "import_completed",

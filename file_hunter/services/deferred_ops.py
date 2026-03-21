@@ -115,6 +115,7 @@ async def drain_pending_ops(location_id: int, root_path: str):
             if op_type == "delete":
                 await _drain_delete(f, op_id, now_iso)
                 from file_hunter.hashes_db import get_file_hashes as _gfh
+
                 _h = (await _gfh([file_id])).get(file_id, {})
                 if _h.get("hash_strong"):
                     affected_strong.add(_h["hash_strong"])
@@ -200,12 +201,16 @@ async def _drain_delete(f, op_id: int, now_iso: str):
         )
 
     from file_hunter.hashes_db import remove_file_hashes
+
     await remove_file_hashes([file_id])
 
     from file_hunter.stats_db import update_stats_for_files
+
     await update_stats_for_files(
         location_id,
-        removed=[(f["folder_id"], f["file_size"] or 0, f["file_type_high"], f["hidden"])],
+        removed=[
+            (f["folder_id"], f["file_size"] or 0, f["file_type_high"], f["hidden"])
+        ],
     )
 
 
@@ -285,6 +290,7 @@ async def _drain_verify(f, op_id: int, now_iso: str) -> dict | None:
     location_id = f["location_id"]
 
     from file_hunter.hashes_db import get_file_hashes as _gfh
+
     _h = (await _gfh([file_id])).get(file_id, {})
     old_hash_fast = _h.get("hash_fast")
 
@@ -318,6 +324,7 @@ async def _drain_verify(f, op_id: int, now_iso: str) -> dict | None:
         )
 
     from file_hunter.hashes_db import update_file_hash
+
     await update_file_hash(file_id, hash_fast=hash_fast, hash_strong=hash_strong)
 
     await broadcast(

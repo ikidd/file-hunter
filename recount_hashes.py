@@ -74,7 +74,11 @@ def recount(hashes_path: str):
             updated += 1
             if updated % 10000 == 0:
                 hdb.commit()
-                print(f"\r    {updated:,} / {dup_count:,} groups updated\033[K", end="", flush=True)
+                print(
+                    f"\r    {updated:,} / {dup_count:,} groups updated\033[K",
+                    end="",
+                    flush=True,
+                )
 
         hdb.commit()
         total_updated += updated
@@ -88,7 +92,9 @@ def recount(hashes_path: str):
 
     elapsed = time.monotonic() - t0
     print(f"\nDone in {elapsed:.1f}s")
-    print(f"Files with duplicates: {with_dups:,} / {total:,} ({with_dups/total*100:.1f}%)")
+    print(
+        f"Files with duplicates: {with_dups:,} / {total:,} ({with_dups / total * 100:.1f}%)"
+    )
 
     hdb.close()
 
@@ -96,7 +102,8 @@ def recount(hashes_path: str):
 def main():
     parser = argparse.ArgumentParser(description="Recount dup_count in hashes.db")
     parser.add_argument(
-        "--hashes", default="data/hashes.db",
+        "--hashes",
+        default="data/hashes.db",
         help="Path to hashes DB (default: data/hashes.db)",
     )
     args = parser.parse_args()

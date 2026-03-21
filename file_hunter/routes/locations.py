@@ -105,7 +105,7 @@ async def remove_location(request: Request):
     agent_id = row[0]["agent_id"]
 
     # Cancel any running scan/backfill for this location first
-    from file_hunter.services.queue_manager import cancel_by_location, enqueue
+    from file_hunter.services.queue_manager import cancel_by_location
     from file_hunter.services.hash_backfill import cancel_backfill_by_location
 
     await cancel_by_location(loc_id)
@@ -128,9 +128,11 @@ async def remove_location(request: Request):
     )
     invalidate_stats_cache()
 
-    # Enqueue the actual CASCADE delete as a background operation
-    op_id = await enqueue(
-        "delete_location",
+    # Queue the purge as housekeeping — runs when system is idle
+    from file_hunter.services.housekeeping import enqueue as hk_enqueue
+
+    await hk_enqueue(
+        "purge_location",
         agent_id,
         {
             "location_id": loc_id,
@@ -139,7 +141,7 @@ async def remove_location(request: Request):
         },
     )
 
-    return json_ok({"message": f"Location '{location_name}' deleted.", "queue_id": op_id})
+    return json_ok({"message": f"Location '{location_name}' deleted."})
 
 
 async def update_location(request: Request):

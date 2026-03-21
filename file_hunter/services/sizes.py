@@ -97,8 +97,7 @@ async def recalculate_location_sizes(location_id: int):
 
         _dup_folder_counts = _Counter(r["folder_id"] for r in dup_rows)
         dup_rows = [
-            {"folder_id": fid, "cnt": cnt}
-            for fid, cnt in _dup_folder_counts.items()
+            {"folder_id": fid, "cnt": cnt} for fid, cnt in _dup_folder_counts.items()
         ]
 
         # 1c. Direct hidden counts per folder
@@ -262,6 +261,11 @@ async def recalculate_location_sizes(location_id: int):
                 json.dumps(loc_type_counts),
             ),
         )
+
+    # Patch stats cache with updated dup counts — no full cache clear needed
+    from file_hunter.services.stats import patch_cache_dup_counts
+
+    patch_cache_dup_counts(location_id, loc_dup_count, cum_dup)
 
 
 async def populate_all_sizes_if_needed():

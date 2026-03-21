@@ -23,6 +23,20 @@ async def ws_endpoint(websocket: WebSocket):
             if state is not None:
                 await websocket.send_text(json.dumps(state))
 
+        # Send dup recalc state if active
+        from file_hunter.services.dup_counts import get_active_recalc_locations
+
+        recalc_locs = get_active_recalc_locations()
+        if recalc_locs:
+            await websocket.send_text(
+                json.dumps(
+                    {
+                        "type": "dup_recalc_started",
+                        "locationIds": list(recalc_locs),
+                    }
+                )
+            )
+
         # Send queue state if items are pending
         from file_hunter.services.queue_manager import get_queue_status_for_broadcast
 

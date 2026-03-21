@@ -54,6 +54,7 @@ async def run_consolidation(file_id: int, mode: str, dest_folder_id: str | None)
         selected_loc_id = selected["location_id"]
 
         from file_hunter.hashes_db import get_file_hashes as _gfh
+
         _h = (await _gfh([file_id])).get(file_id, {})
         hash_strong = _h.get("hash_strong")
         hash_fast = _h.get("hash_fast")
@@ -368,13 +369,22 @@ async def run_consolidation(file_id: int, mode: str, dest_folder_id: str | None)
                             ),
                         )
                     from file_hunter.hashes_db import remove_file_hashes
+
                     await remove_file_hashes([copy["id"]])
 
                     # Stats: original file removed, stub added
                     from file_hunter.stats_db import update_stats_for_files
+
                     await update_stats_for_files(
                         copy_loc_id,
-                        removed=[(copy["folder_id"], copy["file_size"] or 0, copy["file_type_high"], 0)],
+                        removed=[
+                            (
+                                copy["folder_id"],
+                                copy["file_size"] or 0,
+                                copy["file_type_high"],
+                                0,
+                            )
+                        ],
                         added=[(copy["folder_id"], stub_size, "text", 0)],
                     )
                     stubs_written += 1
@@ -556,9 +566,11 @@ async def drain_pending_jobs(location_id: int, root_path: str):
                             ),
                         )
                         from file_hunter.hashes_db import remove_file_hashes
+
                         await remove_file_hashes([fid])
                         # Stats: original removed, stub added
                         from file_hunter.stats_db import update_stats_for_files
+
                         await update_stats_for_files(
                             location_id,
                             removed=[(orig_folder_id, orig_size, orig_type, 0)],
@@ -576,12 +588,19 @@ async def drain_pending_jobs(location_id: int, root_path: str):
                         )
                         if del_rows:
                             from file_hunter.hashes_db import remove_file_hashes
+
                             await remove_file_hashes([r["id"] for r in del_rows])
                             from file_hunter.stats_db import update_stats_for_files
+
                             await update_stats_for_files(
                                 location_id,
                                 removed=[
-                                    (r["folder_id"], r["file_size"] or 0, r["file_type_high"], 0)
+                                    (
+                                        r["folder_id"],
+                                        r["file_size"] or 0,
+                                        r["file_type_high"],
+                                        0,
+                                    )
                                     for r in del_rows
                                 ],
                             )

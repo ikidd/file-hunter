@@ -50,7 +50,9 @@ async def consolidate(request: Request):
         if mode == "copy_to":
             from file_hunter.services.consolidate import _resolve_folder_path_with_loc
 
-            dest_path, dest_loc_id = await _resolve_folder_path_with_loc(db, dest_folder_id)
+            dest_path, dest_loc_id = await _resolve_folder_path_with_loc(
+                db, dest_folder_id
+            )
             if dest_path is None:
                 return json_error("Destination folder not found.", 404)
 
@@ -84,7 +86,9 @@ async def batch_consolidate(request: Request):
         from file_hunter.services.consolidate import _resolve_folder_path_with_loc
 
         async with read_db() as db:
-            dest_path, dest_loc_id = await _resolve_folder_path_with_loc(db, dest_folder_id)
+            dest_path, dest_loc_id = await _resolve_folder_path_with_loc(
+                db, dest_folder_id
+            )
         if dest_path is None:
             return json_error("Destination folder not found.", 404)
 

@@ -16,9 +16,13 @@ writes target file_hashes directly.
 
 import asyncio
 import logging
+import time
 from collections import defaultdict
+from typing import Callable, Awaitable
 
-from file_hunter.db import db_writer
+import httpx
+
+from file_hunter.db import db_writer, read_db
 from file_hunter.hashes_db import hashes_writer, read_hashes, open_hashes_connection
 from file_hunter.services.stats import invalidate_stats_cache
 from file_hunter.ws.scan import broadcast
@@ -30,6 +34,12 @@ RECALC_BATCH = 200
 # Coalesced writer state — single background task
 _recalc_queue: asyncio.Queue | None = None
 _writer_task: asyncio.Task | None = None
+_active_recalc_locations: set[int] = set()
+
+
+def get_active_recalc_locations() -> set[int]:
+    """Return location IDs with active dup recalc (for late-join WS state)."""
+    return set(_active_recalc_locations)
 
 
 async def _batched_recalc(
@@ -122,8 +132,7 @@ async def _batched_recalc(
                     id_ph = ",".join("?" for _ in id_batch)
                     async with db_writer() as cdb:
                         await cdb.execute(
-                            f"UPDATE files SET dup_count = ? "
-                            f"WHERE id IN ({id_ph})",
+                            f"UPDATE files SET dup_count = ? WHERE id IN ({id_ph})",
                             [dc] + id_batch,
                         )
 
@@ -275,8 +284,7 @@ async def full_dup_recount(
                         id_ph = ",".join("?" for _ in id_batch)
                         async with db_writer() as cdb:
                             await cdb.execute(
-                                f"UPDATE files SET dup_count = ? "
-                                f"WHERE id IN ({id_ph})",
+                                f"UPDATE files SET dup_count = ? WHERE id IN ({id_ph})",
                                 [dc] + id_batch,
                             )
 
@@ -454,9 +462,23 @@ def submit_hashes_for_recalc(
     fast = {h for h in (fast_hashes or set()) if h}
     if not strong and not fast:
         return
+    lids = location_ids or set()
     if _recalc_queue is None:
         _recalc_queue = asyncio.Queue()
-    _recalc_queue.put_nowait((strong, fast, source, location_ids or set()))
+    _recalc_queue.put_nowait((strong, fast, source, lids))
+
+    # Mark locations as recalculating immediately (not when writer picks up)
+    if lids:
+        _active_recalc_locations.update(lids)
+        asyncio.get_running_loop().create_task(
+            broadcast(
+                {
+                    "type": "dup_recalc_started",
+                    "locationIds": list(lids),
+                }
+            )
+        )
+
     if _writer_task is None or _writer_task.done():
         _writer_task = asyncio.create_task(_dup_recalc_writer())
 
@@ -519,12 +541,6 @@ async def _dup_recalc_writer():
                 source_label or "unknown",
             )
 
-            # Notify UI that dup counts are being recalculated
-            await broadcast({
-                "type": "dup_recalc_started",
-                "locationIds": list(merged_location_ids),
-            })
-
             # Recalculate dup_count on files
             await recalculate_dup_counts(
                 strong_hashes=merged_strong,
@@ -536,23 +552,22 @@ async def _dup_recalc_writer():
             affected: set[int] = set(merged_location_ids)
 
             async with read_hashes() as hdb:
-                if merged_strong:
-                    h_list = list(merged_strong)
-                    h_ph = ",".join("?" for _ in h_list)
-                    rows = await hdb.execute_fetchall(
-                        f"SELECT DISTINCT location_id FROM active_hashes WHERE hash_strong IN ({h_ph})",
-                        h_list,
-                    )
-                    affected |= {r["location_id"] for r in rows}
-
-                if merged_fast:
-                    h_list = list(merged_fast)
-                    h_ph = ",".join("?" for _ in h_list)
-                    rows = await hdb.execute_fetchall(
-                        f"SELECT DISTINCT location_id FROM active_hashes WHERE hash_fast IN ({h_ph})",
-                        h_list,
-                    )
-                    affected |= {r["location_id"] for r in rows}
+                for hash_set, col in (
+                    (merged_strong, "hash_strong"),
+                    (merged_fast, "hash_fast"),
+                ):
+                    if not hash_set:
+                        continue
+                    h_list = list(hash_set)
+                    for i in range(0, len(h_list), SQL_VAR_LIMIT):
+                        batch = h_list[i : i + SQL_VAR_LIMIT]
+                        ph = ",".join("?" for _ in batch)
+                        rows = await hdb.execute_fetchall(
+                            f"SELECT DISTINCT location_id FROM active_hashes "
+                            f"WHERE {col} IN ({ph})",
+                            batch,
+                        )
+                        affected |= {r["location_id"] for r in rows}
 
             await update_location_dup_counts(affected)
 
@@ -563,11 +578,14 @@ async def _dup_recalc_writer():
                 await recalculate_location_sizes(lid)
 
             total_hashes = len(merged_strong) + len(merged_fast)
-            await broadcast({
-                "type": "dup_recalc_completed",
-                "hashCount": total_hashes,
-                "locationIds": list(affected),
-            })
+            _active_recalc_locations.difference_update(affected)
+            await broadcast(
+                {
+                    "type": "dup_recalc_completed",
+                    "hashCount": total_hashes,
+                    "locationIds": list(affected),
+                }
+            )
     except Exception:
         log.error("Coalesced dup recalc writer failed", exc_info=True)
 
@@ -586,7 +604,6 @@ async def find_dup_candidates(
 
     Returns [{id, full_path, location_id, file_size, hash_partial, inode}, ...]
     """
-    import time
     from collections import Counter
     from file_hunter.db import open_connection
 
@@ -711,14 +728,16 @@ async def find_dup_candidates(
         fid = r["file_id"]
         fi = file_info.get(fid)
         if fi:
-            candidates.append({
-                "id": fid,
-                "full_path": fi["full_path"],
-                "location_id": r["location_id"],
-                "file_size": r["file_size"],
-                "hash_partial": r["hash_partial"],
-                "inode": fi["inode"],
-            })
+            candidates.append(
+                {
+                    "id": fid,
+                    "full_path": fi["full_path"],
+                    "location_id": r["location_id"],
+                    "file_size": r["file_size"],
+                    "hash_partial": r["hash_partial"],
+                    "inode": fi["inode"],
+                }
+            )
 
     log.info(
         "find_dup_candidates: %d candidates total in %.1fs (scope=%s)",
@@ -1086,14 +1105,16 @@ async def hash_candidates_for_location(
         now_iso = datetime.now(timezone.utc).isoformat(timespec="seconds")
         batch = []
         for c in large_files:
-            batch.append((
-                c["id"],
-                c["location_id"],
-                agent_id,
-                c["full_path"],
-                c.get("inode", 0),
-                now_iso,
-            ))
+            batch.append(
+                (
+                    c["id"],
+                    c["location_id"],
+                    agent_id,
+                    c["full_path"],
+                    c.get("inode", 0),
+                    now_iso,
+                )
+            )
             if len(batch) >= 5000:
                 async with db_writer() as wdb:
                     await wdb.executemany(
@@ -1119,7 +1140,10 @@ async def hash_candidates_for_location(
     log.info(
         "hash_candidates_for_location: %d total (%d small handled, %d large queued) "
         "for location %d",
-        total, len(small_files), len(large_files), location_id,
+        total,
+        len(small_files),
+        len(large_files),
+        location_id,
     )
 
     return total, len(small_files), len(large_files)
@@ -1144,12 +1168,14 @@ async def post_ingest_dup_processing(
 
     log.info("Post-ingest dup processing for %s", location_name)
 
-    await broadcast({
-        "type": "scan_progress",
-        "locationId": location_id,
-        "location": location_name,
-        "phase": "checking_duplicates",
-    })
+    await broadcast(
+        {
+            "type": "scan_progress",
+            "locationId": location_id,
+            "location": location_name,
+            "phase": "checking_duplicates",
+        }
+    )
 
     candidates_total, small_handled, large_queued = await hash_candidates_for_location(
         location_id=location_id,
@@ -1158,7 +1184,10 @@ async def post_ingest_dup_processing(
 
     log.info(
         "Dup candidates: %d total (%d small handled, %d large queued) for %s",
-        candidates_total, small_handled, large_queued, location_name,
+        candidates_total,
+        small_handled,
+        large_queued,
+        location_name,
     )
 
     if on_progress:
@@ -1193,3 +1222,155 @@ async def run_hash_file(op_id: int, agent_id: int, params: dict):
         source="hash_file",
         location_ids={location_id},
     )
+
+
+async def drain_pending_hashes(
+    agent_id: int,
+    location_id: int,
+    location_name: str,
+    *,
+    scan_done: asyncio.Event | None = None,
+    on_progress: Callable[[int, int], Awaitable[None]] | None = None,
+):
+    """Drain pending_hashes by sending batches to the agent for hash_fast.
+
+    Shared by scan (concurrent with ingest) and import (sequential after ingest).
+
+    scan_done: if provided, polls until event is set AND table is empty (scan mode).
+               if None, drains to empty and returns (import mode).
+
+    on_progress: async callback(done, total) for UI updates. Scan broadcasts
+                 via WebSocket, import updates the _progress dict.
+
+    Always scoped to location_id — the drainer only processes pending_hashes
+    for the location being scanned/imported. Leftover cleanup for other
+    locations is a housekeeping concern, not a scan/import concern.
+    """
+    from file_hunter.services.agent_ops import hash_fast_batch
+
+    FETCH_LIMIT = 2000
+    total_hashed = 0
+    total_pending = 0
+
+    where_clause = "WHERE agent_id = ? AND location_id = ?"
+    where_params: tuple = (agent_id, location_id)
+
+    async def _process_batch(batch_rows):
+        nonlocal total_hashed
+        paths = [r["full_path"] for r in batch_rows]
+        path_to_file_id = {r["full_path"]: r["file_id"] for r in batch_rows}
+        pending_ids = [r["id"] for r in batch_rows]
+        affected_locs = {r["location_id"] for r in batch_rows}
+
+        try:
+            result = await hash_fast_batch(agent_id, paths)
+        except (ConnectionError, OSError, httpx.ConnectError):
+            log.warning("Hash drainer: agent %d offline, stopping", agent_id)
+            raise
+
+        hash_results = result.get("results", [])
+        affected_fast: set[str] = set()
+
+        if hash_results:
+            async with hashes_writer() as hdb:
+                for hr in hash_results:
+                    fid = path_to_file_id.get(hr["path"])
+                    hf = hr.get("hash_fast")
+                    if fid and hf:
+                        await hdb.execute(
+                            "UPDATE file_hashes SET hash_fast = ? WHERE file_id = ?",
+                            (hf, fid),
+                        )
+                        affected_fast.add(hf)
+
+        # Remove processed entries
+        for i in range(0, len(pending_ids), SQL_VAR_LIMIT):
+            batch = pending_ids[i : i + SQL_VAR_LIMIT]
+            ph = ",".join("?" for _ in batch)
+            async with db_writer() as db:
+                await db.execute(
+                    f"DELETE FROM pending_hashes WHERE id IN ({ph})",
+                    batch,
+                )
+
+        total_hashed += len(hash_results)
+
+        if affected_fast:
+            submit_hashes_for_recalc(
+                strong_hashes=None,
+                fast_hashes=affected_fast,
+                source=f"hash drainer {location_name}",
+                location_ids=affected_locs,
+            )
+
+        log.info(
+            "Hash drainer: %d hashed (%d / %d) for %s",
+            len(hash_results),
+            total_hashed,
+            total_pending,
+            location_name,
+        )
+
+        if on_progress:
+            await on_progress(total_hashed, total_pending)
+
+    try:
+        while True:
+            async with read_db() as rdb:
+                rows = await rdb.execute_fetchall(
+                    "SELECT id, file_id, full_path, inode, location_id "
+                    f"FROM pending_hashes {where_clause} "
+                    "ORDER BY inode LIMIT ?",
+                    (*where_params, FETCH_LIMIT),
+                )
+                if total_pending == 0 or len(rows) == FETCH_LIMIT:
+                    count_row = await rdb.execute_fetchall(
+                        f"SELECT COUNT(*) as c FROM pending_hashes {where_clause}",
+                        where_params,
+                    )
+                    total_pending = total_hashed + count_row[0]["c"]
+
+            if not rows:
+                if scan_done is None or scan_done.is_set():
+                    log.info("Hash drainer: done for %s", location_name)
+                    return
+                await asyncio.sleep(2)
+                continue
+
+            # Get file sizes for byte-based batching
+            file_ids = [r["file_id"] for r in rows]
+            size_map: dict[int, int] = {}
+            for i in range(0, len(file_ids), SQL_VAR_LIMIT):
+                batch_ids = file_ids[i : i + SQL_VAR_LIMIT]
+                ph = ",".join("?" for _ in batch_ids)
+                async with read_db() as rdb:
+                    size_rows = await rdb.execute_fetchall(
+                        f"SELECT id, file_size FROM files WHERE id IN ({ph})",
+                        batch_ids,
+                    )
+                for sr in size_rows:
+                    size_map[sr["id"]] = sr["file_size"]
+
+            # Build byte-sized batches and process
+            batch_rows: list[dict] = []
+            batch_bytes = 0
+
+            for r in rows:
+                fsize = size_map.get(r["file_id"], 0)
+                batch_rows.append(dict(r))
+                batch_bytes += fsize
+
+                if batch_bytes >= HASH_BATCH_BYTES:
+                    await _process_batch(batch_rows)
+                    batch_rows = []
+                    batch_bytes = 0
+
+            if batch_rows:
+                await _process_batch(batch_rows)
+
+            await asyncio.sleep(0)
+
+    except (ConnectionError, OSError, httpx.ConnectError):
+        return
+    except asyncio.CancelledError:
+        return

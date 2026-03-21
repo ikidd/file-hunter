@@ -25,6 +25,25 @@ _cache: dict[str, dict] = {}
 _refresh_task: asyncio.Task | None = None
 
 
+def patch_cache_dup_counts(
+    location_id: int,
+    loc_dup_count: int,
+    folder_dup_counts: dict[int, int],
+):
+    """Surgically update just the duplicate count in cached stats entries.
+
+    Called by recalculate_location_sizes() after writing to stats.db.
+    Other cached fields (file_count, total_size, etc.) remain untouched.
+    """
+    loc_entry = _cache.get(f"loc:{location_id}")
+    if loc_entry is not None:
+        loc_entry["duplicateFiles"] = loc_dup_count
+    for fid, dup_count in folder_dup_counts.items():
+        fld_entry = _cache.get(f"folder:{fid}")
+        if fld_entry is not None:
+            fld_entry["duplicateFiles"] = dup_count
+
+
 def invalidate_stats_cache():
     """Schedule a background refresh of all cached stats.
 

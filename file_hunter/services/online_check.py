@@ -65,6 +65,28 @@ def clear_location_path_status(agent_id: int):
     _agent_location_path_status.pop(agent_id, None)
 
 
+def register_agent_location(agent_id: int, location_id: int, agent_name: str = ""):
+    """Register a newly created location in the in-memory online check state.
+
+    Called when a location is created with an agent_id (import, add-location).
+    Updates both the location ID mapping and the path availability so the
+    online check works immediately without waiting for an agent reconnect.
+    """
+    from file_hunter.ws.agent import _agent_location_ids
+
+    if agent_id in _agent_location_ids:
+        _agent_location_ids[agent_id].add(location_id)
+
+    _all_agent_loc_ids.add(location_id)
+    if agent_name:
+        _agent_label_prefixes[location_id] = agent_name
+
+    # Mark path as available (agent already has it in config)
+    if agent_id not in _agent_location_path_status:
+        _agent_location_path_status[agent_id] = {}
+    _agent_location_path_status[agent_id][location_id] = True
+
+
 def agent_online_check(loc):
     """Return True if this location's agent is online and the path is accessible.
 

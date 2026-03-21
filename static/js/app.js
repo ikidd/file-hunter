@@ -5,7 +5,6 @@ import Detail from './components/detail.js';
 import StatusBar from './components/statusbar.js';
 import Search from './components/search.js';
 import AddLocationModal from './components/addlocation.js';
-import FastScan from './components/fastscan.js';
 import ConfirmModal from './components/confirm.js';
 import Consolidate from './components/consolidate.js';
 import Merge from './components/merge.js';
@@ -438,8 +437,6 @@ SlideshowTriage.init();
 Detail.slideshowTriage = SlideshowTriage;
 ImportCatalog.init();
 RepairCatalog.init();
-FastScan.init();
-
 Merge.init(async ({ source_id, destination_id }) => {
     await API.post('/api/merge', { source_id, destination_id });
 });
@@ -965,6 +962,10 @@ WS.on('__close', () => {
     ActivityLog.add('WebSocket disconnected');
 });
 
+WS.on('activity', (msg) => {
+    if (msg.message) ActivityLog.add(msg.message);
+});
+
 WS.on('scan_started', (msg) => {
     StatusBar.renderActivity('scanning', `${msg.location} — starting...`, msg.locationId);
     ActivityLog.add(`Scan started: <b>${msg.location}</b>`);
@@ -1178,9 +1179,6 @@ WS.on('queue_paused', (msg) => {
         const prep = msg.direction === 'exclude' ? 'from' : 'in';
         ActivityLog.add(`Operations paused: ${verb.toLowerCase()} folder ${prep} duplicates`);
         _startDupExcludePoll();
-    } else if (msg.reason === 'fast_scan') {
-        ActivityLog.add(`Operations paused: fast scanning <b>${msg.location}</b>`);
-        _startFastScanPoll();
     } else {
         ActivityLog.add(`Operations paused: importing <b>${msg.location}</b>`);
     }
@@ -1278,18 +1276,15 @@ WS.on('size_recalc_completed', msg => {
     }
 });
 WS.on('dup_recalc_started', (msg) => {
-    // Show "recalculating..." on dup count if viewing an affected location/folder
-    const dupEl = document.querySelector('[data-stat="duplicates"]');
-    if (dupEl && msg.locationIds) {
-        const viewingLocId = Detail._currentLocationNode
-            ? String(Detail._currentLocationNode.id).replace('loc-', '')
-            : null;
-        if (viewingLocId && msg.locationIds.includes(parseInt(viewingLocId))) {
-            dupEl.textContent = 'recalculating...';
-        }
+    if (msg.locationIds) {
+        for (const id of msg.locationIds) Detail._dupRecalcLocations.add(id);
+        Detail._applyDupRecalcOverride();
     }
 });
 WS.on('dup_recalc_completed', async (msg) => {
+    if (msg.locationIds) {
+        for (const id of msg.locationIds) Detail._dupRecalcLocations.delete(id);
+    }
     await StatusBar.loadStats();
     await Detail.refreshStats();
     FileList.refreshDupCounts();
@@ -1342,52 +1337,6 @@ WS.on('dup_exclude_completed', async msg => {
     await Detail.refreshStats();
     await StatusBar.loadStats();
 });
-
-// --- Fast scan progress polling ---
-let _fastScanPollTimer = null;
-function _startFastScanPoll() {
-    if (_fastScanPollTimer) return;
-    _fastScanPollTimer = setInterval(async () => {
-        const res = await API.get('/api/scan/fast/progress');
-        if (!res.ok) return;
-        const p = res.data;
-        if (p.phase === 'deleting') {
-            StatusBar.renderActivity('scanning', 'Fast Scan: deleting existing data...');
-        } else if (p.phase === 'walking') {
-            StatusBar.renderActivity('scanning', `Fast Scan: ${p.files_found.toLocaleString()} files found`);
-        } else if (p.phase === 'hashing') {
-            const pct = p.files_to_hash > 0 ? Math.round((p.files_hashed / p.files_to_hash) * 100) : 0;
-            StatusBar.renderActivity('scanning', `Fast Scan: partial hashing ${p.files_hashed.toLocaleString()} / ${p.files_to_hash.toLocaleString()} (${pct}%)`);
-        } else if (p.phase === 'confirming') {
-            const pct = p.files_to_hash > 0 ? Math.round((p.files_hashed / p.files_to_hash) * 100) : 0;
-            StatusBar.renderActivity('scanning', `Fast Scan: confirming ${p.files_hashed.toLocaleString()} / ${p.files_to_hash.toLocaleString()} candidates (${pct}%)`);
-        } else if (p.phase === 'recounting') {
-            StatusBar.renderActivity('scanning', 'Fast Scan: recounting duplicates...');
-        } else if (p.phase === 'rebuilding') {
-            StatusBar.renderActivity('scanning', 'Fast Scan: rebuilding sizes...');
-        } else if (p.phase === 'pausing') {
-            StatusBar.renderActivity('scanning', 'Fast Scan: pausing operations...');
-        } else if (p.status === 'complete' || p.status === 'error' || p.status === 'idle') {
-            _stopFastScanPoll();
-            if (p.status === 'complete') {
-                ActivityLog.add(`Fast Scan complete: <b>${p.location}</b> — ${p.files_found.toLocaleString()} files`);
-                await Tree.reload();
-                if (selectedNode) selectedNode = Tree._findNode(selectedNode.id);
-                await Detail.refreshStats();
-            } else if (p.status === 'error') {
-                ActivityLog.add(`Fast Scan failed: ${p.error}`);
-            }
-        }
-        await StatusBar.loadStats();
-    }, 500);
-}
-function _stopFastScanPoll() {
-    if (_fastScanPollTimer) {
-        clearInterval(_fastScanPollTimer);
-        _fastScanPollTimer = null;
-        StatusBar.renderActivity('idle');
-    }
-}
 
 WS.on('location_changed', async (msg) => {
     ActivityLog.add(`Location ${msg.action}: <b>${msg.location?.label || msg.locationId || ''}</b>`);

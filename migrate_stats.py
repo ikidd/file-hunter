@@ -65,9 +65,14 @@ def migrate(catalog_path: str, stats_path: str):
     print(f"\n{len(loc_rows)} locations to migrate")
 
     loc_batch = [
-        (r["id"], r["file_count"] or 0, r["total_size"] or 0,
-         r["duplicate_count"] or 0, r["type_counts"] or "{}",
-         r["hidden_count"] or 0)
+        (
+            r["id"],
+            r["file_count"] or 0,
+            r["total_size"] or 0,
+            r["duplicate_count"] or 0,
+            r["type_counts"] or "{}",
+            r["hidden_count"] or 0,
+        )
         for r in loc_rows
     ]
     sdb.executemany(
@@ -80,9 +85,7 @@ def migrate(catalog_path: str, stats_path: str):
     print(f"  {len(loc_batch)} locations migrated")
 
     # --- Folders ---
-    total_folders = cat.execute(
-        "SELECT COUNT(*) FROM folders"
-    ).fetchone()[0]
+    total_folders = cat.execute("SELECT COUNT(*) FROM folders").fetchone()[0]
 
     print(f"\n{total_folders:,} folders to migrate\n")
 
@@ -104,9 +107,15 @@ def migrate(catalog_path: str, stats_path: str):
             break
 
         batch = [
-            (r["id"], r["location_id"], r["file_count"] or 0,
-             r["total_size"] or 0, r["duplicate_count"] or 0,
-             r["type_counts"] or "{}", r["hidden_count"] or 0)
+            (
+                r["id"],
+                r["location_id"],
+                r["file_count"] or 0,
+                r["total_size"] or 0,
+                r["duplicate_count"] or 0,
+                r["type_counts"] or "{}",
+                r["hidden_count"] or 0,
+            )
             for r in rows
         ]
 
@@ -145,13 +154,17 @@ def migrate(catalog_path: str, stats_path: str):
 
 
 def main():
-    parser = argparse.ArgumentParser(description="Migrate stats from catalog to stats.db")
+    parser = argparse.ArgumentParser(
+        description="Migrate stats from catalog to stats.db"
+    )
     parser.add_argument(
-        "--catalog", default="data/file_hunter.db",
+        "--catalog",
+        default="data/file_hunter.db",
         help="Path to catalog DB (default: data/file_hunter.db)",
     )
     parser.add_argument(
-        "--stats", default="data/stats.db",
+        "--stats",
+        default="data/stats.db",
         help="Path to stats DB (default: data/stats.db)",
     )
     args = parser.parse_args()

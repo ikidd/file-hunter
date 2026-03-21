@@ -68,5 +68,7 @@ async def count_ignore_matches(request: Request):
     location_id = int(location_id) if location_id else None
 
     async with read_db() as db:
-        count = await ignore_svc.count_matching_files(db, filename, file_size, location_id)
+        count = await ignore_svc.count_matching_files(
+            db, filename, file_size, location_id
+        )
     return json_ok({"count": count})

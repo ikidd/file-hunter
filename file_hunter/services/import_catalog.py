@@ -87,9 +87,9 @@ async def run_import(
         # Count existing files so we can report new vs updated
         async with read_db() as db:
             before_count_rows = await db.execute_fetchall(
-            "SELECT COUNT(*) as c FROM files WHERE location_id = ?",
-            (location_id,),
-        )
+                "SELECT COUNT(*) as c FROM files WHERE location_id = ?",
+                (location_id,),
+            )
         files_before = before_count_rows[0]["c"]
 
         # --- Import folders ---
@@ -193,9 +193,14 @@ async def run_import(
                 hf = r["hash_fast"] if has_hash_fast else None
                 if hp or hf:
                     # file_id not known yet — will be resolved after catalog insert
-                    hash_batch.append((
-                        r["rel_path"], r["file_size"], hp, hf,
-                    ))
+                    hash_batch.append(
+                        (
+                            r["rel_path"],
+                            r["file_size"],
+                            hp,
+                            hf,
+                        )
+                    )
 
             async with db_writer() as wdb:
                 await wdb.executemany(
@@ -237,12 +242,19 @@ async def run_import(
                         for ir in id_rows:
                             h = hash_by_rel.get(ir["rel_path"])
                             if h:
-                                hashes_to_insert.append((
-                                    ir["id"], location_id, ir["file_size"],
-                                    h[2], h[3], None,  # hash_partial, hash_fast, hash_strong
-                                ))
+                                hashes_to_insert.append(
+                                    (
+                                        ir["id"],
+                                        location_id,
+                                        ir["file_size"],
+                                        h[2],
+                                        h[3],
+                                        None,  # hash_partial, hash_fast, hash_strong
+                                    )
+                                )
                         if hashes_to_insert:
                             from file_hunter.hashes_db import hashes_writer
+
                             async with hashes_writer() as hdb:
                                 await hdb.executemany(
                                     "INSERT INTO file_hashes "
@@ -264,15 +276,11 @@ async def run_import(
         # Count new files
         async with read_db() as db:
             after_count_rows = await db.execute_fetchall(
-            "SELECT COUNT(*) as c FROM files WHERE location_id = ?",
-            (location_id,),
-        )
+                "SELECT COUNT(*) as c FROM files WHERE location_id = ?",
+                (location_id,),
+            )
         files_after = after_count_rows[0]["c"]
         _progress["files_new"] = files_after - files_before
-
-        # --- Recalculate location sizes ---
-        _progress["status"] = "recalculating"
-        await _recalculate_location_sizes(location_id)
 
         # Update date_last_scanned and record import in scans table
         async with db_writer() as wdb:
@@ -304,10 +312,3 @@ async def run_import(
             os.unlink(catalog_path)
         except OSError:
             pass
-
-
-async def _recalculate_location_sizes(location_id: int):
-    """Rebuild all stored counters for a location after import."""
-    from file_hunter.services.sizes import recalculate_location_sizes
-
-    await recalculate_location_sizes(location_id)

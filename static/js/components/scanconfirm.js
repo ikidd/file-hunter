@@ -13,12 +13,6 @@ const ScanConfirm = {
         document.getElementById('scan-confirm-cancel').addEventListener('click', () => this.close());
         document.getElementById('scan-confirm-submit').addEventListener('click', () => this._doConfirm());
 
-        // Hide fast scan elements if they exist in HTML
-        const fastBtn = document.getElementById('scan-confirm-fast');
-        if (fastBtn) fastBtn.style.display = 'none';
-        const warningEl = document.getElementById('scan-confirm-warning');
-        if (warningEl) warningEl.style.display = 'none';
-
         this.overlayEl.addEventListener('click', (e) => {
             if (e.target === this.overlayEl) this.close();
         });

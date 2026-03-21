@@ -47,8 +47,6 @@ from file_hunter.routes.scan import (
     start_scan,
     cancel_scan,
     get_scan_queue,
-    start_fast_scan,
-    fast_scan_progress,
 )
 from file_hunter.routes.consolidate import consolidate, batch_consolidate
 from file_hunter.routes.merge import merge, cancel_merge
@@ -191,10 +189,6 @@ async def on_startup():
 
     await restore_dup_exclude()
 
-    from file_hunter.services.fast_scan import restore_pending as restore_fast_scan
-
-    await restore_fast_scan()
-
     # Mark interrupted scans as error (agent will rescan on reconnect)
     async with read_db() as db:
         interrupted = await db.execute_fetchall(
@@ -220,6 +214,15 @@ async def on_startup():
     start_queue_manager()
     _elapsed("queue manager started")
 
+    from file_hunter.services.housekeeping import (
+        init_schema as init_housekeeping,
+        start as start_housekeeping,
+    )
+
+    await init_housekeeping()
+    start_housekeeping()
+    _elapsed("housekeeping started")
+
     from file_hunter.services.stats import warm_stats_cache
 
     asyncio.get_event_loop().create_task(warm_stats_cache())
@@ -231,7 +234,10 @@ async def on_shutdown():
     from file_hunter.services.queue_manager import stop as stop_queue_manager
     from file_hunter.services.dup_counts import stop_writer as stop_dup_writer
 
+    from file_hunter.services.housekeeping import stop as stop_housekeeping
+
     await stop_repair()
+    await stop_housekeeping()
     await stop_queue_manager()
     await stop_dup_writer()
     await close_db()
@@ -300,8 +306,6 @@ app = Starlette(
         Route("/api/searches/{id:int}", delete_saved_search, methods=["DELETE"]),
         Route("/api/slideshow-ids", slideshow_ids, methods=["GET"]),
         Route("/api/scan", start_scan, methods=["POST"]),
-        Route("/api/scan/fast", start_fast_scan, methods=["POST"]),
-        Route("/api/scan/fast/progress", fast_scan_progress, methods=["GET"]),
         Route("/api/scan/cancel", cancel_scan, methods=["POST"]),
         Route("/api/scan/queue", get_scan_queue, methods=["GET"]),
         Route("/api/consolidate", consolidate, methods=["POST"]),

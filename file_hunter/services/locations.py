@@ -517,6 +517,13 @@ async def create_location(db, name: str, root_path: str, agent_id: int = None) -
     )
     await db.commit()
     loc_id = cursor.lastrowid
+
+    # Register in online check state so the location is immediately visible
+    if agent_id is not None:
+        from file_hunter.services.online_check import register_agent_location
+
+        register_agent_location(agent_id, loc_id)
+
     online = await asyncio.to_thread(check_location_online, loc_id, root_path)
     return {
         "id": f"loc-{loc_id}",

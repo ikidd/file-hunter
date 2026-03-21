@@ -42,7 +42,9 @@ async def run_delete_location(op_id: int, agent_id: int | None, params: dict):
     affected_fast, affected_strong = await _collect_affected_hashes(location_id)
     logger.info(
         "Delete location #%d: %d affected hash_fast, %d affected hash_strong",
-        location_id, len(affected_fast), len(affected_strong),
+        location_id,
+        len(affected_fast),
+        len(affected_strong),
     )
 
     # Step 3: Clean up catalog — batched to avoid holding writer lock
@@ -51,6 +53,7 @@ async def run_delete_location(op_id: int, agent_id: int | None, params: dict):
     # Step 4: Submit affected hashes to coalesced writer for background recount
     if affected_fast or affected_strong:
         from file_hunter.services.dup_counts import submit_hashes_for_recalc
+
         submit_hashes_for_recalc(
             strong_hashes=affected_strong or None,
             fast_hashes=affected_fast or None,
@@ -99,7 +102,6 @@ async def _collect_affected_hashes(location_id: int) -> tuple[set[str], set[str]
             affected_strong.add(r["hash_strong"])
 
     return affected_fast, affected_strong
-
 
 
 async def _purge_location_batched(location_id: int):

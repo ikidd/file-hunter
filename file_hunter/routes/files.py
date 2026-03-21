@@ -72,7 +72,8 @@ async def file_content(request: Request):
     file_id = int(request.path_params["id"])
     async with read_db() as db:
         row = await db.execute(
-            "SELECT full_path, filename, location_id FROM files WHERE id = ?", (file_id,)
+            "SELECT full_path, filename, location_id FROM files WHERE id = ?",
+            (file_id,),
         )
         row = await row.fetchone()
     if not row:
@@ -100,7 +101,8 @@ async def file_bytes(request: Request):
     file_id = int(request.path_params["id"])
     async with read_db() as db:
         row = await db.execute(
-            "SELECT full_path, location_id, file_size FROM files WHERE id = ?", (file_id,)
+            "SELECT full_path, location_id, file_size FROM files WHERE id = ?",
+            (file_id,),
         )
         row = await row.fetchone()
     if not row:
@@ -225,6 +227,7 @@ async def file_verify(request: Request):
 
         # Check hashes from hashes.db
         from file_hunter.hashes_db import get_file_hashes
+
         h_map = await get_file_hashes([file_id])
         h = h_map.get(file_id, {})
         if h.get("hash_strong"):
@@ -262,6 +265,7 @@ async def file_verify(request: Request):
         return json_error(f"Hash computation failed: {exc}", 500)
 
     from file_hunter.hashes_db import update_file_hash
+
     await update_file_hash(file_id, hash_fast=hash_fast, hash_strong=hash_strong)
 
     # Recalc dup counts: new hash_strong group + old hash_fast group
@@ -494,7 +498,6 @@ async def folder_dup_exclude(request: Request):
         )
 
     # --- Confirmed: start the operation ---
-    from file_hunter.db import db_writer
 
     # Persist pending operation so it survives restarts
     from file_hunter.services.settings import set_setting

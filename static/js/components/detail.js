@@ -39,6 +39,9 @@ const Detail = {
     _ac: null,
     _locationActivityFn: null,
     _currentLocationNode: null,
+    _currentLocationId: null,
+    _currentFolderId: null,
+    _dupRecalcLocations: new Set(),
     _previewModal: null,
     _slideshowTotal: 0,
     _slideshowOffset: 0,
@@ -154,10 +157,27 @@ const Detail = {
             return;
         }
 
+        // Folder view — patch folder counters
+        if (!this._currentLocationNode) {
+            if (!this._currentFolderId) return;
+            const fRes = await API.get(`/api/folders/${this._currentFolderId}/stats`);
+            if (!fRes.ok) return;
+            const fs = fRes.data;
+            const fc = this.el.querySelector('[data-stat="fileCount"]');
+            if (fc) fc.textContent = fs.fileCount.toLocaleString();
+            const flc = this.el.querySelector('[data-stat="folderCount"]');
+            if (flc) flc.textContent = fs.subfolderCount.toLocaleString();
+            const ts = this.el.querySelector('[data-stat="totalSize"]');
+            if (ts) ts.textContent = fs.totalSizeFormatted;
+            const dup = this.el.querySelector('[data-stat="duplicates"]');
+            if (dup) dup.textContent = fs.duplicateFiles.toLocaleString();
+            this._applyDupRecalcOverride();
+            return;
+        }
+
         // Location view — patch location counters
         // Skip if this location is currently scanning — scan_progress has
         // real-time data, the API would overwrite with stale values
-        if (!this._currentLocationNode) return;
         const locId = String(this._currentLocationNode.id).replace('loc-', '');
         if (Tree._scanningLocations.has('loc-' + locId)) return;
 
@@ -184,6 +204,14 @@ const Detail = {
                 </div>`
             ).join('');
         }
+        this._applyDupRecalcOverride();
+    },
+
+    _applyDupRecalcOverride() {
+        if (!this._currentLocationId) return;
+        if (!this._dupRecalcLocations.has(this._currentLocationId)) return;
+        const dupEl = this.el?.querySelector('[data-stat="duplicates"]');
+        if (dupEl) dupEl.textContent = 'recalculating...';
     },
 
     _abortPrevious() {
@@ -763,6 +791,8 @@ const Detail = {
 
     async renderFile(file) {
         this._currentLocationNode = null;
+        this._currentLocationId = null;
+        this._currentFolderId = null;
         const gen = ++this._renderGen;
         const signal = this._abortPrevious();
         await this.showLoading();
@@ -1374,6 +1404,8 @@ const Detail = {
 
     async renderLocation(node) {
         this._currentLocationNode = node;
+        this._currentLocationId = parseInt(String(node.id).replace('loc-', ''));
+        this._currentFolderId = null;
         const gen = ++this._renderGen;
         const signal = this._abortPrevious();
         await this.showLoading();
@@ -1512,12 +1544,14 @@ const Detail = {
         `;
 
         if (s.online) this._wireSchedule(locId);
+        this._applyDupRecalcOverride();
 
         return { online: s.online };
     },
 
     async renderFolder(folder) {
         this._currentLocationNode = null;
+        this._currentFolderId = parseInt(String(folder.id).replace('fld-', ''));
         const gen = ++this._renderGen;
         const signal = this._abortPrevious();
         await this.showLoading();
@@ -1541,6 +1575,7 @@ const Detail = {
             return {};
         }
         const s = res.data;
+        this._currentLocationId = parseInt(String(s.locationId).replace('loc-', ''));
 
         this.el.innerHTML = `
             <div class="detail-section">
@@ -1586,6 +1621,7 @@ const Detail = {
             </div>
         `;
         this._wireBreadcrumbs();
+        this._applyDupRecalcOverride();
 
         const dupExcludeCb = document.getElementById('detail-dup-exclude-cb');
         if (dupExcludeCb) {

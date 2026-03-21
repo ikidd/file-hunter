@@ -82,8 +82,8 @@ async def _adopt_orphaned_locations(agent_id: int):
 
     async with read_db() as db:
         orphans = await db.execute_fetchall(
-        "SELECT id, name, root_path FROM locations WHERE agent_id IS NULL"
-    )
+            "SELECT id, name, root_path FROM locations WHERE agent_id IS NULL"
+        )
     if not orphans:
         return
 
@@ -245,6 +245,26 @@ async def _sync_agent_locations(agent_id: int, agent_locations: list[dict]):
             ops_row = await pending_ops.fetchone()
         if ops_row and ops_row["cnt"] > 0:
             await drain_pending_ops(loc_id, root_path)
+
+        # Drain pending_hashes (from interrupted import/scan drain)
+        async with read_db() as db:
+            ph_row = await db.execute_fetchall(
+                "SELECT COUNT(*) as cnt FROM pending_hashes "
+                "WHERE location_id = ? AND agent_id = ?",
+                (loc_id, agent_id),
+            )
+        if ph_row and ph_row[0]["cnt"] > 0:
+            from file_hunter.services.dup_counts import drain_pending_hashes
+
+            loc_name = ""
+            async with read_db() as db:
+                name_row = await db.execute_fetchall(
+                    "SELECT name FROM locations WHERE id = ?", (loc_id,)
+                )
+            if name_row:
+                loc_name = name_row[0]["name"]
+
+            asyncio.create_task(drain_pending_hashes(agent_id, loc_id, loc_name))
 
     return location_ids
 

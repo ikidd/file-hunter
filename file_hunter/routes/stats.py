@@ -70,12 +70,14 @@ async def _bg_recalculate():
         total = len(loc_rows)
         for i, loc in enumerate(loc_rows, 1):
             log.info("Recalculating stats: %s (%d/%d)", loc["name"], i, total)
-            await broadcast({
-                "type": "recalc_progress",
-                "location": loc["name"],
-                "done": i,
-                "total": total,
-            })
+            await broadcast(
+                {
+                    "type": "recalc_progress",
+                    "location": loc["name"],
+                    "done": i,
+                    "total": total,
+                }
+            )
             await recalculate_location_sizes(loc["id"])
         invalidate_stats_cache()
         log.info("Stats recalculated for %d locations", total)
@@ -315,9 +317,7 @@ async def _bg_repair(phases: list[str] | None = None):
             else:
                 _repair_progress["phase"] = "sizes"
                 async with read_db() as _rdb:
-                    all_locs = await _rdb.execute_fetchall(
-                        "SELECT id FROM locations"
-                    )
+                    all_locs = await _rdb.execute_fetchall("SELECT id FROM locations")
                 _repair_progress["locations_total"] = len(all_locs)
                 log.info(
                     "Catalog repair: phase 3 — recalculating sizes for %d locations",

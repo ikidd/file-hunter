@@ -361,6 +361,7 @@ async def run_backfill(
 async def _flush_writes(writes: list[tuple[int, str]]):
     """Batch-update hash_fast in hashes.db for a list of file IDs."""
     from file_hunter.hashes_db import hashes_writer
+
     async with hashes_writer() as wdb:
         for file_id, hash_fast in writes:
             await wdb.execute(
@@ -420,9 +421,13 @@ async def _backfill_agents(
             await db.close()
         path_map = {r["id"]: r for r in path_rows}
         rows = [
-            {"id": r["id"], "full_path": path_map[r["id"]]["full_path"],
-             "location_id": r["location_id"]}
-            for r in rows if r["id"] in path_map
+            {
+                "id": r["id"],
+                "full_path": path_map[r["id"]]["full_path"],
+                "location_id": r["location_id"],
+            }
+            for r in rows
+            if r["id"] in path_map
         ]
 
     if not rows:

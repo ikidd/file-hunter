@@ -302,6 +302,20 @@ const ImportCatalog = {
                 textEl.textContent = p.dup_hashes_total > 0
                     ? `Recounting duplicates... ${p.dup_hashes_done.toLocaleString()} / ${p.dup_hashes_total.toLocaleString()} hashes`
                     : 'Recounting duplicates...';
+            } else if (p.status === 'checking_duplicates') {
+                textEl.textContent = 'Finding duplicate candidates...';
+                fillEl.style.width = '100%';
+            } else if (p.status === 'hashing_duplicates') {
+                const hashDone = p.hash_done || 0;
+                const hashTotal = p.hash_total || 0;
+                const hashPct = hashTotal > 0 ? Math.round((hashDone / hashTotal) * 100) : 0;
+                fillEl.style.width = hashPct + '%';
+                textEl.textContent = hashTotal > 0
+                    ? `Hashing duplicates... ${hashDone.toLocaleString()} / ${hashTotal.toLocaleString()}`
+                    : 'Hashing duplicates...';
+            } else if (p.status === 'rebuilding_stats') {
+                textEl.textContent = 'Rebuilding statistics...';
+                fillEl.style.width = '100%';
             } else if (p.status === 'running') {
                 if (p.files_imported === 0 && p.folders_created > 0) {
                     textEl.textContent = `Creating folders... ${p.folders_created.toLocaleString()} created`;

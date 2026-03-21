@@ -450,8 +450,12 @@ def _parse_tsv_line(line: str) -> dict | None:
     return None
 
 
-async def stream_tree(agent_id: int, root_path: str, prefix: str | None = None,
-                      metadata_only: bool = False):
+async def stream_tree(
+    agent_id: int,
+    root_path: str,
+    prefix: str | None = None,
+    metadata_only: bool = False,
+):
     """Stream the full metadata tree from an agent as parsed dicts.
 
     Each directory arrives as a batch: one "dir" dict followed by all "file"

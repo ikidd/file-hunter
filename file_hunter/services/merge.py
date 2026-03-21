@@ -269,7 +269,10 @@ async def run_merge(source_id, source_info, destination_id, dest_info):
 
                     # Stats: file added at destination
                     from file_hunter.stats_db import update_stats_for_files as _usf
-                    await _usf(dest_loc_id, added=[(dest_folder_id, file_size, type_high, 1)])
+
+                    await _usf(
+                        dest_loc_id, added=[(dest_folder_id, file_size, type_high, 1)]
+                    )
 
                     async with db_writer() as wdb:
                         # Stub source with .moved
@@ -300,14 +303,23 @@ async def run_merge(source_id, source_info, destination_id, dest_info):
                         )
 
                     from file_hunter.hashes_db import remove_file_hashes
+
                     _del_ids = [r["id"] for r in _replaced] + [src_file["id"]]
                     await remove_file_hashes(_del_ids)
 
                     # Stats: original file removed, stub added (size=0)
                     from file_hunter.stats_db import update_stats_for_files
+
                     await update_stats_for_files(
                         src_file["location_id"],
-                        removed=[(src_file["folder_id"], src_file["file_size"] or 0, src_file["file_type_high"], src_file["hidden"])],
+                        removed=[
+                            (
+                                src_file["folder_id"],
+                                src_file["file_size"] or 0,
+                                src_file["file_type_high"],
+                                src_file["hidden"],
+                            )
+                        ],
                         added=[(src_file["folder_id"], 0, "text", 0)],
                     )
 
@@ -406,13 +418,22 @@ async def run_merge(source_id, source_info, destination_id, dest_info):
                         )
 
                     from file_hunter.hashes_db import remove_file_hashes
+
                     _del_ids = [r["id"] for r in _replaced] + [src_file["id"]]
                     await remove_file_hashes(_del_ids)
 
                     from file_hunter.stats_db import update_stats_for_files
+
                     await update_stats_for_files(
                         src_file["location_id"],
-                        removed=[(src_file["folder_id"], src_file["file_size"] or 0, src_file["file_type_high"], src_file["hidden"])],
+                        removed=[
+                            (
+                                src_file["folder_id"],
+                                src_file["file_size"] or 0,
+                                src_file["file_type_high"],
+                                src_file["hidden"],
+                            )
+                        ],
                         added=[(src_file["folder_id"], 0, "text", 0)],
                     )
 
@@ -563,8 +584,12 @@ async def run_merge(source_id, source_info, destination_id, dest_info):
 
                     # Stats: file added at destination
                     from file_hunter.stats_db import update_stats_for_files as _usf
+
                     is_hidden = 1 if dest_file_name.startswith(".") else 0
-                    await _usf(dest_loc_id, added=[(dest_folder_id, file_size, type_high, is_hidden)])
+                    await _usf(
+                        dest_loc_id,
+                        added=[(dest_folder_id, file_size, type_high, is_hidden)],
+                    )
 
                     async with db_writer() as wdb:
                         # DB operations for source stub
@@ -595,13 +620,22 @@ async def run_merge(source_id, source_info, destination_id, dest_info):
                         )
 
                     from file_hunter.hashes_db import remove_file_hashes
+
                     _del_ids = [r["id"] for r in _replaced] + [src_file["id"]]
                     await remove_file_hashes(_del_ids)
 
                     from file_hunter.stats_db import update_stats_for_files
+
                     await update_stats_for_files(
                         src_file["location_id"],
-                        removed=[(src_file["folder_id"], src_file["file_size"] or 0, src_file["file_type_high"], src_file["hidden"])],
+                        removed=[
+                            (
+                                src_file["folder_id"],
+                                src_file["file_size"] or 0,
+                                src_file["file_type_high"],
+                                src_file["hidden"],
+                            )
+                        ],
                         added=[(src_file["folder_id"], 0, "text", 0)],
                     )
 
@@ -785,9 +819,9 @@ async def _upsert_sources_record(
     async with read_db() as db:
         # Check if record already exists
         rows = await db.execute_fetchall(
-        "SELECT id FROM files WHERE location_id = ? AND rel_path = ?",
-        (dest_location_id, sources_rel),
-    )
+            "SELECT id FROM files WHERE location_id = ? AND rel_path = ?",
+            (dest_location_id, sources_rel),
+        )
 
     async with db_writer() as wdb:
         if rows:

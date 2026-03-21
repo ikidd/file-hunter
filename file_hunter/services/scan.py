@@ -77,7 +77,9 @@ async def run_scan(op_id: int, agent_id: int, params: dict):
             )
             logger.info(
                 "Resuming scan #%d for location #%d (%s)",
-                scan_id, location_id, location_name,
+                scan_id,
+                location_id,
+                location_name,
             )
         else:
             cursor = await db.execute(
@@ -116,9 +118,30 @@ async def run_scan(op_id: int, agent_id: int, params: dict):
         )
 
     # Launch hash drainer as concurrent task
+    from file_hunter.services.dup_counts import drain_pending_hashes
+
     scan_done_event = asyncio.Event()
+
+    async def _drainer_progress(done, total):
+        await broadcast(
+            {
+                "type": "scan_progress",
+                "locationId": location_id,
+                "location": location_name,
+                "phase": "checking_duplicates",
+                "checksDone": done,
+                "checksTotal": total,
+            }
+        )
+
     drainer_task = asyncio.create_task(
-        _drain_pending_hashes(agent_id, location_id, location_name, scan_done_event)
+        drain_pending_hashes(
+            agent_id,
+            location_id,
+            location_name,
+            scan_done=scan_done_event,
+            on_progress=_drainer_progress,
+        )
     )
 
     # State — initialised before try so exception handlers can reference them
@@ -134,33 +157,51 @@ async def run_scan(op_id: int, agent_id: int, params: dict):
 
             # --- Phase 1: stream metadata only into temp DB ---
             files_found, dirs_found = await _stream_to_temp_db(
-                tmp_path, agent_id, root_path, prefix_for_agent,
-                location_id, location_name,
+                tmp_path,
+                agent_id,
+                root_path,
+                prefix_for_agent,
+                location_id,
+                location_name,
                 metadata_only=True,
             )
 
             logger.info(
                 "Rescan stream captured: %d files, %d dirs for %s",
-                files_found, dirs_found, location_name,
+                files_found,
+                dirs_found,
+                location_name,
             )
 
             # --- Phase 2: diff temp DB against catalog, apply changes ---
             new_count, changed_count, stale_count = await _diff_and_update(
-                tmp_path, location_id, scan_id, root_path, now_iso,
-                agent_id, location_name, files_found,
+                tmp_path,
+                location_id,
+                scan_id,
+                root_path,
+                now_iso,
+                agent_id,
+                location_name,
+                files_found,
             )
             files_new = new_count
 
             logger.info(
                 "Rescan diff complete: %d new, %d changed, %d stale for %s",
-                new_count, changed_count, stale_count, location_name,
+                new_count,
+                changed_count,
+                stale_count,
+                location_name,
             )
 
             # --- Phase 3: find dup candidates for new/changed files ---
             if new_count > 0 or changed_count > 0:
                 from file_hunter.services.dup_counts import post_ingest_dup_processing
+
                 candidates_total = await post_ingest_dup_processing(
-                    location_id, agent_id, location_name,
+                    location_id,
+                    agent_id,
+                    location_name,
                 )
 
         else:
@@ -168,24 +209,37 @@ async def run_scan(op_id: int, agent_id: int, params: dict):
 
             # --- Phase 1: stream metadata + hashes into temp DB ---
             files_found, dirs_found = await _stream_to_temp_db(
-                tmp_path, agent_id, root_path, prefix_for_agent,
-                location_id, location_name,
+                tmp_path,
+                agent_id,
+                root_path,
+                prefix_for_agent,
+                location_id,
+                location_name,
             )
 
             logger.info(
                 "Stream captured: %d files, %d dirs for %s",
-                files_found, dirs_found, location_name,
+                files_found,
+                dirs_found,
+                location_name,
             )
 
             # --- Phase 2: bulk ingest from temp DB into catalog ---
             files_new = await _bulk_ingest(
-                tmp_path, location_id, scan_id, root_path, now_iso,
-                location_name, files_found,
+                tmp_path,
+                location_id,
+                scan_id,
+                root_path,
+                now_iso,
+                location_name,
+                files_found,
             )
 
             logger.info(
                 "Ingest complete: %d files (%d new) for %s",
-                files_found, files_new, location_name,
+                files_found,
+                files_new,
+                location_name,
             )
 
             # Broadcast root folders so frontend can populate the tree
@@ -193,8 +247,11 @@ async def run_scan(op_id: int, agent_id: int, params: dict):
 
             # --- Phase 3: find dup candidates and queue for hashing ---
             from file_hunter.services.dup_counts import post_ingest_dup_processing
+
             candidates_total = await post_ingest_dup_processing(
-                location_id, agent_id, location_name,
+                location_id,
+                agent_id,
+                location_name,
             )
 
         # --- Finalization ---
@@ -224,7 +281,11 @@ async def run_scan(op_id: int, agent_id: int, params: dict):
 
         logger.info(
             "Scan completed: location #%d (%s), %d files found, %d new, %d stale",
-            location_id, location_name, files_found, files_new, stale_count,
+            location_id,
+            location_name,
+            files_found,
+            files_new,
+            stale_count,
         )
 
         # Wait for hash drainer to finish remaining work
@@ -238,7 +299,8 @@ async def run_scan(op_id: int, agent_id: int, params: dict):
             logger.warning(
                 "Hash drainer failed for %s: %s — scan data is intact, "
                 "pending hashes will be retried next scan",
-                location_name, drainer_err,
+                location_name,
+                drainer_err,
             )
         logger.info("Hash drainer finished for %s", location_name)
 
@@ -246,12 +308,14 @@ async def run_scan(op_id: int, agent_id: int, params: dict):
         from file_hunter.services.sizes import recalculate_location_sizes
 
         logger.info("Running size recalc for %s", location_name)
-        await broadcast({
-            "type": "scan_progress",
-            "locationId": location_id,
-            "location": location_name,
-            "phase": "rebuilding",
-        })
+        await broadcast(
+            {
+                "type": "scan_progress",
+                "locationId": location_id,
+                "location": location_name,
+                "phase": "rebuilding",
+            }
+        )
         await recalculate_location_sizes(location_id)
 
         invalidate_stats_cache()
@@ -325,7 +389,10 @@ async def run_scan(op_id: int, agent_id: int, params: dict):
             )
         logger.warning(
             "Scan interrupted: location #%d (%s): %s — scan_id=%d saved",
-            location_id, location_name, e, scan_id,
+            location_id,
+            location_name,
+            e,
+            scan_id,
         )
         await broadcast(
             {
@@ -358,7 +425,10 @@ async def run_scan(op_id: int, agent_id: int, params: dict):
         )
         logger.error(
             "Scan failed: location #%d (%s): %s",
-            location_id, location_name, e, exc_info=True,
+            location_id,
+            location_name,
+            e,
+            exc_info=True,
         )
         raise
 
@@ -382,6 +452,10 @@ async def _stream_to_temp_db(
 
     metadata_only: if True, tells agent to skip hash phase.
     """
+    # Remove stale temp file from interrupted scans
+    if os.path.exists(tmp_path):
+        os.unlink(tmp_path)
+
     tmp_db = sqlite3.connect(tmp_path)
     tmp_db.execute("PRAGMA journal_mode=WAL")
     tmp_db.execute("PRAGMA synchronous=OFF")  # temp DB, speed over safety
@@ -408,30 +482,32 @@ async def _stream_to_temp_db(
     hashes_total = 0
     hash_batch: list[tuple] = []
 
-    async for record in stream_tree(agent_id, root_path, prefix=prefix,
-                                    metadata_only=metadata_only):
+    async for record in stream_tree(
+        agent_id, root_path, prefix=prefix, metadata_only=metadata_only
+    ):
         from file_hunter.services.queue_manager import wait_if_paused
+
         await wait_if_paused()
 
         rtype = record.get("type")
 
         if rtype == "dir":
             current_rel_dir = record["rel_dir"]
-            tmp_db.execute(
-                "INSERT OR IGNORE INTO dirs VALUES (?)", (current_rel_dir,)
-            )
+            tmp_db.execute("INSERT OR IGNORE INTO dirs VALUES (?)", (current_rel_dir,))
             total_dirs += 1
 
         elif rtype == "file":
-            file_batch.append((
-                current_rel_dir,
-                record["rel_path"],
-                record["size"],
-                record["mtime"],
-                record["ctime"],
-                record["inode"],
-                None,  # hash_partial — filled in by H records
-            ))
+            file_batch.append(
+                (
+                    current_rel_dir,
+                    record["rel_path"],
+                    record["size"],
+                    record["mtime"],
+                    record["ctime"],
+                    record["inode"],
+                    None,  # hash_partial — filled in by H records
+                )
+            )
             total_files += 1
 
             # Flush batch to temp DB periodically
@@ -450,13 +526,16 @@ async def _stream_to_temp_db(
                 )
                 tmp_db.commit()
                 file_batch.clear()
-            tmp_db.execute("CREATE INDEX IF NOT EXISTS idx_tmp_files_relpath ON files(rel_path)")
+            tmp_db.execute(
+                "CREATE INDEX IF NOT EXISTS idx_tmp_files_relpath ON files(rel_path)"
+            )
             tmp_db.commit()
             hash_phase = True
             hashes_total = record.get("total", 0)
             logger.info(
                 "Scan hash phase: %d files to hash for %s",
-                hashes_total, location_name,
+                hashes_total,
+                location_name,
             )
 
         elif rtype == "hash":
@@ -486,31 +565,33 @@ async def _stream_to_temp_db(
                 hash_count = tmp_db.execute(
                     "SELECT COUNT(*) FROM files WHERE hash_partial IS NOT NULL"
                 ).fetchone()[0]
-                await broadcast({
-                    "type": "scan_progress",
-                    "locationId": location_id,
-                    "location": location_name,
-                    "phase": "hashing",
-                    "filesFound": total_files,
-                    "hashesDone": hash_count,
-                    "hashesTotal": hashes_total,
-                })
+                await broadcast(
+                    {
+                        "type": "scan_progress",
+                        "locationId": location_id,
+                        "location": location_name,
+                        "phase": "hashing",
+                        "filesFound": total_files,
+                        "hashesDone": hash_count,
+                        "hashesTotal": hashes_total,
+                    }
+                )
             else:
-                await broadcast({
-                    "type": "scan_progress",
-                    "locationId": location_id,
-                    "location": location_name,
-                    "phase": "scanning",
-                    "filesFound": total_files,
-                    "dirsFound": total_dirs,
-                })
+                await broadcast(
+                    {
+                        "type": "scan_progress",
+                        "locationId": location_id,
+                        "location": location_name,
+                        "phase": "scanning",
+                        "filesFound": total_files,
+                        "dirsFound": total_dirs,
+                    }
+                )
             last_broadcast = now_mono
 
     # Flush remaining batches
     if file_batch:
-        tmp_db.executemany(
-            "INSERT INTO files VALUES (?, ?, ?, ?, ?, ?, ?)", file_batch
-        )
+        tmp_db.executemany("INSERT INTO files VALUES (?, ?, ?, ?, ?, ?, ?)", file_batch)
     if hash_batch:
         tmp_db.executemany(
             "UPDATE files SET hash_partial = ? WHERE rel_path = ?",
@@ -520,7 +601,9 @@ async def _stream_to_temp_db(
 
     # Indexes for ingest and diff phases
     tmp_db.execute("CREATE INDEX IF NOT EXISTS idx_tmp_files_dir ON files(rel_dir)")
-    tmp_db.execute("CREATE INDEX IF NOT EXISTS idx_tmp_files_relpath ON files(rel_path)")
+    tmp_db.execute(
+        "CREATE INDEX IF NOT EXISTS idx_tmp_files_relpath ON files(rel_path)"
+    )
     tmp_db.commit()
     tmp_db.close()
 
@@ -606,32 +689,38 @@ async def _bulk_ingest(
             if rel_dir and rel_dir in folder_cache:
                 folder_id, dup_exclude = folder_cache[rel_dir]
 
-            batch.append((
-                filename,
-                full_path,
-                rel_path,
-                location_id,
-                folder_id,
-                file_type_high,
-                file_type_low,
-                r["file_size"],
-                r["ctime"],
-                r["mtime"],
-                now_iso,
-                now_iso,
-                scan_id,
-                is_hidden,
-                dup_exclude,
-                r["inode"],
-            ))
+            batch.append(
+                (
+                    filename,
+                    full_path,
+                    rel_path,
+                    location_id,
+                    folder_id,
+                    file_type_high,
+                    file_type_low,
+                    r["file_size"],
+                    r["ctime"],
+                    r["mtime"],
+                    now_iso,
+                    now_iso,
+                    scan_id,
+                    is_hidden,
+                    dup_exclude,
+                    r["inode"],
+                )
+            )
 
             batch_deltas.append((folder_id, r["file_size"], file_type_high, is_hidden))
 
             # Collect hash data for hashes.db
             if r["hash_partial"] or r["file_size"] > 0:
-                batch_hashes.append((
-                    rel_path, r["file_size"], r["hash_partial"],
-                ))
+                batch_hashes.append(
+                    (
+                        rel_path,
+                        r["file_size"],
+                        r["hash_partial"],
+                    )
+                )
 
         async with db_writer() as db:
             await db.executemany(
@@ -674,10 +763,16 @@ async def _bulk_ingest(
             for ir in id_rows:
                 h = hash_by_rel.get(ir["rel_path"])
                 if h:
-                    hashes_to_insert.append((
-                        ir["id"], location_id, ir["file_size"],
-                        h[2], None, None,  # hash_partial, hash_fast, hash_strong
-                    ))
+                    hashes_to_insert.append(
+                        (
+                            ir["id"],
+                            location_id,
+                            ir["file_size"],
+                            h[2],
+                            None,
+                            None,  # hash_partial, hash_fast, hash_strong
+                        )
+                    )
             if hashes_to_insert:
                 async with hashes_writer() as hdb:
                     await hdb.executemany(
@@ -696,7 +791,9 @@ async def _bulk_ingest(
         from file_hunter.stats_db import apply_file_deltas, read_stats as read_stats_db
 
         live_totals = await apply_file_deltas(
-            location_id, folder_parents, added=batch_deltas,
+            location_id,
+            folder_parents,
+            added=batch_deltas,
         )
 
         ingested += len(batch)
@@ -706,7 +803,9 @@ async def _bulk_ingest(
         if now_mono - last_broadcast >= 2.0:
             logger.info(
                 "Ingest progress: %d / %d files for %s",
-                ingested, total_files, location_name,
+                ingested,
+                total_files,
+                location_name,
             )
 
             # Read global totals from stats.db for status bar
@@ -719,19 +818,23 @@ async def _bulk_ingest(
             global_fc = global_row[0]["fc"] if global_row else 0
             global_ts = global_row[0]["ts"] if global_row else 0
 
-            await broadcast({
-                "type": "scan_progress",
-                "locationId": location_id,
-                "location": location_name,
-                "phase": "cataloging",
-                "catalogDone": ingested,
-                "catalogTotal": total_files,
-                "fileCount": live_totals.get("fileCount", ingested) if live_totals else ingested,
-                "totalSize": live_totals.get("totalSize", 0) if live_totals else 0,
-                "folderCount": len(folder_cache),
-                "globalFileCount": global_fc,
-                "globalTotalSize": global_ts,
-            })
+            await broadcast(
+                {
+                    "type": "scan_progress",
+                    "locationId": location_id,
+                    "location": location_name,
+                    "phase": "cataloging",
+                    "catalogDone": ingested,
+                    "catalogTotal": total_files,
+                    "fileCount": live_totals.get("fileCount", ingested)
+                    if live_totals
+                    else ingested,
+                    "totalSize": live_totals.get("totalSize", 0) if live_totals else 0,
+                    "folderCount": len(folder_cache),
+                    "globalFileCount": global_fc,
+                    "globalTotalSize": global_ts,
+                }
+            )
             last_broadcast = now_mono
 
         await asyncio.sleep(0)
@@ -796,12 +899,14 @@ async def _diff_and_update(
     folder_parents = {r["id"]: r["parent_id"] for r in fp_rows}
 
     # --- Phase 2b: diff using ATTACH ---
-    await broadcast({
-        "type": "scan_progress",
-        "locationId": location_id,
-        "location": location_name,
-        "phase": "comparing",
-    })
+    await broadcast(
+        {
+            "type": "scan_progress",
+            "locationId": location_id,
+            "location": location_name,
+            "phase": "comparing",
+        }
+    )
 
     # Use dedicated read connection with ATTACH for diff queries
     conn = await open_connection()
@@ -809,13 +914,15 @@ async def _diff_and_update(
         await conn.execute(f"ATTACH DATABASE '{tmp_path}' AS temp_scan")
 
         # New files: in temp DB but not in catalog
-        await broadcast({
-            "type": "scan_progress",
-            "locationId": location_id,
-            "location": location_name,
-            "phase": "comparing",
-            "compareStep": "Finding new files...",
-        })
+        await broadcast(
+            {
+                "type": "scan_progress",
+                "locationId": location_id,
+                "location": location_name,
+                "phase": "comparing",
+                "compareStep": "Finding new files...",
+            }
+        )
         new_rows = await conn.execute_fetchall(
             "SELECT t.rel_dir, t.rel_path, t.file_size, t.mtime, t.ctime, t.inode "
             "FROM temp_scan.files t "
@@ -828,13 +935,15 @@ async def _diff_and_update(
         logger.info("Rescan diff: %d new files for %s", new_count, location_name)
 
         # Changed files: in both but size or mtime differs
-        await broadcast({
-            "type": "scan_progress",
-            "locationId": location_id,
-            "location": location_name,
-            "phase": "comparing",
-            "compareStep": f"{new_count:,} new — finding changed files...",
-        })
+        await broadcast(
+            {
+                "type": "scan_progress",
+                "locationId": location_id,
+                "location": location_name,
+                "phase": "comparing",
+                "compareStep": f"{new_count:,} new — finding changed files...",
+            }
+        )
         changed_rows = await conn.execute_fetchall(
             "SELECT t.rel_dir, t.rel_path, t.file_size, t.mtime, t.ctime, t.inode, "
             "c.id as file_id, c.file_size as old_size, c.file_type_high as old_type, "
@@ -847,16 +956,20 @@ async def _diff_and_update(
             (location_id,),
         )
         changed_count = len(changed_rows)
-        logger.info("Rescan diff: %d changed files for %s", changed_count, location_name)
+        logger.info(
+            "Rescan diff: %d changed files for %s", changed_count, location_name
+        )
 
         # Stale files: in catalog but not in temp DB (with details for stats)
-        await broadcast({
-            "type": "scan_progress",
-            "locationId": location_id,
-            "location": location_name,
-            "phase": "comparing",
-            "compareStep": f"{new_count:,} new, {changed_count:,} changed — finding stale files...",
-        })
+        await broadcast(
+            {
+                "type": "scan_progress",
+                "locationId": location_id,
+                "location": location_name,
+                "phase": "comparing",
+                "compareStep": f"{new_count:,} new, {changed_count:,} changed — finding stale files...",
+            }
+        )
         stale_ids = await conn.execute_fetchall(
             "SELECT c.id, c.folder_id, c.file_size, c.file_type_high, c.hidden "
             "FROM main.files c "
@@ -879,18 +992,19 @@ async def _diff_and_update(
             ph = ",".join("?" for _ in batch)
             async with db_writer() as db:
                 await db.execute(
-                    f"UPDATE files SET stale = 1, scan_id = ? "
-                    f"WHERE id IN ({ph})",
+                    f"UPDATE files SET stale = 1, scan_id = ? WHERE id IN ({ph})",
                     [scan_id] + batch,
                 )
             await asyncio.sleep(0)
 
         # Remove stale files from hashes.db
         from file_hunter.hashes_db import remove_file_hashes
+
         await remove_file_hashes(stale_id_list)
 
         # Stats: remove stale file deltas
         from file_hunter.stats_db import apply_file_deltas as _apply_deltas
+
         stale_removed = [
             (r["folder_id"], r["file_size"] or 0, r["file_type_high"], r["hidden"])
             for r in stale_ids
@@ -918,14 +1032,16 @@ async def _diff_and_update(
 
     # --- Phase 2c: insert new files ---
     if new_rows:
-        await broadcast({
-            "type": "scan_progress",
-            "locationId": location_id,
-            "location": location_name,
-            "phase": "cataloging",
-            "catalogDone": 0,
-            "catalogTotal": new_count,
-        })
+        await broadcast(
+            {
+                "type": "scan_progress",
+                "locationId": location_id,
+                "location": location_name,
+                "phase": "cataloging",
+                "catalogDone": 0,
+                "catalogTotal": new_count,
+            }
+        )
 
         for i in range(0, len(new_rows), INGEST_BATCH_SIZE):
             batch_rows = new_rows[i : i + INGEST_BATCH_SIZE]
@@ -943,12 +1059,26 @@ async def _diff_and_update(
                 if rel_dir and rel_dir in folder_cache:
                     folder_id, dup_exclude = folder_cache[rel_dir]
 
-                batch.append((
-                    filename, full_path, rel_path, location_id, folder_id,
-                    file_type_high, file_type_low, r["file_size"],
-                    r["ctime"], r["mtime"], now_iso, now_iso, scan_id,
-                    is_hidden, dup_exclude, r["inode"],
-                ))
+                batch.append(
+                    (
+                        filename,
+                        full_path,
+                        rel_path,
+                        location_id,
+                        folder_id,
+                        file_type_high,
+                        file_type_low,
+                        r["file_size"],
+                        r["ctime"],
+                        r["mtime"],
+                        now_iso,
+                        now_iso,
+                        scan_id,
+                        is_hidden,
+                        dup_exclude,
+                        r["inode"],
+                    )
+                )
 
             async with db_writer() as db:
                 await db.executemany(
@@ -980,6 +1110,7 @@ async def _diff_and_update(
                 for b in batch
             ]
             from file_hunter.stats_db import apply_file_deltas as _apply_deltas
+
             await _apply_deltas(location_id, folder_parents, added=batch_deltas)
 
             # Register in hashes.db (no hash values yet — populated in phase 2e)
@@ -1005,14 +1136,16 @@ async def _diff_and_update(
                         h_batch,
                     )
 
-            await broadcast({
-                "type": "scan_progress",
-                "locationId": location_id,
-                "location": location_name,
-                "phase": "cataloging",
-                "catalogDone": min(i + INGEST_BATCH_SIZE, new_count),
-                "catalogTotal": new_count,
-            })
+            await broadcast(
+                {
+                    "type": "scan_progress",
+                    "locationId": location_id,
+                    "location": location_name,
+                    "phase": "cataloging",
+                    "catalogDone": min(i + INGEST_BATCH_SIZE, new_count),
+                    "catalogTotal": new_count,
+                }
+            )
             await asyncio.sleep(0)
 
     # --- Phase 2d: update changed files ---
@@ -1033,13 +1166,23 @@ async def _diff_and_update(
                 if rel_dir and rel_dir in folder_cache:
                     folder_id, dup_exclude = folder_cache[rel_dir]
 
-                update_batch.append((
-                    filename, full_path, folder_id,
-                    file_type_high, file_type_low, r["file_size"],
-                    r["ctime"], r["mtime"], now_iso, scan_id,
-                    is_hidden, r["inode"],
-                    r["file_id"],
-                ))
+                update_batch.append(
+                    (
+                        filename,
+                        full_path,
+                        folder_id,
+                        file_type_high,
+                        file_type_low,
+                        r["file_size"],
+                        r["ctime"],
+                        r["mtime"],
+                        now_iso,
+                        scan_id,
+                        is_hidden,
+                        r["inode"],
+                        r["file_id"],
+                    )
+                )
 
             async with db_writer() as db:
                 await db.executemany(
@@ -1071,9 +1214,12 @@ async def _diff_and_update(
             changed_added.append((folder_id, r["file_size"], file_type_high, is_hidden))
 
         from file_hunter.stats_db import apply_file_deltas as _apply_deltas
+
         await _apply_deltas(
-            location_id, folder_parents,
-            removed=changed_removed, added=changed_added,
+            location_id,
+            folder_parents,
+            removed=changed_removed,
+            added=changed_added,
         )
 
         logger.info(
@@ -1096,14 +1242,16 @@ async def _diff_and_update(
         hashed = 0
         last_broadcast = time.monotonic()
 
-        await broadcast({
-            "type": "scan_progress",
-            "locationId": location_id,
-            "location": location_name,
-            "phase": "hashing",
-            "hashesDone": 0,
-            "hashesTotal": total_to_hash,
-        })
+        await broadcast(
+            {
+                "type": "scan_progress",
+                "locationId": location_id,
+                "location": location_name,
+                "phase": "hashing",
+                "hashesDone": 0,
+                "hashesTotal": total_to_hash,
+            }
+        )
 
         # Batch by bytes using HASH_BATCH_BYTES
         from file_hunter.services.dup_counts import HASH_BATCH_BYTES
@@ -1125,7 +1273,9 @@ async def _diff_and_update(
             if batch_bytes >= HASH_BATCH_BYTES:
                 result = await hash_partial_batch(agent_id, batch_paths)
                 await _write_hash_partials_to_hashes_db(
-                    result, root_path, location_id,
+                    result,
+                    root_path,
+                    location_id,
                 )
                 hashed += len(batch_paths)
                 batch_paths = []
@@ -1133,27 +1283,29 @@ async def _diff_and_update(
 
                 now_mono = time.monotonic()
                 if now_mono - last_broadcast >= 2.0:
-                    await broadcast({
-                        "type": "scan_progress",
-                        "locationId": location_id,
-                        "location": location_name,
-                        "phase": "hashing",
-                        "hashesDone": hashed,
-                        "hashesTotal": total_to_hash,
-                    })
+                    await broadcast(
+                        {
+                            "type": "scan_progress",
+                            "locationId": location_id,
+                            "location": location_name,
+                            "phase": "hashing",
+                            "hashesDone": hashed,
+                            "hashesTotal": total_to_hash,
+                        }
+                    )
                     last_broadcast = now_mono
 
         # Flush remaining
         if batch_paths:
             result = await hash_partial_batch(agent_id, batch_paths)
             await _write_hash_partials_to_hashes_db(
-                result, root_path, location_id,
+                result,
+                root_path,
+                location_id,
             )
             hashed += len(batch_paths)
 
-        logger.info(
-            "Rescan: %d hash partials applied for %s", hashed, location_name
-        )
+        logger.info("Rescan: %d hash partials applied for %s", hashed, location_name)
 
     # Broadcast updated tree children
     await _broadcast_location_children(location_id)
@@ -1162,7 +1314,9 @@ async def _diff_and_update(
 
 
 async def _write_hash_partials_to_hashes_db(
-    result: dict, root_path: str, location_id: int,
+    result: dict,
+    root_path: str,
+    location_id: int,
 ):
     """Write hash_partial results from agent directly to hashes.db.
 
@@ -1212,6 +1366,7 @@ async def _broadcast_location_children(location_id: int):
     """Broadcast root folders for a location so frontend can populate the tree."""
     async with read_db() as rdb:
         from file_hunter.services.settings import get_setting
+
         show_hidden = await get_setting(rdb, "showHiddenFiles") == "1"
         hidden_filter = "" if show_hidden else " AND f.hidden = 0"
         child_hidden_filter = "" if show_hidden else " AND c.hidden = 0"
@@ -1238,12 +1393,13 @@ async def _broadcast_location_children(location_id: int):
         if f["dup_exclude"]:
             child_node["dupExcluded"] = True
         children.append(child_node)
-    await broadcast({
-        "type": "location_children",
-        "locationId": location_id,
-        "children": children,
-    })
-
+    await broadcast(
+        {
+            "type": "location_children",
+            "locationId": location_id,
+            "children": children,
+        }
+    )
 
 
 async def _broadcast_progress(
@@ -1309,167 +1465,6 @@ async def _broadcast_progress(
             "globalTypeBreakdown": global_type_breakdown,
         }
     )
-
-
-async def _drain_pending_hashes(
-    agent_id: int, location_id: int, location_name: str,
-    scan_done: asyncio.Event,
-):
-    """Background task: drain pending_hashes by sending batches to the agent.
-
-    Runs concurrently with the scan. Polls the pending_hashes table for
-    this agent, sends inode-sorted batches to the agent's /files/hash-batch
-    endpoint, writes results back, and submits to the coalesced dup recalc
-    writer for incremental dup counting.
-
-    Batches by bytes (HASH_BATCH_BYTES) not count — predictable I/O per batch.
-    Exits when scan_done is set AND the table is empty.
-    """
-    from file_hunter.services.agent_ops import hash_fast_batch
-    from file_hunter.services.dup_counts import submit_hashes_for_recalc, HASH_BATCH_BYTES
-
-    # Fetch a large chunk, then split into byte-sized batches
-    FETCH_LIMIT = 2000
-    total_hashed = 0
-    total_pending = 0
-    last_broadcast = time.monotonic()
-
-    async def _broadcast_drainer_progress():
-        nonlocal last_broadcast
-        now = time.monotonic()
-        if now - last_broadcast >= 2.0:
-            remaining = total_pending - total_hashed
-            await broadcast({
-                "type": "scan_progress",
-                "locationId": location_id,
-                "location": location_name,
-                "phase": "checking_duplicates",
-                "checksDone": total_hashed,
-                "checksTotal": total_pending,
-            })
-            last_broadcast = now
-
-    async def _process_batch(batch_rows):
-        """Hash a batch via agent, write results, submit to coalesced writer."""
-        nonlocal total_hashed
-        paths = [r["full_path"] for r in batch_rows]
-        path_to_file_id = {r["full_path"]: r["file_id"] for r in batch_rows}
-        pending_ids = [r["id"] for r in batch_rows]
-        affected_locs = {r["location_id"] for r in batch_rows}
-
-        try:
-            result = await hash_fast_batch(agent_id, paths)
-        except (ConnectionError, OSError, httpx.ConnectError):
-            logger.warning(
-                "Hash drainer: agent %d offline, stopping", agent_id
-            )
-            raise
-
-        hash_results = result.get("results", [])
-        affected_fast: set[str] = set()
-
-        if hash_results:
-            from file_hunter.hashes_db import hashes_writer
-            async with hashes_writer() as hdb:
-                for hr in hash_results:
-                    fid = path_to_file_id.get(hr["path"])
-                    hf = hr.get("hash_fast")
-                    if fid and hf:
-                        await hdb.execute(
-                            "UPDATE file_hashes SET hash_fast = ? WHERE file_id = ?",
-                            (hf, fid),
-                        )
-                        affected_fast.add(hf)
-
-        # Remove processed entries from pending_hashes
-        for i in range(0, len(pending_ids), 500):
-            batch = pending_ids[i : i + 500]
-            ph = ",".join("?" for _ in batch)
-            async with db_writer() as db:
-                await db.execute(
-                    f"DELETE FROM pending_hashes WHERE id IN ({ph})",
-                    batch,
-                )
-
-        total_hashed += len(hash_results)
-
-        if affected_fast:
-            submit_hashes_for_recalc(
-                strong_hashes=None,
-                fast_hashes=affected_fast,
-                source=f"hash drainer {location_name}",
-                location_ids=affected_locs,
-            )
-
-        logger.info(
-            "Hash drainer: %d hashed (%d / %d) for %s",
-            len(hash_results), total_hashed, total_pending, location_name,
-        )
-
-        await _broadcast_drainer_progress()
-
-    try:
-        while True:
-            async with read_db() as rdb:
-                rows = await rdb.execute_fetchall(
-                    "SELECT id, file_id, full_path, inode, location_id FROM pending_hashes "
-                    "WHERE agent_id = ? "
-                    "ORDER BY inode "
-                    "LIMIT ?",
-                    (agent_id, FETCH_LIMIT),
-                )
-                # Get total pending on first fetch or periodically
-                if total_pending == 0 or len(rows) == FETCH_LIMIT:
-                    count_row = await rdb.execute_fetchall(
-                        "SELECT COUNT(*) as c FROM pending_hashes WHERE agent_id = ?",
-                        (agent_id,),
-                    )
-                    total_pending = total_hashed + count_row[0]["c"]
-
-            if not rows:
-                if scan_done.is_set():
-                    logger.info("Hash drainer: done for %s", location_name)
-                    return
-                await asyncio.sleep(2)
-                continue
-
-            # Get file sizes for byte-based batching
-            file_ids = [r["file_id"] for r in rows]
-            size_map: dict[int, int] = {}
-            for i in range(0, len(file_ids), 500):
-                batch_ids = file_ids[i : i + 500]
-                ph = ",".join("?" for _ in batch_ids)
-                async with read_db() as rdb:
-                    size_rows = await rdb.execute_fetchall(
-                        f"SELECT id, file_size FROM files WHERE id IN ({ph})",
-                        batch_ids,
-                    )
-                for sr in size_rows:
-                    size_map[sr["id"]] = sr["file_size"]
-
-            # Build byte-sized batches and process
-            batch_rows: list[dict] = []
-            batch_bytes = 0
-
-            for r in rows:
-                fsize = size_map.get(r["file_id"], 0)
-                batch_rows.append(dict(r))
-                batch_bytes += fsize
-
-                if batch_bytes >= HASH_BATCH_BYTES:
-                    await _process_batch(batch_rows)
-                    batch_rows = []
-                    batch_bytes = 0
-
-            if batch_rows:
-                await _process_batch(batch_rows)
-
-            await asyncio.sleep(0)
-
-    except (ConnectionError, OSError, httpx.ConnectError):
-        return
-    except asyncio.CancelledError:
-        return
 
 
 def _now() -> str:
