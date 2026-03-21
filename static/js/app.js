@@ -1611,6 +1611,21 @@ WS.on('upload_file_error', (msg) => {
     ActivityLog.add(`Upload error: <b>${msg.filename}</b> — ${msg.error}`);
 });
 
+WS.on('file_added', (msg) => {
+    // Append to file list if viewing the same folder
+    const viewingFolder = FileList.currentFolder;
+    if (!viewingFolder || !msg.folderId) return;
+    const viewId = String(viewingFolder);
+    const folderId = String(msg.folderId);
+    // Match loc-N to loc-N or fld-N to fld-N
+    if (viewId === `loc-${folderId}` || viewId === `fld-${folderId}` || viewId === folderId) {
+        if (!FileList.currentItems) FileList.currentItems = [];
+        FileList.currentItems.push(msg.file);
+        FileList.totalFiles++;
+        FileList.render();
+    }
+});
+
 WS.on('upload_completed', async (msg) => {
     StatusBar.renderActivity('idle');
     ActivityLog.add(`Upload completed: <b>${msg.location}</b> — ${msg.cataloged} cataloged, ${msg.duplicates} duplicates`);

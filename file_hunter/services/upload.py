@@ -164,8 +164,34 @@ async def run_upload(
                         ),
                     )
 
+                # Get the inserted file ID
+                file_id = (await wdb.execute("SELECT last_insert_rowid()")).fetchone()[0]
+
                 affected_hashes.add(hash_strong)
                 cataloged += 1
+
+                # Broadcast so the file list can show the new file immediately
+                await broadcast(
+                    {
+                        "type": "file_added",
+                        "locationId": location_id,
+                        "folderId": folder_id,
+                        "file": {
+                            "id": file_id,
+                            "name": sf["filename"],
+                            "typeHigh": type_high,
+                            "typeLow": type_low,
+                            "size": file_size,
+                            "date": modified,
+                            "dups": 0,
+                            "hashStrong": hash_strong,
+                            "hashFast": hash_fast,
+                            "stale": False,
+                            "missing": False,
+                            "hidden": bool(sf["filename"].startswith(".")),
+                        },
+                    }
+                )
 
                 # Stats: new file added
                 is_hidden = 1 if sf["filename"].startswith(".") else 0
