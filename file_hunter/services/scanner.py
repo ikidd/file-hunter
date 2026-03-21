@@ -46,9 +46,9 @@ async def _mark_stale_files(
 
     stale_ids = [r["id"] for r in stale_rows]
     if stale_ids:
-        from file_hunter.hashes_db import remove_file_hashes
+        from file_hunter.hashes_db import mark_hashes_stale
 
-        await remove_file_hashes(stale_ids)
+        await mark_hashes_stale(stale_ids)
 
     return cursor.rowcount
 
@@ -121,15 +121,15 @@ async def _upsert_file(
     modified_date: str,
     file_type_high: str,
     file_type_low: str,
-    hash_partial: str | None,
-    hash_fast: str | None,
-    hash_strong: str | None,
     now_iso: str,
     hidden: int = 0,
     dup_exclude: int = 0,
     inode: int = 0,
 ) -> int:
-    """Insert or update a file record. Preserves description and tags on update."""
+    """Insert or update a file record. Preserves description and tags on update.
+
+    Hashes are NOT written here — they belong in hashes.db only.
+    """
     row = await db.execute_fetchall(
         "SELECT id FROM files WHERE location_id = ? AND rel_path = ?",
         (location_id, rel_path),
@@ -140,9 +140,6 @@ async def _upsert_file(
             """UPDATE files SET
                 filename=?, full_path=?, folder_id=?,
                 file_type_high=?, file_type_low=?, file_size=?,
-                hash_partial=COALESCE(?, hash_partial),
-                hash_fast=COALESCE(?, hash_fast),
-                hash_strong=COALESCE(?, hash_strong),
                 created_date=?, modified_date=?,
                 date_last_seen=?, scan_id=?, stale=0, hidden=?, dup_exclude=?,
                 inode=?
@@ -154,9 +151,6 @@ async def _upsert_file(
                 file_type_high,
                 file_type_low,
                 file_size,
-                hash_partial,
-                hash_fast,
-                hash_strong,
                 created_date,
                 modified_date,
                 now_iso,
@@ -173,11 +167,10 @@ async def _upsert_file(
             """INSERT INTO files
                (filename, full_path, rel_path, location_id, folder_id,
                 file_type_high, file_type_low, file_size,
-                hash_partial, hash_fast, hash_strong,
                 description, tags,
                 created_date, modified_date, date_cataloged, date_last_seen,
                 scan_id, stale, hidden, dup_exclude, inode)
-               VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, '', '', ?, ?, ?, ?, ?, 0, ?, ?, ?)""",
+               VALUES (?, ?, ?, ?, ?, ?, ?, ?, '', '', ?, ?, ?, ?, ?, 0, ?, ?, ?)""",
             (
                 filename,
                 full_path,
@@ -187,9 +180,6 @@ async def _upsert_file(
                 file_type_high,
                 file_type_low,
                 file_size,
-                hash_partial,
-                hash_fast,
-                hash_strong,
                 created_date,
                 modified_date,
                 now_iso,
@@ -201,35 +191,6 @@ async def _upsert_file(
             ),
         )
         return cursor.lastrowid
-
-
-async def write_hash_results(
-    results: list[dict], path_to_id: dict[str, int]
-) -> tuple[int, set[str]]:
-    """Write hash_fast results from an agent call to the files table.
-
-    results: from hash_fast_batch()["results"], each {"path": ..., "hash_fast": ...}
-    path_to_id: mapping of full_path -> file id
-
-    Returns (count_written, set_of_hash_fast_values).
-    """
-    from file_hunter.db import db_writer
-
-    hash_map = {r["path"]: r["hash_fast"] for r in results}
-    written = 0
-    hashes: set[str] = set()
-    if hash_map:
-        async with db_writer() as wdb:
-            for path, h in hash_map.items():
-                fid = path_to_id.get(path)
-                if fid:
-                    await wdb.execute(
-                        "UPDATE files SET hash_fast = ? WHERE id = ?",
-                        (h, fid),
-                    )
-                    hashes.add(h)
-                    written += 1
-    return written, hashes
 
 
 # Public aliases for pro/extension reuse (keep _-prefixed originals intact)

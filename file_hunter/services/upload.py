@@ -163,10 +163,9 @@ async def run_upload(
                         """INSERT INTO files
                            (filename, full_path, rel_path, location_id, folder_id,
                             file_type_high, file_type_low, file_size,
-                            hash_partial, hash_fast, hash_strong,
                             description, tags,
                             created_date, modified_date, date_cataloged, date_last_seen, scan_id)
-                           VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, '', '',
+                           VALUES (?, ?, ?, ?, ?, ?, ?, ?, '', '',
                                    ?, ?, ?, ?, NULL)""",
                         (
                             sf["filename"],
@@ -177,9 +176,6 @@ async def run_upload(
                             type_high,
                             type_low,
                             file_size,
-                            hash_partial,
-                            hash_fast,
-                            hash_strong,
                             created,
                             modified,
                             now_iso,

@@ -1050,10 +1050,10 @@ async def _diff_and_update(
                 )
             await asyncio.sleep(0)
 
-        # Remove stale files from hashes.db
-        from file_hunter.hashes_db import remove_file_hashes
+        # Flag stale in hashes.db (preserves hash data for recovery)
+        from file_hunter.hashes_db import mark_hashes_stale
 
-        await remove_file_hashes(stale_id_list)
+        await mark_hashes_stale(stale_id_list)
 
         # Stats: remove stale file deltas
         from file_hunter.stats_db import apply_file_deltas as _apply_deltas
@@ -1077,26 +1077,10 @@ async def _diff_and_update(
                 )
             await asyncio.sleep(0)
 
-        # Recovered files need hash_partial re-registered in hashes.db
-        # (removed when they went stale). Bulk re-insert from catalog data.
-        async with read_db() as rdb:
-            for i in range(0, len(recovered_id_list), 500):
-                batch = recovered_id_list[i : i + 500]
-                ph = ",".join("?" for _ in batch)
-                rows = await rdb.execute_fetchall(
-                    f"SELECT id, location_id, file_size, hash_partial "
-                    f"FROM files WHERE id IN ({ph})",
-                    batch,
-                )
-        if rows:
-            async with hashes_writer() as hdb:
-                for r in rows:
-                    await hdb.execute(
-                        "INSERT OR IGNORE INTO file_hashes "
-                        "(file_id, location_id, file_size, hash_partial) "
-                        "VALUES (?, ?, ?, ?)",
-                        (r["id"], r["location_id"], r["file_size"], r["hash_partial"]),
-                    )
+        # Clear stale flag in hashes.db — hash data was preserved
+        from file_hunter.hashes_db import clear_hashes_stale
+
+        await clear_hashes_stale(recovered_id_list)
 
     # Mark all seen files with current scan_id — batched to avoid holding writer
     async with read_db() as rdb:
@@ -1278,11 +1262,22 @@ async def _diff_and_update(
                     "file_type_high=?, file_type_low=?, file_size=?, "
                     "created_date=?, modified_date=?, date_last_seen=?, scan_id=?, "
                     "hidden=?, inode=?, "
-                    "hash_partial=NULL, hash_fast=NULL, hash_strong=NULL, "
                     "stale=0 "
                     "WHERE id=?",
                     update_batch,
                 )
+
+            # Clear hashes in hashes.db for changed files (need re-hashing)
+            changed_ids = [r["file_id"] for r in batch]
+            for ci in range(0, len(changed_ids), 500):
+                cbatch = changed_ids[ci : ci + 500]
+                cph = ",".join("?" for _ in cbatch)
+                async with hashes_writer() as hdb:
+                    await hdb.execute(
+                        f"UPDATE file_hashes SET hash_partial=NULL, hash_fast=NULL, "
+                        f"hash_strong=NULL WHERE file_id IN ({cph})",
+                        cbatch,
+                    )
             await asyncio.sleep(0)
 
         # Stats: changed files — remove old sizes, add new sizes

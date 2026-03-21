@@ -289,8 +289,7 @@ async def run_merge(source_id, source_info, destination_id, dest_info):
                             """UPDATE files SET
                                 filename=?, full_path=?, rel_path=?,
                                 file_type_high='text', file_type_low='moved',
-                                file_size=0, hash_fast=NULL, hash_strong=NULL,
-                                hash_partial=NULL, modified_date=?, date_last_seen=?
+                                file_size=0, modified_date=?, date_last_seen=?
                                WHERE id=?""",
                             (
                                 stub_name,
@@ -368,10 +367,13 @@ async def run_merge(source_id, source_info, destination_id, dest_info):
                         src_path, src_loc_id, strong=True
                     )
                     files_hashed += 1
-                    # Update source file record with hash
-                    async with db_writer() as wdb:
-                        await wdb.execute(
-                            "UPDATE files SET hash_fast=?, hash_strong=? WHERE id=?",
+                    # Update source file hashes in hashes.db
+                    from file_hunter.hashes_db import hashes_writer
+
+                    async with hashes_writer() as hdb:
+                        await hdb.execute(
+                            "UPDATE file_hashes SET hash_fast=?, hash_strong=? "
+                            "WHERE file_id=?",
                             (hash_fast, hash_strong, src_file["id"]),
                         )
                 except (PermissionError, FileNotFoundError, OSError, ConnectionError):
@@ -404,8 +406,7 @@ async def run_merge(source_id, source_info, destination_id, dest_info):
                             """UPDATE files SET
                                 filename=?, full_path=?, rel_path=?,
                                 file_type_high='text', file_type_low='moved',
-                                file_size=0, hash_fast=NULL, hash_strong=NULL,
-                                hash_partial=NULL, modified_date=?, date_last_seen=?
+                                file_size=0, modified_date=?, date_last_seen=?
                                WHERE id=?""",
                             (
                                 stub_name,
@@ -606,8 +607,7 @@ async def run_merge(source_id, source_info, destination_id, dest_info):
                             """UPDATE files SET
                                 filename=?, full_path=?, rel_path=?,
                                 file_type_high='text', file_type_low='moved',
-                                file_size=0, hash_fast=NULL, hash_strong=NULL,
-                                hash_partial=NULL, modified_date=?, date_last_seen=?
+                                file_size=0, modified_date=?, date_last_seen=?
                                WHERE id=?""",
                             (
                                 stub_name,

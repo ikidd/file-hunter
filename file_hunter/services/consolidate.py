@@ -355,7 +355,7 @@ async def run_consolidation(file_id: int, mode: str, dest_folder_id: str | None)
                             """UPDATE files SET
                                 filename=?, full_path=?, rel_path=?,
                                 file_type_high='text', file_type_low='moved',
-                                file_size=?, hash_fast=NULL, hash_strong=NULL,
+                                file_size=?,
                                 modified_date=?, date_last_seen=?
                                WHERE id=?""",
                             (
@@ -552,7 +552,7 @@ async def drain_pending_jobs(location_id: int, root_path: str):
                             """UPDATE files SET
                                 filename=?, full_path=?, rel_path=?,
                                 file_type_high='text', file_type_low='moved',
-                                file_size=?, hash_fast=NULL, hash_strong=NULL,
+                                file_size=?,
                                 modified_date=?, date_last_seen=?
                                WHERE id=?""",
                             (

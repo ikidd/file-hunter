@@ -153,7 +153,6 @@ async def _bg_repair(phases: list[str] | None = None):
     )
     from file_hunter.services.online_check import agent_online_check
     from file_hunter.services.queue_manager import paused_queue
-    from file_hunter.services.scanner import write_hash_results
     from file_hunter.services.sizes import recalculate_location_sizes
     from file_hunter.services.stats import invalidate_stats_cache
     from file_hunter.ws.scan import broadcast
@@ -252,9 +251,22 @@ async def _bg_repair(phases: list[str] | None = None):
                             )
                             break
 
-                        written, _ = await write_hash_results(
-                            result.get("results", []), path_to_id
-                        )
+                        # Write hash_fast results to hashes.db
+                        from file_hunter.hashes_db import hashes_writer
+
+                        hash_results = result.get("results", [])
+                        written = 0
+                        if hash_results:
+                            async with hashes_writer() as hdb:
+                                for hr in hash_results:
+                                    fid = path_to_id.get(hr["path"])
+                                    hf = hr.get("hash_fast")
+                                    if fid and hf:
+                                        await hdb.execute(
+                                            "UPDATE file_hashes SET hash_fast = ? WHERE file_id = ?",
+                                            (hf, fid),
+                                        )
+                                        written += 1
                         hashed += written
                         errors += len(result.get("errors", []))
                         _repair_progress["hashed"] = hashed

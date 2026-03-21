@@ -29,7 +29,8 @@ CREATE TABLE IF NOT EXISTS file_hashes (
     hash_fast TEXT,
     hash_strong TEXT,
     dup_count INTEGER NOT NULL DEFAULT 0,
-    excluded INTEGER NOT NULL DEFAULT 0
+    excluded INTEGER NOT NULL DEFAULT 0,
+    stale INTEGER NOT NULL DEFAULT 0
 );
 
 CREATE INDEX IF NOT EXISTS idx_hashes_size_partial
@@ -42,8 +43,15 @@ CREATE INDEX IF NOT EXISTS idx_hashes_location
     ON file_hashes(location_id);
 
 CREATE VIEW IF NOT EXISTS active_hashes AS
-    SELECT * FROM file_hashes WHERE excluded = 0;
+    SELECT * FROM file_hashes WHERE excluded = 0 AND stale = 0;
 """
+
+_MIGRATIONS = [
+    "ALTER TABLE file_hashes ADD COLUMN stale INTEGER NOT NULL DEFAULT 0",
+    # Recreate view to include stale filter
+    "DROP VIEW IF EXISTS active_hashes",
+    "CREATE VIEW active_hashes AS SELECT * FROM file_hashes WHERE excluded = 0 AND stale = 0",
+]
 
 
 def _hashes_db_path() -> Path:
@@ -74,13 +82,23 @@ async def init_hashes_db():
         # Column migration (idempotent)
         import sqlite3 as _sqlite3
 
-        try:
-            await conn.execute(
-                "ALTER TABLE file_hashes ADD COLUMN excluded INTEGER NOT NULL DEFAULT 0"
-            )
-            await conn.commit()
-        except _sqlite3.OperationalError:
-            pass  # column already exists
+        for migration in [
+            "ALTER TABLE file_hashes ADD COLUMN excluded INTEGER NOT NULL DEFAULT 0",
+            "ALTER TABLE file_hashes ADD COLUMN stale INTEGER NOT NULL DEFAULT 0",
+        ]:
+            try:
+                await conn.execute(migration)
+                await conn.commit()
+            except _sqlite3.OperationalError:
+                pass  # column already exists
+
+        # Recreate view to include stale filter
+        await conn.execute("DROP VIEW IF EXISTS active_hashes")
+        await conn.execute(
+            "CREATE VIEW IF NOT EXISTS active_hashes AS "
+            "SELECT * FROM file_hashes WHERE excluded = 0 AND stale = 0"
+        )
+        await conn.commit()
     finally:
         await conn.close()
 
@@ -175,10 +193,11 @@ async def get_file_hashes(file_ids: list[int]) -> dict[int, dict]:
 
 
 async def remove_file_hashes(file_ids: list[int]):
-    """Remove entries from hashes.db for deleted/stale/excluded files.
+    """Remove entries from hashes.db for truly deleted files.
 
-    Batched to avoid SQLite variable limits. Safe to call with IDs
-    that don't exist in hashes.db (no-op for those).
+    Only use for permanent deletion (location delete, file delete).
+    For stale files, use mark_hashes_stale() instead — preserves
+    hash data for recovery.
     """
     if not file_ids:
         return
@@ -188,6 +207,38 @@ async def remove_file_hashes(file_ids: list[int]):
         async with hashes_writer() as wdb:
             await wdb.execute(
                 f"DELETE FROM file_hashes WHERE file_id IN ({ph})",
+                batch,
+            )
+
+
+async def mark_hashes_stale(file_ids: list[int]):
+    """Flag hashes as stale — excluded from active_hashes but data preserved.
+
+    Used when files are marked stale (not seen on disk). The hash data
+    remains so files can be recovered without re-hashing.
+    """
+    if not file_ids:
+        return
+    for i in range(0, len(file_ids), 500):
+        batch = file_ids[i : i + 500]
+        ph = ",".join("?" for _ in batch)
+        async with hashes_writer() as wdb:
+            await wdb.execute(
+                f"UPDATE file_hashes SET stale = 1 WHERE file_id IN ({ph})",
+                batch,
+            )
+
+
+async def clear_hashes_stale(file_ids: list[int]):
+    """Clear stale flag — file recovered, hashes active again."""
+    if not file_ids:
+        return
+    for i in range(0, len(file_ids), 500):
+        batch = file_ids[i : i + 500]
+        ph = ",".join("?" for _ in batch)
+        async with hashes_writer() as wdb:
+            await wdb.execute(
+                f"UPDATE file_hashes SET stale = 0 WHERE file_id IN ({ph})",
                 batch,
             )
 

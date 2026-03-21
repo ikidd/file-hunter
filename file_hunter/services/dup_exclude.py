@@ -193,27 +193,39 @@ async def toggle_dup_exclude(folder_id: int, exclude: bool):
             # Get distinct hashes from files in the folder tree
             all_strong = set()
             all_fast = set()
+            # Get file_ids from catalog by folder scope
+            all_file_ids = []
             for i in range(0, len(folder_ids), SQL_VAR_LIMIT):
                 batch = folder_ids[i : i + SQL_VAR_LIMIT]
                 ph = ",".join("?" for _ in batch)
-                strong_rows = await conn.execute_fetchall(
-                    f"SELECT DISTINCT hash_strong FROM files "
-                    f"WHERE folder_id IN ({ph}) AND stale = 0 "
-                    f"AND hash_strong IS NOT NULL AND hash_strong != ''",
+                id_rows = await conn.execute_fetchall(
+                    f"SELECT id FROM files WHERE folder_id IN ({ph}) AND stale = 0",
                     batch,
                 )
-                all_strong.update(r["hash_strong"] for r in strong_rows)
-
-                fast_rows = await conn.execute_fetchall(
-                    f"SELECT DISTINCT hash_fast FROM files "
-                    f"WHERE folder_id IN ({ph}) AND stale = 0 "
-                    f"AND hash_fast IS NOT NULL AND hash_fast != '' "
-                    f"AND hash_strong IS NULL",
-                    batch,
-                )
-                all_fast.update(r["hash_fast"] for r in fast_rows)
+                all_file_ids.extend(r["id"] for r in id_rows)
         finally:
             await conn.close()
+
+        # Read hashes from hashes.db
+        from file_hunter.hashes_db import open_hashes_connection
+
+        hconn = await open_hashes_connection()
+        try:
+            for i in range(0, len(all_file_ids), SQL_VAR_LIMIT):
+                batch = all_file_ids[i : i + SQL_VAR_LIMIT]
+                ph = ",".join("?" for _ in batch)
+                rows = await hconn.execute_fetchall(
+                    f"SELECT hash_strong, hash_fast FROM file_hashes "
+                    f"WHERE file_id IN ({ph})",
+                    batch,
+                )
+                for r in rows:
+                    if r["hash_strong"]:
+                        all_strong.add(r["hash_strong"])
+                    elif r["hash_fast"]:
+                        all_fast.add(r["hash_fast"])
+        finally:
+            await hconn.close()
 
         log.info(
             "dup_exclude %s: folder '%s' — %d folders, %d files, %d strong + %d fast hashes",

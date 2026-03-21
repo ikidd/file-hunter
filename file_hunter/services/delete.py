@@ -252,21 +252,38 @@ async def delete_folder(db, folder_id: int) -> dict:
     )
     file_count = count_row[0]["cnt"] if count_row else 0
 
-    # Collect hashes before deletion for dup_count recalc
-    hash_rows = await db.execute_fetchall(
+    # Collect file IDs from catalog, then read hashes from hashes.db
+    file_id_rows = await db.execute_fetchall(
         """WITH RECURSIVE descendants(id) AS (
                SELECT ? UNION ALL
                SELECT f.id FROM folders f JOIN descendants d ON f.parent_id = d.id
            )
-           SELECT DISTINCT hash_strong, hash_fast FROM files
-           WHERE folder_id IN (SELECT id FROM descendants)
-           AND (hash_strong IS NOT NULL OR hash_fast IS NOT NULL)""",
+           SELECT id FROM files WHERE folder_id IN (SELECT id FROM descendants)""",
         (folder_id,),
     )
-    affected_strong = {r["hash_strong"] for r in hash_rows if r["hash_strong"]}
-    affected_fast = {
-        r["hash_fast"] for r in hash_rows if not r["hash_strong"] and r["hash_fast"]
-    }
+    affected_strong: set[str] = set()
+    affected_fast: set[str] = set()
+    if file_id_rows:
+        from file_hunter.hashes_db import open_hashes_connection
+
+        hconn = await open_hashes_connection()
+        try:
+            fids = [r["id"] for r in file_id_rows]
+            for i in range(0, len(fids), 500):
+                batch = fids[i : i + 500]
+                ph = ",".join("?" for _ in batch)
+                hash_rows = await hconn.execute_fetchall(
+                    f"SELECT hash_strong, hash_fast FROM file_hashes "
+                    f"WHERE file_id IN ({ph})",
+                    batch,
+                )
+                for r in hash_rows:
+                    if r["hash_strong"]:
+                        affected_strong.add(r["hash_strong"])
+                    elif r["hash_fast"]:
+                        affected_fast.add(r["hash_fast"])
+        finally:
+            await hconn.close()
 
     # Check if location is online and folder exists
     deleted_from_disk = False
