@@ -1,8 +1,170 @@
-"""Dynamic search query builder."""
+"""Dynamic search query builder.
 
+Search results are cached in a temporary SQLite DB so paging and
+re-sorting work against the small result set, not the full files table.
+"""
+
+import os
 import re
+import secrets
+import sqlite3
+import logging
+from pathlib import Path
+
+logger = logging.getLogger(__name__)
 
 PAGE_SIZE = 120
+
+# Active search cache state
+_search_id: str | None = None
+_search_db_path: Path | None = None
+
+_SEARCH_SCHEMA = """
+CREATE TABLE results (
+    file_id INTEGER PRIMARY KEY,
+    filename TEXT NOT NULL,
+    file_type_high TEXT,
+    file_type_low TEXT,
+    file_size INTEGER,
+    modified_date TEXT,
+    stale INTEGER NOT NULL DEFAULT 0,
+    hidden INTEGER NOT NULL DEFAULT 0,
+    location_id INTEGER,
+    location_name TEXT,
+    hash_strong TEXT,
+    hash_fast TEXT,
+    dup_count INTEGER NOT NULL DEFAULT 0
+);
+CREATE INDEX idx_results_name ON results(filename);
+CREATE INDEX idx_results_size ON results(file_size);
+CREATE INDEX idx_results_date ON results(modified_date);
+CREATE INDEX idx_results_type ON results(file_type_low);
+CREATE INDEX idx_results_dups ON results(dup_count);
+"""
+
+RESULT_SORT_COLUMNS = {
+    "name": "filename",
+    "type": "file_type_low",
+    "size": "file_size",
+    "date": "modified_date",
+    "dups": "dup_count",
+}
+
+
+def _search_db_dir() -> Path:
+    from file_hunter.config import load_config
+    config = load_config()
+    return Path(config.get("data_dir", "data")) / "temp"
+
+
+async def _populate_search_db(db, where, params, search_path):
+    """Run the search query and populate a temp SQLite DB with results."""
+    from file_hunter.hashes_db import get_file_hashes
+    from file_hunter.services.dup_counts import batch_dup_counts
+
+    # Fetch all matching file IDs + display data
+    rows = await db.execute_fetchall(
+        f"""SELECT f.id, f.filename, f.file_type_high, f.file_type_low,
+                   f.file_size, f.modified_date, f.stale, f.hidden,
+                   f.location_id, l.name as location_name
+            FROM files f
+            JOIN locations l ON l.id = f.location_id
+            WHERE {where}""",
+        params,
+    )
+
+    if not rows:
+        # Create empty DB
+        sdb = sqlite3.connect(str(search_path))
+        sdb.executescript(_SEARCH_SCHEMA)
+        sdb.close()
+        return 0
+
+    # Fetch hashes and dup counts
+    file_ids = [r["id"] for r in rows]
+    hash_map = await get_file_hashes(file_ids)
+
+    strong_list = [h["hash_strong"] for h in hash_map.values() if h.get("hash_strong")]
+    fast_list = [
+        h["hash_fast"] for h in hash_map.values()
+        if not h.get("hash_strong") and h.get("hash_fast")
+    ]
+    live_dups = await batch_dup_counts(
+        strong_hashes=strong_list, fast_hashes=fast_list
+    )
+
+    # Write to search DB
+    if os.path.exists(search_path):
+        os.unlink(search_path)
+    sdb = sqlite3.connect(str(search_path))
+    sdb.executescript(_SEARCH_SCHEMA)
+
+    batch = []
+    for r in rows:
+        h = hash_map.get(r["id"], {})
+        hs = h.get("hash_strong")
+        hf = h.get("hash_fast")
+        dc = live_dups.get(hs or hf, 0)
+        batch.append((
+            r["id"], r["filename"], r["file_type_high"], r["file_type_low"],
+            r["file_size"], r["modified_date"], r["stale"], r["hidden"],
+            r["location_id"], r["location_name"], hs, hf, dc,
+        ))
+        if len(batch) >= 5000:
+            sdb.executemany(
+                "INSERT INTO results VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?)",
+                batch,
+            )
+            sdb.commit()
+            batch = []
+    if batch:
+        sdb.executemany(
+            "INSERT INTO results VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?)",
+            batch,
+        )
+        sdb.commit()
+    sdb.close()
+    return len(rows)
+
+
+def _read_search_page(search_path, sort, sort_dir, page):
+    """Read a page from the search results DB."""
+    col = RESULT_SORT_COLUMNS.get(sort, "filename")
+    direction = "DESC" if sort_dir == "desc" else "ASC"
+    offset = page * PAGE_SIZE
+
+    sdb = sqlite3.connect(str(search_path))
+    sdb.row_factory = sqlite3.Row
+
+    total_row = sdb.execute("SELECT COUNT(*) as c FROM results").fetchone()
+    total = total_row["c"]
+
+    rows = sdb.execute(
+        f"SELECT * FROM results ORDER BY {col} {direction} LIMIT ? OFFSET ?",
+        (PAGE_SIZE, offset),
+    ).fetchall()
+
+    sdb.close()
+
+    items = []
+    for r in rows:
+        items.append({
+            "id": r["file_id"],
+            "name": r["filename"],
+            "typeHigh": r["file_type_high"],
+            "typeLow": r["file_type_low"],
+            "size": r["file_size"],
+            "date": r["modified_date"],
+            "dups": r["dup_count"],
+            "hashStrong": r["hash_strong"],
+            "hashFast": r["hash_fast"],
+            "stale": bool(r["stale"]),
+            "missing": False,
+            "hidden": bool(r["hidden"]),
+            "location": r["location_name"],
+        })
+
+    return items, total
 
 
 def _escape_like(value: str) -> str:
@@ -97,6 +259,7 @@ async def search_files(
     sort="name",
     sort_dir="asc",
     cached_total=None,
+    search_id=None,
 ):
     """Search files with optional filters. Returns paged envelope."""
     from file_hunter.services.settings import get_setting
@@ -198,76 +361,36 @@ async def search_files(
 
     where = " AND ".join(conditions) if conditions else "1=1"
 
-    col = SORT_COLUMNS.get(sort, "f.filename")
-    direction = "DESC" if sort_dir == "desc" else "ASC"
-    offset = page * PAGE_SIZE
+    global _search_id, _search_db_path
 
     total = 0
     items = []
     if include_files:
-        # Count total matching — skip if client cached it from a previous page
-        if cached_total is not None:
-            total = cached_total
+        # Check if we have a cached search DB
+        if search_id and _search_id == search_id and _search_db_path and os.path.exists(_search_db_path):
+            # Cache hit — page from existing search DB
+            items, total = _read_search_page(_search_db_path, sort, sort_dir, page)
         else:
-            count_row = await db.execute_fetchall(
-                f"SELECT COUNT(*) as cnt FROM files f WHERE {where}",
-                params,
-            )
-            total = count_row[0]["cnt"] if count_row else 0
+            # New search — populate search DB
+            search_dir = _search_db_dir()
+            search_dir.mkdir(parents=True, exist_ok=True)
+            new_id = secrets.token_hex(8)
+            search_path = search_dir / f"search-{new_id}.db"
 
-        # Fetch paged results (structural data — hashes from hashes.db)
-        rows = await db.execute_fetchall(
-            f"""SELECT f.id, f.filename, f.file_type_high, f.file_type_low,
-                       f.file_size, f.modified_date, f.full_path,
-                       f.stale, f.location_id, f.hidden, l.root_path
-                FROM files f
-                JOIN locations l ON l.id = f.location_id
-                WHERE {where}
-                ORDER BY {col} {direction}
-                LIMIT ? OFFSET ?""",
-            params + [PAGE_SIZE, offset],
-        )
+            # Clean up old search DB
+            if _search_db_path and os.path.exists(_search_db_path):
+                try:
+                    os.unlink(_search_db_path)
+                except OSError:
+                    pass
 
-        # All locations are agent-backed — no local file existence checks
-        missing_set = set()
+            total = await _populate_search_db(db, where, params, search_path)
+            _search_id = new_id
+            _search_db_path = search_path
 
-        from file_hunter.hashes_db import get_file_hashes
-        from file_hunter.services.dup_counts import batch_dup_counts
-
-        file_ids = [r["id"] for r in rows]
-        hash_map = await get_file_hashes(file_ids)
-
-        strong_list = [h["hash_strong"] for h in hash_map.values() if h["hash_strong"]]
-        fast_list = [
-            h["hash_fast"]
-            for h in hash_map.values()
-            if not h["hash_strong"] and h["hash_fast"]
-        ]
-        live_dups = await batch_dup_counts(
-            strong_hashes=strong_list, fast_hashes=fast_list
-        )
-
-        items = []
-        for r in rows:
-            h = hash_map.get(r["id"], {})
-            hs = h.get("hash_strong")
-            hf = h.get("hash_fast")
-            items.append(
-                {
-                    "id": r["id"],
-                    "name": r["filename"],
-                    "typeHigh": r["file_type_high"],
-                    "typeLow": r["file_type_low"],
-                    "size": r["file_size"],
-                    "date": r["modified_date"],
-                    "dups": live_dups.get(hs or hf, 0),
-                    "hashStrong": hs,
-                    "hashFast": hf,
-                    "stale": bool(r["stale"]),
-                    "missing": False if r["stale"] else r["id"] in missing_set,
-                    "hidden": bool(r["hidden"]),
-                }
-            )
+            # Read first page
+            items, total = _read_search_page(search_path, sort, sort_dir, page)
+            search_id = new_id
 
     # Folder search (name filter only)
     folders = []
@@ -317,6 +440,7 @@ async def search_files(
         "total": total,
         "page": page,
         "pageSize": PAGE_SIZE,
+        "searchId": search_id,
     }
 
 
@@ -488,6 +612,7 @@ async def search_files_advanced(
     sort="name",
     sort_dir="asc",
     cached_total=None,
+    search_id=None,
 ):
     """Search files with advanced include/exclude conditions."""
     from file_hunter.services.settings import get_setting
@@ -518,72 +643,30 @@ async def search_files_advanced(
 
     where = " AND ".join(where_parts) if where_parts else "1=1"
 
-    col = SORT_COLUMNS.get(sort, "f.filename")
-    direction = "DESC" if sort_dir == "desc" else "ASC"
-    offset = page * PAGE_SIZE
+    global _search_id, _search_db_path
 
     total = 0
     items = []
     if include_files:
-        if cached_total is not None:
-            total = cached_total
+        if search_id and _search_id == search_id and _search_db_path and os.path.exists(_search_db_path):
+            items, total = _read_search_page(_search_db_path, sort, sort_dir, page)
         else:
-            count_row = await db.execute_fetchall(
-                f"SELECT COUNT(*) as cnt FROM files f WHERE {where}",
-                where_params,
-            )
-            total = count_row[0]["cnt"] if count_row else 0
+            search_dir = _search_db_dir()
+            search_dir.mkdir(parents=True, exist_ok=True)
+            new_id = secrets.token_hex(8)
+            search_path = search_dir / f"search-{new_id}.db"
 
-        rows = await db.execute_fetchall(
-            f"""SELECT f.id, f.filename, f.file_type_high, f.file_type_low,
-                       f.file_size, f.modified_date, f.full_path,
-                       f.stale, f.location_id, f.hidden, l.root_path
-                FROM files f
-                JOIN locations l ON l.id = f.location_id
-                WHERE {where}
-                ORDER BY {col} {direction}
-                LIMIT ? OFFSET ?""",
-            where_params + [PAGE_SIZE, offset],
-        )
+            if _search_db_path and os.path.exists(_search_db_path):
+                try:
+                    os.unlink(_search_db_path)
+                except OSError:
+                    pass
 
-        missing_set = set()
-
-        from file_hunter.hashes_db import get_file_hashes
-        from file_hunter.services.dup_counts import batch_dup_counts
-
-        file_ids = [r["id"] for r in rows]
-        hash_map = await get_file_hashes(file_ids)
-
-        strong_list = [h["hash_strong"] for h in hash_map.values() if h["hash_strong"]]
-        fast_list = [
-            h["hash_fast"]
-            for h in hash_map.values()
-            if not h["hash_strong"] and h["hash_fast"]
-        ]
-        live_dups = await batch_dup_counts(
-            strong_hashes=strong_list, fast_hashes=fast_list
-        )
-
-        for r in rows:
-            h = hash_map.get(r["id"], {})
-            hs = h.get("hash_strong")
-            hf = h.get("hash_fast")
-            items.append(
-                {
-                    "id": r["id"],
-                    "name": r["filename"],
-                    "typeHigh": r["file_type_high"],
-                    "typeLow": r["file_type_low"],
-                    "size": r["file_size"],
-                    "date": r["modified_date"],
-                    "dups": live_dups.get(hs or hf, 0),
-                    "hashStrong": hs,
-                    "hashFast": hf,
-                    "stale": bool(r["stale"]),
-                    "missing": False if r["stale"] else r["id"] in missing_set,
-                    "hidden": bool(r["hidden"]),
-                }
-            )
+            total = await _populate_search_db(db, where, where_params, search_path)
+            _search_id = new_id
+            _search_db_path = search_path
+            items, total = _read_search_page(search_path, sort, sort_dir, page)
+            search_id = new_id
 
     # Folder search — apply name conditions to folder name
     folders = []
@@ -639,4 +722,5 @@ async def search_files_advanced(
         "total": total,
         "page": page,
         "pageSize": PAGE_SIZE,
+        "searchId": search_id,
     }
