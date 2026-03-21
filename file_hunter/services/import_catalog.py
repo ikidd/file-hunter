@@ -168,6 +168,7 @@ async def run_import(
                 )
                 full_path = os.path.join(root_path, r["rel_path"])
 
+                hp = r["hash_partial"]
                 catalog_batch.append(
                     (
                         r["filename"],
@@ -178,6 +179,7 @@ async def run_import(
                         r["file_type_high"],
                         r["file_type_low"],
                         r["file_size"],
+                        hp,
                         "",  # description
                         "",  # tags
                         r["created_date"],
@@ -189,7 +191,6 @@ async def run_import(
                 )
 
                 # Collect hashes for hashes.db
-                hp = r["hash_partial"]
                 hf = r["hash_fast"] if has_hash_fast else None
                 if hp or hf:
                     # file_id not known yet — will be resolved after catalog insert
@@ -206,16 +207,17 @@ async def run_import(
                 await wdb.executemany(
                     "INSERT INTO files "
                     "(filename, full_path, rel_path, location_id, folder_id, "
-                    "file_type_high, file_type_low, file_size, "
+                    "file_type_high, file_type_low, file_size, hash_partial, "
                     "description, tags, created_date, modified_date, "
                     "date_cataloged, date_last_seen, hidden) "
-                    "VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?) "
+                    "VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?) "
                     "ON CONFLICT(location_id, rel_path) DO UPDATE SET "
                     "filename=excluded.filename, full_path=excluded.full_path, "
                     "folder_id=excluded.folder_id, "
                     "file_type_high=excluded.file_type_high, "
                     "file_type_low=excluded.file_type_low, "
                     "file_size=excluded.file_size, "
+                    "hash_partial=COALESCE(excluded.hash_partial, hash_partial), "
                     "created_date=excluded.created_date, "
                     "modified_date=excluded.modified_date, "
                     "date_last_seen=excluded.date_last_seen, "
