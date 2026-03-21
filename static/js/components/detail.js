@@ -1760,16 +1760,18 @@ const Detail = {
         const signal = this._abortPrevious();
         this._lastDetail = null;
 
+        const MAX_SHOWN = 10;
         const files = items.filter(i => i.type !== 'folder');
         const folders = items.filter(i => i.type === 'folder');
 
-        // Fetch folder sizes in parallel
+        // Fetch folder sizes — only for folders in the visible list
         const folderSizes = {};
-        if (folders.length > 0) {
+        const visibleFolders = folders.slice(0, MAX_SHOWN);
+        if (visibleFolders.length > 0) {
             let results;
             try {
                 results = await Promise.all(
-                    folders.map(f => {
+                    visibleFolders.map(f => {
                         const numId = String(f.id).replace('fld-', '');
                         return API.get(`/api/folders/${numId}/stats`, { signal });
                     })
@@ -1781,7 +1783,7 @@ const Detail = {
             if (gen !== this._renderGen) return;
             results.forEach((res, i) => {
                 if (res.ok) {
-                    folderSizes[folders[i].id] = res.data.totalSize || 0;
+                    folderSizes[visibleFolders[i].id] = res.data.totalSize || 0;
                 }
             });
         }
@@ -1795,7 +1797,9 @@ const Detail = {
         if (fileCount > 0) parts.push(`${fileCount} file${fileCount !== 1 ? 's' : ''}`);
         if (folderCount > 0) parts.push(`${folderCount} folder${folderCount !== 1 ? 's' : ''}`);
 
-        let itemListHtml = items.map(item => {
+        const shown = items.slice(0, MAX_SHOWN);
+        const remaining = items.length - shown.length;
+        let itemListHtml = shown.map(item => {
             const icon = item.type === 'folder' ? '\uD83D\uDCC1' : '\uD83D\uDCC4';
             const size = item.type === 'folder'
                 ? (folderSizes[item.id] ? formatSize(folderSizes[item.id]) : '')
@@ -1805,6 +1809,9 @@ const Detail = {
                 <span class="value">${size}</span>
             </div>`;
         }).join('');
+        if (remaining > 0) {
+            itemListHtml += `<div class="detail-field"><span class="label muted">and ${remaining.toLocaleString()} more...</span></div>`;
+        }
 
         this.el.innerHTML = `
             <div class="detail-section">
