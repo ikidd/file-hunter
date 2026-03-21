@@ -71,31 +71,42 @@ const Consolidate = {
         this._selectedDest = null;
         this._expandedNodes = new Set();
 
+        // Locations list — only for single file
+        const locsField = this.locationsEl.closest('.modal-field');
         if (this._isMulti) {
             this.filenameEl.textContent = `${files.length} files selected`;
             this.locationsEl.innerHTML = '';
+            if (locsField) locsField.style.display = 'none';
         } else {
             this.filenameEl.textContent = file.name;
             this.locationsEl.innerHTML = dups
                 .map(d => `<li>${d.location} &mdash; ${d.path}</li>`)
                 .join('');
+            if (locsField) locsField.style.display = '';
         }
 
-        // Reset mode radios — hide keep_here for search results
+        // Mode selector — hide entirely for search or multi with copy_to only
+        const modeField = this.modeGroup.closest('.modal-field');
         const radios = this.modeGroup.querySelectorAll('input[name="consolidate-mode"]');
-        const keepHereOption = this.modeGroup.querySelector('.consolidate-mode-option');
+        const options = this.modeGroup.querySelectorAll('.consolidate-mode-option');
+
         if (this._isSearchMode) {
-            keepHereOption.style.display = 'none';
+            // Search: copy_to only, hide mode selector entirely
+            if (modeField) modeField.style.display = 'none';
             this._selectedMode = 'copy_to';
             radios.forEach(r => { r.checked = r.value === 'copy_to'; });
         } else {
-            keepHereOption.style.display = '';
+            // Folder: both modes available
+            if (modeField) modeField.style.display = '';
+            options.forEach(o => o.style.display = '');
             this._selectedMode = 'keep_here';
             radios.forEach(r => { r.checked = r.value === 'keep_here'; });
         }
-        this.modeGroup.querySelectorAll('.consolidate-mode-option').forEach(l => l.classList.remove('selected'));
-        const activeOption = this.modeGroup.querySelector(`.consolidate-mode-option:has(input[value="${this._selectedMode}"])`);
-        if (activeOption) activeOption.classList.add('selected');
+        options.forEach(l => l.classList.remove('selected'));
+        options.forEach(o => {
+            const input = o.querySelector('input');
+            if (input && input.value === this._selectedMode) o.classList.add('selected');
+        });
 
         this._updateModeUI();
 
