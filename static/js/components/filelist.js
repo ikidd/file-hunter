@@ -169,11 +169,41 @@ const FileList = {
         }
     },
 
-    _selectAll() {
+    async _selectAll() {
+        // Select current page items immediately
         const items = this._getDisplayItems();
         items.forEach(item => {
             this.selectedItems.set(itemKey(item), item);
         });
+        this._fireSelectionChange();
+        this.render();
+
+        // Fetch remaining pages if multi-page
+        const totalPages = this._totalPages();
+        if (totalPages <= 1) return;
+
+        for (let page = 0; page < totalPages; page++) {
+            if (page === this.currentPage) continue;
+            const params = new URLSearchParams({
+                folder_id: this.currentFolder,
+                page,
+                sort: this.sortKey,
+                sortDir: this._sortDirStr(),
+            });
+            if (this.filterText) params.set('filter', this.filterText);
+            const res = await API.get(`/api/files?${params.toString()}`);
+            if (res.ok && res.data.items) {
+                res.data.items.forEach(item => {
+                    this.selectedItems.set(itemKey(item), item);
+                });
+            }
+        }
+        // Also select all folders on current page
+        if (this.currentFolders) {
+            this.currentFolders.forEach(f => {
+                this.selectedItems.set(itemKey(f), f);
+            });
+        }
         this._fireSelectionChange();
         this.render();
     },
@@ -562,16 +592,17 @@ const FileList = {
     async _goToPage(n, selectPosition) {
         const totalPages = this._totalPages();
         this.currentPage = Math.max(0, Math.min(n, totalPages - 1));
-        this._clearSelection();
 
         await (this._searchMode ? this._fetchSearch() : this._fetchFolder());
 
-        // Select first or last item after page load
+        // Keyboard navigation: set cursor on first/last item without clearing selection
         if (selectPosition) {
             const items = this._getDisplayItems();
             if (items.length > 0) {
                 const file = selectPosition === 'last' ? items[items.length - 1] : items[0];
-                this._selectOnly(file, selectPosition === 'last' ? items.length - 1 : 0);
+                const idx = selectPosition === 'last' ? items.length - 1 : 0;
+                this._anchorIdx = idx;
+                this.selectedItems.set(itemKey(file), file);
                 this.render();
                 this._fireSelectionChange();
             }
