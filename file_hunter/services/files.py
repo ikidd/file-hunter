@@ -391,7 +391,8 @@ async def update_file(db, file_id: int, description: str = None, tags: list = No
 
 
 async def move_file(
-    db, file_id: int, *, new_name: str = None, destination_folder_id: str = None
+    db, file_id: int, *, new_name: str = None, destination_folder_id: str = None,
+    skip_post_processing: bool = False,
 ):
     """Move and/or rename a file on disk and in the catalog."""
     from file_hunter.services import fs
@@ -475,9 +476,10 @@ async def move_file(
         await queue_deferred_op(db, file_id, src_loc_id, "move", params)
         await db.commit()
 
-        from file_hunter.services.stats import invalidate_stats_cache
+        if not skip_post_processing:
+            from file_hunter.services.stats import invalidate_stats_cache
 
-        invalidate_stats_cache()
+            invalidate_stats_cache()
         return {
             "id": file_id,
             "old_name": old_name,
@@ -540,16 +542,17 @@ async def move_file(
     )
     await db.commit()
 
-    from file_hunter.services.stats import invalidate_stats_cache
+    if not skip_post_processing:
+        from file_hunter.services.stats import invalidate_stats_cache
 
-    invalidate_stats_cache()
+        invalidate_stats_cache()
 
-    from file_hunter.services.sizes import schedule_size_recalc
+        from file_hunter.services.sizes import schedule_size_recalc
 
-    if final_location_id != src_loc_id:
-        schedule_size_recalc(src_loc_id, final_location_id)
-    else:
-        schedule_size_recalc(src_loc_id)
+        if final_location_id != src_loc_id:
+            schedule_size_recalc(src_loc_id, final_location_id)
+        else:
+            schedule_size_recalc(src_loc_id)
 
     return {
         "id": file_id,

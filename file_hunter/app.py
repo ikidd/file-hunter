@@ -28,6 +28,8 @@ from file_hunter.routes.files import (
     file_delete,
     file_move,
     file_verify,
+    file_rehash,
+    batch_rehash,
     file_dup_counts,
     file_cancel_pending,
     folder_download,
@@ -288,6 +290,8 @@ app = Starlette(
         Route("/api/files/{id:int}", file_update, methods=["PATCH"]),
         Route("/api/files/{id:int}/move", file_move, methods=["POST"]),
         Route("/api/files/{id:int}/verify", file_verify, methods=["POST"]),
+        Route("/api/files/rehash", batch_rehash, methods=["POST"]),
+        Route("/api/files/{id:int}/rehash", file_rehash, methods=["POST"]),
         Route(
             "/api/files/{id:int}/cancel-pending", file_cancel_pending, methods=["POST"]
         ),

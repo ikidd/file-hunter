@@ -158,6 +158,23 @@ const FileList = {
         return this.selectedItems.has(itemKey(item));
     },
 
+    _updateHeaderCheckbox() {
+        const hcb = this.el.querySelector('thead input[type="checkbox"]');
+        if (!hcb) return;
+        const selCount = this.selectedItems.size;
+        const totalItems = this.totalFiles + (this.currentFolders ? this.currentFolders.length : 0);
+        if (selCount === 0) {
+            hcb.checked = false;
+            hcb.indeterminate = false;
+        } else if (selCount >= totalItems && totalItems > 0) {
+            hcb.checked = true;
+            hcb.indeterminate = false;
+        } else {
+            hcb.checked = false;
+            hcb.indeterminate = true;
+        }
+    },
+
     _fireSelectionChange() {
         const count = this.selectedItems.size;
         if (count === 0) {
@@ -751,7 +768,11 @@ const FileList = {
                 e.stopPropagation();
                 this._toggleItem(file, idx);
                 this._fireSelectionChange();
-                this.render();
+                // Update row highlight + header checkbox without full re-render
+                const nowSelected = this._isSelected(file);
+                tr.classList.toggle('selected', nowSelected);
+                cb.checked = nowSelected;
+                this._updateHeaderCheckbox();
             });
             tdCheck.appendChild(cb);
             tr.appendChild(tdCheck);

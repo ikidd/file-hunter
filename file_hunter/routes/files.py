@@ -296,6 +296,199 @@ async def file_verify(request: Request):
     return json_ok(detail)
 
 
+async def file_rehash(request: Request):
+    """POST /api/files/{id:int}/rehash — compute hash_partial + hash_fast."""
+    file_id = int(request.path_params["id"])
+
+    async with read_db() as db:
+        row = await db.execute_fetchall(
+            """SELECT f.id, f.filename, f.full_path, f.file_size,
+                      f.location_id, l.root_path
+               FROM files f
+               JOIN locations l ON l.id = f.location_id
+               WHERE f.id = ?""",
+            (file_id,),
+        )
+        if not row:
+            return json_error("File not found.", 404)
+        f = dict(row[0])
+
+        loc_row = await db.execute_fetchall(
+            "SELECT agent_id FROM locations WHERE id = ?", (f["location_id"],)
+        )
+    agent_id = loc_row[0]["agent_id"] if loc_row else None
+
+    from file_hunter.services import fs
+    from file_hunter.hashes_db import get_file_hashes
+
+    # Read old hashes before overwriting
+    old_h = (await get_file_hashes([file_id])).get(file_id, {})
+    old_fast = old_h.get("hash_fast")
+
+    online = await fs.dir_exists(f["root_path"], f["location_id"])
+    if not online:
+        return json_error("Location is offline.", 400)
+
+    exists = await fs.file_exists(f["full_path"], f["location_id"])
+    if not exists:
+        return json_error("File not found on disk.", 400)
+
+    # Compute hash_fast
+    try:
+        (hash_fast,) = await fs.file_hash(f["full_path"], f["location_id"])
+    except Exception as exc:
+        return json_error(f"Hash computation failed: {exc}", 500)
+
+    # Compute hash_partial
+    hash_partial = None
+    if agent_id is not None:
+        from file_hunter.services.agent_ops import hash_partial_batch
+
+        try:
+            hp_result = await hash_partial_batch(agent_id, [f["full_path"]])
+            for hr in hp_result.get("results", []):
+                if hr.get("path") == f["full_path"]:
+                    hash_partial = hr.get("hash_partial")
+                    break
+        except Exception:
+            pass
+
+    # Ensure entry exists in hashes.db, then update
+    from file_hunter.hashes_db import hashes_writer
+
+    async with hashes_writer() as hdb:
+        await hdb.execute(
+            "INSERT INTO file_hashes (file_id, location_id, file_size, hash_partial, hash_fast) "
+            "VALUES (?, ?, ?, ?, ?) "
+            "ON CONFLICT(file_id) DO UPDATE SET "
+            "hash_partial=COALESCE(excluded.hash_partial, file_hashes.hash_partial), "
+            "hash_fast=excluded.hash_fast",
+            (file_id, f["location_id"], f["file_size"], hash_partial, hash_fast),
+        )
+
+    from file_hunter.services.dup_counts import submit_hashes_for_recalc
+
+    recalc_fast = {hash_fast}
+    if old_fast and old_fast != hash_fast:
+        recalc_fast.add(old_fast)
+    submit_hashes_for_recalc(
+        fast_hashes=recalc_fast,
+        source=f"rehash {f['filename']}",
+    )
+
+    from file_hunter.services.stats import invalidate_stats_cache
+
+    invalidate_stats_cache()
+
+    async with read_db() as db:
+        detail = await get_file_detail(db, file_id)
+    return json_ok(detail)
+
+
+async def batch_rehash(request: Request):
+    """POST /api/files/rehash — rehash multiple files. Body: { fileIds: [int] }."""
+    body = await request.json()
+    file_ids = body.get("fileIds", [])
+    if not file_ids:
+        return json_error("fileIds is required.")
+
+    asyncio.create_task(_run_batch_rehash(file_ids))
+    return json_ok({"queued": len(file_ids)})
+
+
+async def _run_batch_rehash(file_ids: list[int]):
+    """Background task: rehash each file (partial + fast)."""
+    from file_hunter.services import fs
+    from file_hunter.hashes_db import hashes_writer
+    from file_hunter.services.dup_counts import submit_hashes_for_recalc
+
+    affected_fast: set[str] = set()
+    total = len(file_ids)
+
+    for i, file_id in enumerate(file_ids):
+        try:
+            async with read_db() as db:
+                row = await db.execute_fetchall(
+                    """SELECT f.id, f.filename, f.full_path, f.file_size,
+                              f.location_id, l.root_path
+                       FROM files f
+                       JOIN locations l ON l.id = f.location_id
+                       WHERE f.id = ?""",
+                    (file_id,),
+                )
+                if not row:
+                    continue
+                f = dict(row[0])
+
+                loc_row = await db.execute_fetchall(
+                    "SELECT agent_id FROM locations WHERE id = ?",
+                    (f["location_id"],),
+                )
+            agent_id = loc_row[0]["agent_id"] if loc_row else None
+
+            if not await fs.file_exists(f["full_path"], f["location_id"]):
+                continue
+
+            # Read old hash before overwriting
+            from file_hunter.hashes_db import get_file_hashes
+
+            old_h = (await get_file_hashes([file_id])).get(file_id, {})
+            old_fast = old_h.get("hash_fast")
+
+            (hash_fast,) = await fs.file_hash(f["full_path"], f["location_id"])
+
+            hash_partial = None
+            if agent_id is not None:
+                from file_hunter.services.agent_ops import hash_partial_batch
+
+                try:
+                    hp_result = await hash_partial_batch(agent_id, [f["full_path"]])
+                    for hr in hp_result.get("results", []):
+                        if hr.get("path") == f["full_path"]:
+                            hash_partial = hr.get("hash_partial")
+                            break
+                except Exception:
+                    pass
+
+            async with hashes_writer() as hdb:
+                await hdb.execute(
+                    "INSERT INTO file_hashes "
+                    "(file_id, location_id, file_size, hash_partial, hash_fast) "
+                    "VALUES (?, ?, ?, ?, ?) "
+                    "ON CONFLICT(file_id) DO UPDATE SET "
+                    "hash_partial=COALESCE(excluded.hash_partial, file_hashes.hash_partial), "
+                    "hash_fast=excluded.hash_fast",
+                    (file_id, f["location_id"], f["file_size"], hash_partial, hash_fast),
+                )
+
+            affected_fast.add(hash_fast)
+            if old_fast and old_fast != hash_fast:
+                affected_fast.add(old_fast)
+
+            await broadcast(
+                {
+                    "type": "rehash_progress",
+                    "processed": i + 1,
+                    "total": total,
+                    "filename": f["filename"],
+                }
+            )
+        except Exception as exc:
+            logger.warning("Rehash failed for file %d: %s", file_id, exc)
+
+    if affected_fast:
+        submit_hashes_for_recalc(
+            fast_hashes=affected_fast,
+            source=f"batch rehash ({total} files)",
+        )
+
+    from file_hunter.services.stats import invalidate_stats_cache
+
+    invalidate_stats_cache()
+
+    await broadcast({"type": "rehash_completed", "total": total})
+
+
 async def folder_download(request: Request):
     """GET /api/folders/{id:int}/download — download folder as ZIP."""
     from file_hunter.services.batch import build_streaming_zip

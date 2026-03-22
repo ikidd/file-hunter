@@ -108,6 +108,13 @@ const StatusBar = {
                     Merging: ${detail || '...'}
                 </span>
             `;
+        } else if (state === 'rehashing') {
+            this._scanningLocationId = null;
+            this.activityEl.innerHTML = `
+                <span class="status-activity-text scanning">
+                    ${detail || 'Re-hashing...'}
+                </span>
+            `;
         } else {
             this._scanningLocationId = null;
             this.activityEl.innerHTML = `

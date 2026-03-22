@@ -311,6 +311,23 @@ function wireBatchActions(items) {
         });
     }
 
+    // Batch rehash
+    const rehashBtn = document.getElementById('batch-rehash-btn');
+    if (rehashBtn && fileIds.length > 0) {
+        rehashBtn.addEventListener('click', async () => {
+            rehashBtn.disabled = true;
+            rehashBtn.textContent = 'Hashing\u2026';
+            const res = await API.post('/api/files/rehash', { fileIds });
+            if (res.ok) {
+                Toast.success(`Re-hashing ${fileIds.length} file(s) in background`);
+            } else {
+                Toast.error(res.error || 'Re-hash failed');
+            }
+            rehashBtn.disabled = false;
+            rehashBtn.textContent = 'Re-hash';
+        });
+    }
+
     // Batch tag
     const tagAddBtn = document.getElementById('batch-tag-add');
     const tagInput = document.getElementById('batch-tag-input');
@@ -1549,6 +1566,7 @@ WS.on('consolidate_progress', (msg) => {
 });
 
 WS.on('consolidate_completed', async (msg) => {
+    if (msg.batch) return; // batch_consolidate_completed handles UI
     StatusBar.renderActivity('idle');
     ActivityLog.add(`Consolidation completed: <b>${msg.filename}</b> — ${msg.stubsWritten} stubs written, ${msg.stubsQueued} queued`);
     Toast.success(`Consolidation completed: ${msg.filename}`);
@@ -1581,9 +1599,30 @@ WS.on('consolidate_queue_drained', (msg) => {
     Toast.info(`${msg.jobsCompleted} deferred consolidation job${msg.jobsCompleted === 1 ? '' : 's'} completed`);
 });
 
-WS.on('batch_consolidate_completed', (msg) => {
+WS.on('batch_consolidate_completed', async (msg) => {
+    StatusBar.renderActivity('idle');
     ActivityLog.add(`Batch consolidation completed: ${msg.completed} of ${msg.total} files`);
     Toast.success(`Batch consolidation completed: ${msg.completed} of ${msg.total} files`);
+    await StatusBar.loadStats();
+    await Tree.reload();
+    if (selectedNode) {
+        selectedNode = Tree._findNode(selectedNode.id);
+        if (selectedNode) await FileList.showFolder(selectedNode.id);
+    }
+    await refreshDetailPanel();
+});
+
+WS.on('rehash_progress', (msg) => {
+    StatusBar.renderActivity('rehashing', `Re-hashing ${msg.processed}/${msg.total} — ${msg.filename}`);
+});
+
+WS.on('rehash_completed', async (msg) => {
+    StatusBar.renderActivity('idle');
+    Toast.success(`Re-hash completed: ${msg.total} file${msg.total !== 1 ? 's' : ''}`);
+    if (selectedNode) {
+        await FileList.showFolder(selectedNode.id);
+    }
+    await refreshDetailPanel();
 });
 
 WS.on('upload_transfer', (msg) => {

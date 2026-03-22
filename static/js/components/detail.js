@@ -293,6 +293,16 @@ const Detail = {
             m.content.innerHTML = `<audio src="${url}" controls autoplay></audio>`;
         } else if (type === 'document' && (detail.typeLow || '').toLowerCase() === 'pdf') {
             m.content.innerHTML = `<iframe src="${url}" title="${detail.name}"></iframe>`;
+        } else if (type === 'text' && (detail.typeLow || '').toLowerCase() === 'csv') {
+            m.content.innerHTML = `<div id="modal-csv-preview" class="csv-preview">Loading...</div>`;
+            fetch(url, { headers: _authHeaders() }).then(r => r.ok ? r.text() : null).then(text => {
+                const el = document.getElementById('modal-csv-preview');
+                if (!el || !text) { if (el) el.textContent = '(Preview not available)'; return; }
+                this._renderCsvTable(el, text);
+            }).catch(() => {
+                const el = document.getElementById('modal-csv-preview');
+                if (el) el.textContent = '(Preview not available)';
+            });
         } else if (type === 'text') {
             m.content.innerHTML = `<pre>Loading...</pre>`;
             fetch(url, { headers: _authHeaders() }).then(r => r.ok ? r.text() : '(Preview not available)').then(text => {
@@ -892,6 +902,7 @@ const Detail = {
                     <span class="label">Strong</span>
                     <span class="value" style="font-family: monospace; font-size: 0.8em; word-break: break-all;">${detail.hashStrong || ''}</span>
                 </div>
+                ${detail.id && !detail.stale && !hasPendingOp && detail.online !== false ? `<button class="btn btn-sm" id="detail-rehash" style="margin-top:0.4rem">Re-hash</button>` : ''}
                 ${detail.id && !detail.verified && !detail.stale && !hasPendingOp ? `<button class="btn btn-sm" id="detail-verify" style="margin-top:0.4rem">Verify (SHA-256)${detail.locationOnline === false ? ' \u2014 queued' : ''}</button>` : ''}
             </div>
             <div class="detail-section">
@@ -936,7 +947,11 @@ const Detail = {
         this._wireShowAllDups(detail);
         this._wireBreadcrumbs();
         this._wireShowInFolder(detail);
-        this._loadTextPreview(detail);
+        if ((detail.typeLow || '').toLowerCase() === 'csv') {
+            this._loadCsvPreview(detail);
+        } else {
+            this._loadTextPreview(detail);
+        }
         this._wirePreviewZoom(detail);
         const textPreviewBtn = document.getElementById('detail-preview-text');
         if (textPreviewBtn) textPreviewBtn.addEventListener('click', () => this._openPreviewModal(detail));
@@ -953,6 +968,21 @@ const Detail = {
             });
         }
 
+        const rehashBtn = document.getElementById('detail-rehash');
+        if (rehashBtn && detail.id) {
+            rehashBtn.addEventListener('click', async () => {
+                rehashBtn.disabled = true;
+                rehashBtn.textContent = 'Hashing\u2026';
+                const res = await API.post(`/api/files/${detail.id}/rehash`);
+                if (res.ok) {
+                    this._lastDetail = res.data;
+                    this.renderFile({ id: detail.id, type: 'file' });
+                } else {
+                    rehashBtn.textContent = res.error || 'Failed';
+                }
+            });
+        }
+
         const verifyBtn = document.getElementById('detail-verify');
         if (verifyBtn && detail.id) {
             verifyBtn.addEventListener('click', async () => {
@@ -961,7 +991,6 @@ const Detail = {
                 const res = await API.post(`/api/files/${detail.id}/verify`);
                 if (res.ok) {
                     if (res.data.deferred) {
-                        // Queued for offline — detail will refresh via WS
                         verifyBtn.textContent = 'Queued';
                     } else {
                         this._lastDetail = res.data;
@@ -999,6 +1028,9 @@ const Detail = {
         if (type === 'document' && (detail.typeLow || '').toLowerCase() === 'pdf') {
             return `<div class="detail-preview detail-preview-pdf">${zoom}<iframe src="${url}" title="${detail.name}"></iframe></div><div class="detail-preview-btns">${hexBtn}</div>`;
         }
+        if (type === 'text' && (detail.typeLow || '').toLowerCase() === 'csv') {
+            return `<div class="detail-preview">${zoom}<div id="detail-csv-preview" class="csv-preview">Loading...</div></div><div class="detail-preview-btns">${hexBtn}</div>`;
+        }
         if (type === 'text') {
             return `<div class="detail-preview">${zoom}<pre id="detail-text-preview">Loading...</pre></div><div class="detail-preview-btns">${hexBtn}</div>`;
         }
@@ -1022,6 +1054,67 @@ const Detail = {
             }
         } catch {
             pre.textContent = '(Preview not available)';
+        }
+    },
+
+    _parseCsvLine(line) {
+        const cells = [];
+        let i = 0, cell = '', inQuotes = false;
+        while (i < line.length) {
+            const ch = line[i];
+            if (inQuotes) {
+                if (ch === '"' && line[i + 1] === '"') { cell += '"'; i += 2; }
+                else if (ch === '"') { inQuotes = false; i++; }
+                else { cell += ch; i++; }
+            } else {
+                if (ch === '"') { inQuotes = true; i++; }
+                else if (ch === ',') { cells.push(cell); cell = ''; i++; }
+                else { cell += ch; i++; }
+            }
+        }
+        cells.push(cell);
+        return cells;
+    },
+
+    _renderCsvTable(el, text) {
+        const lines = text.trim().split('\n');
+        if (lines.length === 0) { el.textContent = '(Empty file)'; return; }
+
+        const maxRows = 100;
+        const headers = this._parseCsvLine(lines[0]);
+        const dataLines = lines.slice(1, maxRows + 1);
+
+        let html = '<table class="csv-table"><thead><tr>';
+        for (const h of headers) {
+            html += `<th>${h.replace(/</g, '&lt;')}</th>`;
+        }
+        html += '</tr></thead><tbody>';
+        for (const line of dataLines) {
+            if (!line.trim()) continue;
+            const cells = this._parseCsvLine(line);
+            html += '<tr>';
+            for (let c = 0; c < headers.length; c++) {
+                html += `<td>${(cells[c] || '').replace(/</g, '&lt;')}</td>`;
+            }
+            html += '</tr>';
+        }
+        html += '</tbody></table>';
+        if (lines.length > maxRows + 1) {
+            html += `<div class="muted" style="padding:0.3rem">Showing ${maxRows} of ${lines.length - 1} rows</div>`;
+        }
+        el.innerHTML = html;
+    },
+
+    async _loadCsvPreview(detail) {
+        const el = document.getElementById('detail-csv-preview');
+        if (!el || !detail.id) return;
+        try {
+            const resp = await fetch(`/api/files/${detail.id}/content`, { headers: _authHeaders() });
+            if (!resp.ok) { el.textContent = '(Preview not available)'; return; }
+            const text = await resp.text();
+            this._renderCsvTable(el, text);
+        } catch {
+            el.textContent = '(Preview not available)';
         }
     },
 
@@ -1824,6 +1917,7 @@ const Detail = {
                     <button class="btn btn-danger btn-sm" id="batch-delete-btn">Delete</button>
                     <button class="btn btn-sm" id="batch-move-btn">Move</button>
                     <button class="btn btn-sm" id="batch-download-btn">Download ZIP</button>
+                    <button class="btn btn-sm" id="batch-rehash-btn">Re-hash</button>
                 </div>
             </div>
             <div class="detail-section">

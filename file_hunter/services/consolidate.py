@@ -1,11 +1,14 @@
 """Consolidation logic — copy/keep canonical file, write .moved stubs and .sources metadata."""
 
+import logging
 import os
 from datetime import datetime, timezone
 
 from file_hunter.db import db_writer, read_db
 from file_hunter.services import fs
 from file_hunter.ws.scan import broadcast
+
+logger = logging.getLogger("file_hunter")
 
 # Guard against concurrent consolidation of the same hash
 _active_consolidations: set[str] = set()
@@ -15,7 +18,11 @@ def is_consolidation_running(hash_value: str) -> bool:
     return hash_value in _active_consolidations
 
 
-async def run_consolidation(file_id: int, mode: str, dest_folder_id: str | None):
+async def run_consolidation(
+    file_id: int, mode: str, dest_folder_id: str | None,
+    shared_csv_path: str | None = None, shared_csv_loc_id: int | None = None,
+    skip_post_processing: bool = False,
+):
     """Main consolidation background task.
 
     mode: 'keep_here' or 'copy_to'
@@ -303,27 +310,65 @@ async def run_consolidation(file_id: int, mode: str, dest_folder_id: str | None)
             )
             return
 
-        # Write .sources file next to canonical
-        await fs.write_sources_file(canonical_path, all_copies, now_iso, dest_loc_id)
-        await _insert_stub_record(
-            canonical_path + ".sources",
-            canonical_id,
-            dest_loc_id,
-            now_iso,
+        # Write .sources file next to canonical (best-effort)
+        try:
+            await fs.write_sources_file(canonical_path, all_copies, now_iso, dest_loc_id)
+            await _insert_stub_record(
+                canonical_path + ".sources",
+                canonical_id,
+                dest_loc_id,
+                now_iso,
+            )
+        except Exception as e:
+            logger.warning("Could not write .sources file: %s", e)
+
+        # Result log CSV — use shared one from batch, or create per-file
+        from file_hunter.services.op_result_log import (
+            create_log, append_row, add_to_catalog,
+        )
+
+        owns_csv = shared_csv_path is None
+        if owns_csv:
+            dest_dir = os.path.dirname(canonical_path)
+            csv_path = await create_log(dest_dir, dest_loc_id, "consolidate")
+            csv_loc_id = dest_loc_id
+            csv_folder_id = None
+            if mode == "keep_here":
+                csv_folder_id = selected.get("folder_id")
+            elif mode == "copy_to":
+                if dest_folder_id.startswith("fld-"):
+                    csv_folder_id = int(dest_folder_id[4:])
+        else:
+            csv_path = shared_csv_path
+            csv_loc_id = shared_csv_loc_id
+            csv_folder_id = None  # batch manages catalog entry
+
+        # Resolve destination location name
+        if mode == "keep_here":
+            dest_loc_name = selected["location_name"]
+        else:
+            async with read_db() as db:
+                _ln = await db.execute_fetchall(
+                    "SELECT name FROM locations WHERE id = ?", (dest_loc_id,)
+                )
+            dest_loc_name = _ln[0]["name"] if _ln else ""
+
+        # Log the canonical file
+        await append_row(
+            csv_path, csv_loc_id,
+            selected["location_name"], canonical_path,
+            dest_loc_name, canonical_path, "canonical",
         )
 
         # Process each duplicate (everything except the canonical)
         duplicates = [c for c in all_copies if c["id"] != canonical_id]
         total_dups = len(duplicates)
+        writable_cache: dict[str, bool] = {}
 
         for idx, copy in enumerate(duplicates, 1):
             original_path = copy["full_path"]
             loc_root = copy["root_path"]
             copy_loc_id = copy["location_id"]
-            location_online = await fs.dir_exists(loc_root, copy_loc_id)
-            file_on_disk = location_online and await fs.file_exists(
-                original_path, copy_loc_id
-            )
 
             await broadcast(
                 {
@@ -338,7 +383,72 @@ async def run_consolidation(file_id: int, mode: str, dest_folder_id: str | None)
                 }
             )
 
-            if file_on_disk:
+            # Check if location is online
+            try:
+                location_online = await fs.dir_exists(loc_root, copy_loc_id)
+            except ConnectionError:
+                location_online = False
+
+            if not location_online:
+                # Offline — queue for later
+                stubs_queued += 1
+                async with db_writer() as wdb:
+                    await wdb.execute(
+                        """INSERT INTO consolidation_jobs
+                           (source_file, source_location_id, source_path,
+                            destination_path, status, date_created)
+                           VALUES (?, ?, ?, ?, 'pending', ?)""",
+                        (
+                            copy["filename"],
+                            copy_loc_id,
+                            original_path,
+                            canonical_path,
+                            now_iso,
+                        ),
+                    )
+                await append_row(
+                    csv_path, csv_loc_id,
+                    copy["location_name"], original_path,
+                    dest_loc_name, canonical_path, "offline - queued",
+                )
+                continue
+
+            file_on_disk = await fs.file_exists(original_path, copy_loc_id)
+            if not file_on_disk:
+                stubs_queued += 1
+                async with db_writer() as wdb:
+                    await wdb.execute(
+                        """INSERT INTO consolidation_jobs
+                           (source_file, source_location_id, source_path,
+                            destination_path, status, date_created)
+                           VALUES (?, ?, ?, ?, 'pending', ?)""",
+                        (
+                            copy["filename"],
+                            copy_loc_id,
+                            original_path,
+                            canonical_path,
+                            now_iso,
+                        ),
+                    )
+                await append_row(
+                    csv_path, csv_loc_id,
+                    copy["location_name"], original_path,
+                    dest_loc_name, canonical_path, "file missing - queued",
+                )
+                continue
+
+            # Check folder writability (cached per directory)
+            copy_dir = os.path.dirname(original_path)
+            if copy_dir not in writable_cache:
+                try:
+                    test_path = os.path.join(copy_dir, ".fh-write-test")
+                    await fs.file_write_text(test_path, "", copy_loc_id)
+                    await fs.file_delete(test_path, copy_loc_id)
+                    writable_cache[copy_dir] = True
+                except Exception:
+                    writable_cache[copy_dir] = False
+
+            if writable_cache[copy_dir]:
                 try:
                     await fs.write_moved_stub(
                         original_path,
@@ -346,8 +456,9 @@ async def run_consolidation(file_id: int, mode: str, dest_folder_id: str | None)
                         canonical_path,
                         now_iso,
                         copy_loc_id,
+                        dest_location_name=dest_loc_name,
                     )
-                    # Replace the original file record with a record for the .moved stub
+                    # Replace the original file record with the .moved stub
                     stub_path = original_path + ".moved"
                     stub_name = copy["filename"] + ".moved"
                     stub_rel = copy["rel_path"] + ".moved"
@@ -375,7 +486,6 @@ async def run_consolidation(file_id: int, mode: str, dest_folder_id: str | None)
 
                     await remove_file_hashes([copy["id"]])
 
-                    # Stats: original file removed, stub added
                     from file_hunter.stats_db import update_stats_for_files
 
                     await update_stats_for_files(
@@ -391,39 +501,31 @@ async def run_consolidation(file_id: int, mode: str, dest_folder_id: str | None)
                         added=[(copy["folder_id"], stub_size, "text", 0)],
                     )
                     stubs_written += 1
-                except Exception:
-                    stubs_queued += 1
-                    async with db_writer() as wdb:
-                        await wdb.execute(
-                            """INSERT INTO consolidation_jobs
-                               (source_file, source_location_id, source_path,
-                                destination_path, status, date_created)
-                               VALUES (?, ?, ?, ?, 'pending', ?)""",
-                            (
-                                copy["filename"],
-                                copy_loc_id,
-                                original_path,
-                                canonical_path,
-                                now_iso,
-                            ),
-                        )
-            else:
-                # Offline or file missing — queue for later
-                stubs_queued += 1
-                async with db_writer() as wdb:
-                    await wdb.execute(
-                        """INSERT INTO consolidation_jobs
-                           (source_file, source_location_id, source_path,
-                            destination_path, status, date_created)
-                           VALUES (?, ?, ?, ?, 'pending', ?)""",
-                        (
-                            copy["filename"],
-                            copy_loc_id,
-                            original_path,
-                            canonical_path,
-                            now_iso,
-                        ),
+                    await append_row(
+                        csv_path, csv_loc_id,
+                        copy["location_name"], original_path,
+                        dest_loc_name, canonical_path, "stubbed",
                     )
+                except Exception as e:
+                    logger.warning("Stub write failed for %s: %s", original_path, e)
+                    await append_row(
+                        csv_path, csv_loc_id,
+                        copy["location_name"], original_path,
+                        dest_loc_name, canonical_path, "stub failed",
+                        str(e),
+                    )
+            else:
+                # Read-only folder — skip stub, don't queue
+                await append_row(
+                    csv_path, csv_loc_id,
+                    copy["location_name"], original_path,
+                    dest_loc_name, canonical_path, "stub failed (read-only)",
+                    copy_dir,
+                )
+
+        # Add result CSV to catalog (only if this consolidation owns it)
+        if owns_csv:
+            await add_to_catalog(csv_path, csv_loc_id, csv_folder_id)
 
         await broadcast(
             {
@@ -433,33 +535,33 @@ async def run_consolidation(file_id: int, mode: str, dest_folder_id: str | None)
                 "canonicalPath": canonical_path,
                 "stubsWritten": stubs_written,
                 "stubsQueued": stubs_queued,
+                "batch": not owns_csv,
             }
         )
-        from file_hunter.services.stats import invalidate_stats_cache
+        if not skip_post_processing:
+            from file_hunter.services.stats import invalidate_stats_cache
 
-        invalidate_stats_cache()
+            invalidate_stats_cache()
 
-        from file_hunter.services.sizes import recalculate_location_sizes
+            from file_hunter.services.sizes import recalculate_location_sizes
 
-        affected_loc_ids = {c["location_id"] for c in all_copies}
-        for lid in affected_loc_ids:
-            await recalculate_location_sizes(lid)
+            affected_loc_ids = {c["location_id"] for c in all_copies}
+            for lid in affected_loc_ids:
+                await recalculate_location_sizes(lid)
 
-        from file_hunter.services.dup_counts import recalculate_dup_counts
+            from file_hunter.services.dup_counts import recalculate_dup_counts
 
-        recalc_strong = set()
-        recalc_fast = set()
-        # Canonical now has hash_strong (computed on demand during verification)
-        if selected.get("hash_strong"):
-            recalc_strong.add(selected["hash_strong"])
-        # If copies were found by hash_fast, that group changed too
-        if hash_col == "hash_fast":
-            recalc_fast.add(effective_hash)
-        await recalculate_dup_counts(
-            strong_hashes=recalc_strong or None,
-            fast_hashes=recalc_fast or None,
-            source=f"consolidate {filename}",
-        )
+            recalc_strong = set()
+            recalc_fast = set()
+            if selected.get("hash_strong"):
+                recalc_strong.add(selected["hash_strong"])
+            if hash_col == "hash_fast":
+                recalc_fast.add(effective_hash)
+            await recalculate_dup_counts(
+                strong_hashes=recalc_strong or None,
+                fast_hashes=recalc_fast or None,
+                source=f"consolidate {filename}",
+            )
 
     except Exception as exc:
         await broadcast(
@@ -482,15 +584,69 @@ async def run_batch_consolidation(
     file_ids: list[int], mode: str, dest_folder_id: str | None
 ):
     """Run consolidation for multiple files sequentially in the background."""
+    from file_hunter.services.op_result_log import (
+        create_log, add_to_catalog,
+    )
+
+    # Resolve destination for the shared CSV
+    dest_dir = None
+    dest_loc_id = None
+    csv_folder_id = None
+    if dest_folder_id:
+        async with read_db() as db:
+            d, lid = await _resolve_folder_path_with_loc(db, dest_folder_id)
+        dest_dir = d
+        dest_loc_id = lid
+        if dest_folder_id.startswith("fld-"):
+            csv_folder_id = int(dest_folder_id[4:])
+
+    if not dest_dir and file_ids:
+        # keep_here mode — resolve from first file
+        async with read_db() as db:
+            row = await db.execute_fetchall(
+                """SELECT f.full_path, f.folder_id, f.location_id
+                   FROM files f WHERE f.id = ?""",
+                (file_ids[0],),
+            )
+        if row:
+            dest_dir = os.path.dirname(row[0]["full_path"])
+            dest_loc_id = row[0]["location_id"]
+            csv_folder_id = row[0]["folder_id"]
+
+    if not dest_dir or not dest_loc_id:
+        logger.error("Batch consolidation: could not resolve destination")
+        return
+
+    csv_path = await create_log(dest_dir, dest_loc_id, "consolidate")
+
     completed = 0
     errors = 0
 
     for file_id in file_ids:
         try:
-            await run_consolidation(file_id, mode, dest_folder_id)
+            await run_consolidation(
+                file_id, mode, dest_folder_id,
+                shared_csv_path=csv_path, shared_csv_loc_id=dest_loc_id,
+                skip_post_processing=True,
+            )
             completed += 1
         except Exception:
             errors += 1
+
+    await add_to_catalog(csv_path, dest_loc_id, csv_folder_id)
+
+    # Post-processing once for the entire batch
+    from file_hunter.services.stats import invalidate_stats_cache
+
+    invalidate_stats_cache()
+
+    from file_hunter.services.sizes import recalculate_location_sizes
+
+    await recalculate_location_sizes(dest_loc_id)
+
+    from file_hunter.services.dup_counts import recalculate_dup_counts
+
+    await recalculate_dup_counts(source=f"batch consolidate ({len(file_ids)} files)")
 
     await broadcast(
         {
@@ -530,7 +686,7 @@ async def drain_pending_jobs(location_id: int, root_path: str):
         if await fs.file_exists(source_path, location_id):
             try:
                 await fs.write_moved_stub(
-                    source_path, source_file, dest_path, now_iso, location_id
+                    source_path, source_file, dest_path, now_iso, location_id,
                 )
                 stub_path = source_path + ".moved"
                 stub_name = source_file + ".moved"
@@ -727,9 +883,9 @@ async def _ensure_canonical_record(
             """INSERT INTO files
                (filename, full_path, rel_path, location_id, folder_id,
                 file_type_high, file_type_low, file_size,
-                hash_fast, hash_strong, description, tags,
+                description, tags,
                 created_date, modified_date, date_cataloged, date_last_seen, scan_id)
-               VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, NULL)""",
+               VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, NULL)""",
             (
                 source["filename"],
                 canonical_path,
@@ -739,8 +895,6 @@ async def _ensure_canonical_record(
                 type_high,
                 type_low,
                 file_size,
-                source["hash_fast"],
-                source["hash_strong"],
                 source.get("description", ""),
                 source.get("tags", ""),
                 source.get("created_date", now_iso),
@@ -749,7 +903,25 @@ async def _ensure_canonical_record(
                 now_iso,
             ),
         )
-        return cursor.lastrowid
+        new_id = cursor.lastrowid
+
+    # Register hashes in hashes.db for the new file record
+    hash_fast = source.get("hash_fast")
+    hash_strong = source.get("hash_strong")
+    if hash_fast or hash_strong:
+        from file_hunter.hashes_db import hashes_writer
+
+        async with hashes_writer() as hdb:
+            await hdb.execute(
+                "INSERT INTO file_hashes "
+                "(file_id, location_id, file_size, hash_partial, hash_fast, hash_strong) "
+                "VALUES (?, ?, ?, NULL, ?, ?) "
+                "ON CONFLICT(file_id) DO UPDATE SET "
+                "hash_fast=excluded.hash_fast, hash_strong=excluded.hash_strong",
+                (new_id, location_id, file_size, hash_fast, hash_strong),
+            )
+
+    return new_id
 
 
 async def _insert_stub_record(
@@ -780,9 +952,9 @@ async def _insert_stub_record(
             """INSERT OR IGNORE INTO files
                (filename, full_path, rel_path, location_id, folder_id,
                 file_type_high, file_type_low, file_size,
-                hash_fast, hash_strong, description, tags,
+                description, tags,
                 created_date, modified_date, date_cataloged, date_last_seen, scan_id)
-               VALUES (?, ?, ?, ?, ?, 'text', 'sources', ?, NULL, NULL, '', '',
+               VALUES (?, ?, ?, ?, ?, 'text', 'sources', ?, '', '',
                        ?, ?, ?, ?, NULL)""",
             (
                 stub_name,

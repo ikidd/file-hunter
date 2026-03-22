@@ -30,15 +30,20 @@ async def consolidate(request: Request):
         return json_error("destination_folder_id is required for copy_to mode.", 400)
 
     async with read_db() as db:
-        # Verify file exists and has a hash
+        # Verify file exists
         rows = await db.execute_fetchall(
-            "SELECT id, filename, hash_strong, hash_fast FROM files WHERE id = ?",
+            "SELECT id, filename FROM files WHERE id = ?",
             (file_id,),
         )
         if not rows:
             return json_error("File not found.", 404)
 
-        effective_hash = rows[0]["hash_strong"] or rows[0]["hash_fast"]
+        # Check hash from hashes.db
+        from file_hunter.hashes_db import get_file_hashes
+
+        h_map = await get_file_hashes([file_id])
+        h = h_map.get(file_id, {})
+        effective_hash = h.get("hash_strong") or h.get("hash_fast")
         if not effective_hash:
             return json_error("File has no hash — scan it first.", 400)
 

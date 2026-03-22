@@ -105,9 +105,9 @@ async def run_upload(
                         """INSERT INTO files
                            (filename, full_path, rel_path, location_id, folder_id,
                             file_type_high, file_type_low, file_size,
-                            hash_fast, hash_strong, description, tags,
+                            description, tags,
                             created_date, modified_date, date_cataloged, date_last_seen, scan_id)
-                           VALUES (?, ?, ?, ?, ?, 'text', 'moved', ?, NULL, NULL, '', '',
+                           VALUES (?, ?, ?, ?, ?, 'text', 'moved', ?, '', '',
                                    ?, ?, ?, ?, NULL)""",
                         (
                             stub_name,

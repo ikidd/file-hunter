@@ -49,11 +49,11 @@ async def file_move(src: str, dest: str, location_id: int):
     return await proxy("file_move", location_id, path=src, destination=dest)
 
 
-async def file_write_text(path: str, text: str, location_id: int):
+async def file_write_text(path: str, text: str, location_id: int, append: bool = False):
     proxy = get_agent_proxy()
     if not proxy:
         raise ConnectionError("Agent proxy not available.")
-    return await proxy("file_write", location_id, path=path, content=text)
+    return await proxy("file_write", location_id, path=path, content=text, append=append)
 
 
 async def file_write_bytes(path: str, data: bytes, location_id: int):
@@ -190,13 +190,15 @@ async def copy_file(
 
 
 async def write_moved_stub(
-    original_path: str, filename: str, dest_path: str, now_iso: str, location_id: int
+    original_path: str, filename: str, dest_path: str, now_iso: str, location_id: int,
+    dest_location_name: str = "",
 ):
     """Generate .moved stub text, write it, and delete the original."""
+    moved_to = f"{dest_location_name}: {dest_path}" if dest_location_name else dest_path
     stub_text = (
         f"Consolidated by File Hunter\n"
         f"Original: {filename}\n"
-        f"Moved to: {dest_path}\n"
+        f"Moved to: {moved_to}\n"
         f"Date: {now_iso}\n"
     )
     stub_path = original_path + ".moved"
