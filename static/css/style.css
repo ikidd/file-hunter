@@ -2406,7 +2406,9 @@ select.modal-input {
 .settings-row {
     display: flex;
     flex-direction: column;
+    align-items: flex-start;
     gap: 0.25rem;
+    margin-bottom: 0.75rem;
 }
 
 .settings-inline {

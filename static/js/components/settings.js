@@ -79,7 +79,7 @@ const Settings = {
                     <span class="settings-hint">Clears incorrect stale flags, recalculates file counts and duplicate detection</span>
                 </div>
                 <div class="settings-row">
-                    <button class="btn btn-sm btn-danger" id="settings-reset-queues">Reset Queues</button>
+                    <button class="btn btn-sm" id="settings-reset-queues">Reset Queues</button>
                     <span class="settings-hint">Removes temporary scan databases, clears all queued operations and pending hashes. Only available when no operations are running.</span>
                 </div>
             </div>
